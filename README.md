@@ -1,34 +1,35 @@
 # FeiCodex Rocket Bridge
 
-Independent Feishu bot bridge based on `codex app-server`.
+基于 `codex app-server` 的飞书机器人桥接服务（独立版）。
 
-This repository does not depend on `feishu_codex_bridge` source code.
+本仓库不依赖 `feishu_codex_bridge` 的源码。
 
-## Features
+## 功能特性
 
-- Text messages are sent directly to Codex.
-- Attachments are downloaded and staged for the next turn.
-- Menu actions open management cards.
-- Card actions support project/session/model workflows.
+- 文本消息直通 Codex。
+- 附件消息自动下载并暂存，供下一轮对话使用。
+- 菜单点击可打开项目/会话管理卡片。
+- 卡片交互支持项目切换、会话管理、模型切换等流程。
 
-## Prerequisites
+## 前置条件
 
-- Linux host with `python3` and `venv`
-- Codex CLI available in `PATH` (`codex`) and logged in (`codex login`)
-- Feishu app credentials (`FEISHU_APP_ID`, `FEISHU_APP_SECRET`)
+- Linux 主机（安装 `python3` 和 `venv`）
+- 已安装 Codex CLI，并可通过 `codex` 命令调用
+- 已完成 Codex 登录：`codex login`
+- 已创建飞书应用并拿到凭证：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`
 
-## Quick Start
+## 快速开始
 
 ```bash
 ./scripts/init.sh
 ```
 
-Then edit `.env` and set at least:
+然后编辑 `.env`，至少填写以下配置：
 
 - `FEISHU_APP_ID`
 - `FEISHU_APP_SECRET`
 
-Start services in two terminals:
+分别在两个终端启动：
 
 ```bash
 ./scripts/run_api.sh
@@ -38,60 +39,60 @@ Start services in two terminals:
 ./scripts/run_bridge.sh
 ```
 
-## Feishu Console Setup
+## 飞书后台配置
 
-In app event/callback configuration:
+在飞书应用后台的「事件与回调」中配置：
 
-- Subscribe event: `im.message.receive_v1`
-- Subscribe event: `application.botmenu.v6`
-- Configure callback: `card.action.trigger`
+- 订阅事件：`im.message.receive_v1`
+- 订阅事件：`application.botmenu.v6`
+- 回调配置：`card.action.trigger`
 
-In app menu, keep keys:
+在应用菜单中建议保留以下 `event_key`：
 
 - `menu_project_manage`
 - `menu_session_manage`
 
-These keys map via `BRIDGE_MENU_ACTIONS_JSON` in `.env`.
+菜单键映射通过 `.env` 里的 `BRIDGE_MENU_ACTIONS_JSON` 配置。
 
-## Environment
+## 环境变量
 
-See [.env.example](./.env.example). Defaults are repository-local:
+请参考 [.env.example](./.env.example)。默认值均为仓库内相对路径：
 
-- state file: `./data/state.json`
-- uploads dir: `./data/uploads`
-- default cwd: `.`
+- 状态文件：`./data/state.json`
+- 上传目录：`./data/uploads`
+- 默认工作目录：`.`
 
-Both `app.py` and `long_conn.py` auto-load `.env`.
+`app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 
-## HTTP Control API
+## HTTP 控制 API
 
-Prefix: `/appbridge/api` (configurable by `BRIDGE_API_PREFIX`).
+默认前缀：`/appbridge/api`（可通过 `BRIDGE_API_PREFIX` 修改）
 
 - `GET /chat/{chat_id}/status`
 - `POST /chat/{chat_id}/thread/reset`
 - `POST /chat/{chat_id}/turn`
 - `POST /chat/{chat_id}/interrupt`
 
-Auth header:
+鉴权头：
 
 - `Authorization: Bearer <BRIDGE_API_TOKEN>`
 
-## Smoke Test
+## 烟雾测试
 
 ```bash
 ./.venv/bin/python smoke_test.py
 ```
 
-## systemd (optional)
+## systemd 部署（可选）
 
-Template files:
+模板文件：
 
 - `feicodex-rocket-api.service.example`
 - `feicodex-rocket-bridge.service.example`
 
-Replace `__APP_DIR__` with absolute path before installing.
+安装前请将模板中的 `__APP_DIR__` 替换为项目绝对路径。
 
-Example:
+示例：
 
 ```bash
 APP_DIR="$(pwd)"
