@@ -1,0 +1,20 @@
+[Unit]
+Description=FeiCodex Rocket Bridge
+After=network.target
+Wants=feicodex-rocket-api.service
+After=feicodex-rocket-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=-__APP_DIR__/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=BRIDGE_STATE_PATH=__APP_DIR__/data/state.json
+Environment=BRIDGE_API_PREFIX=/appbridge/api
+Environment=BRIDGE_CONTROL_BASE=http://127.0.0.1:18788
+ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/long_conn.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

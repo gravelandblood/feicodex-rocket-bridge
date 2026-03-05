@@ -1,0 +1,16 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Virtualenv
+.venv/
+
+# Local env and runtime data
+.env
+.env.*
+!.env.example
+*.log
+
+# Runtime state/uploads
+data/*
+!data/.gitkeep
