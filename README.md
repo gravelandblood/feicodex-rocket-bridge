@@ -2,8 +2,6 @@
 
 基于 `codex app-server` 的飞书机器人桥接服务（独立版）。
 
-本仓库不依赖 `feishu_codex_bridge` 的源码。
-
 ## 功能特性
 
 - 文本消息直通 Codex。
@@ -77,7 +75,7 @@
 
 - `Authorization: Bearer <BRIDGE_API_TOKEN>`
 
-## 烟雾测试
+## 冒烟测试
 
 ```bash
 ./.venv/bin/python smoke_test.py
