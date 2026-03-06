@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import atexit
+import base64
+import json
 import logging
 import os
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
@@ -38,6 +42,20 @@ _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
     _state_path = APP_DIR / _state_path
 STORE = BridgeStateStore(str(_state_path.resolve()))
+
+
+def _resolve_env_path(raw: str) -> Path:
+    p = Path(str(raw or "")).expanduser()
+    if not p.is_absolute():
+        p = APP_DIR / p
+    return p.resolve()
+
+
+AUTH_PROFILES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_PROFILES_DIR", str(DATA_DIR / "auth_profiles")))
+AUTH_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_HOMES_DIR", str(DATA_DIR / "auth_homes")))
+AUTH_REGISTRY_PATH = _resolve_env_path(
+    os.environ.get("BRIDGE_AUTH_REGISTRY_PATH", str(DATA_DIR / "auth_profiles_registry.json"))
+)
 
 
 class TurnRequest(BaseModel):
@@ -70,6 +88,18 @@ class InterruptTurnRequest(BaseModel):
     turn_id: str = Field(default="")
 
 
+class UpdateChatConfigRequest(BaseModel):
+    cwd: str = Field(default="")
+    model: str = Field(default="")
+    sandbox: str = Field(default="")
+    approval_policy: str = Field(default="")
+    personality: str = Field(default="")
+
+
+class UpdateChatAuthProfileRequest(BaseModel):
+    profile: str = Field(default="")
+
+
 @dataclass
 class ChatRuntime:
     chat_id: str
@@ -80,6 +110,7 @@ class ChatRuntime:
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL
     personality: str = DEFAULT_PERSONALITY
+    auth_profile: str = ""
     last_input_at: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
     client: CodexAppServerClient = field(default_factory=CodexAppServerClient)
@@ -110,8 +141,10 @@ class BridgeRuntimeManager:
                 sandbox=str(persisted.get("sandbox") or DEFAULT_SANDBOX),
                 approval_policy=str(persisted.get("approval_policy") or DEFAULT_APPROVAL),
                 personality=str(persisted.get("personality") or DEFAULT_PERSONALITY),
+                auth_profile=str(persisted.get("auth_profile") or ""),
                 last_input_at=int(persisted.get("last_input_at") or persisted.get("updated_at") or 0),
             )
+            _apply_runtime_auth_profile(runtime)
             self._runtimes[clean_chat_id] = runtime
             return runtime
 
@@ -232,6 +265,7 @@ def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = Non
         "sandbox": runtime.sandbox,
         "approval_policy": runtime.approval_policy,
         "personality": runtime.personality,
+        "auth_profile": runtime.auth_profile,
         "last_input_at": int(runtime.last_input_at or 0),
     }
     if patch:
@@ -252,6 +286,132 @@ def _read_rate_limits(runtime: ChatRuntime, allow_request: bool = True) -> Dict[
     except Exception:
         return {}
     return {}
+
+
+def _load_auth_registry() -> Dict[str, Any]:
+    if not AUTH_REGISTRY_PATH.exists():
+        return {"profiles": []}
+    try:
+        data = json.loads(AUTH_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("profiles"), list):
+            return data
+    except Exception:
+        pass
+    return {"profiles": []}
+
+
+def _save_auth_registry(profiles: List[Dict[str, Any]]) -> None:
+    AUTH_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"profiles": profiles, "updated_at": int(time.time())}
+    AUTH_REGISTRY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _profile_home_dir(profile: str) -> Path:
+    return AUTH_HOMES_DIR / str(profile or "").strip()
+
+
+def _decode_jwt_payload(token: str) -> Dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    raw = parts[1].replace("-", "+").replace("_", "/")
+    raw += "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        return json.loads(base64.b64decode(raw.encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _validate_auth_profile_file(source: Path) -> Dict[str, Any]:
+    profile = str(source.name[: -len(".auth.json")] if source.name.endswith(".auth.json") else source.stem).strip()
+    meta: Dict[str, Any] = {
+        "profile": profile,
+        "source_auth_json": str(source),
+        "source_config_toml": "",
+        "valid": False,
+        "reason": "",
+        "auth_mode": "",
+        "email": "",
+        "sub": "",
+        "home_dir": str(_profile_home_dir(profile)),
+    }
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except Exception as exc:
+        meta["reason"] = f"invalid json: {exc}"
+        return meta
+
+    auth_mode = str(data.get("auth_mode") or "").strip()
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    payload = _decode_jwt_payload(str(tokens.get("id_token") or ""))
+    meta["auth_mode"] = auth_mode
+    meta["email"] = str(payload.get("email") or "").strip()
+    meta["sub"] = str(payload.get("sub") or "").strip()
+
+    if not auth_mode or not isinstance(tokens, dict):
+        meta["reason"] = "missing auth_mode/tokens"
+        return meta
+
+    home_dir = _profile_home_dir(profile)
+    home_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, home_dir / "auth.json")
+
+    cfg = source.with_name(f"{profile}.config.toml")
+    if cfg.exists() and cfg.is_file():
+        shutil.copy2(cfg, home_dir / "config.toml")
+        meta["source_config_toml"] = str(cfg)
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home_dir)
+    try:
+        proc = subprocess.run(
+            ["codex", "login", "status"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        meta["reason"] = f"status check failed: {exc}"
+        return meta
+
+    output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    if proc.returncode == 0 and "Logged in" in output:
+        meta["valid"] = True
+        return meta
+    meta["reason"] = output.strip() or f"status code {proc.returncode}"
+    return meta
+
+
+def _refresh_auth_profiles() -> List[Dict[str, Any]]:
+    AUTH_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    profiles: List[Dict[str, Any]] = []
+    for path in sorted(AUTH_PROFILES_DIR.glob("*.auth.json")):
+        if not path.is_file():
+            continue
+        profile = str(path.name[: -len(".auth.json")] if path.name.endswith(".auth.json") else path.stem).strip()
+        if not profile:
+            continue
+        profiles.append(_validate_auth_profile_file(path))
+    _save_auth_registry(profiles)
+    return profiles
+
+
+def _get_auth_profile(profile: str) -> Optional[Dict[str, Any]]:
+    target = str(profile or "").strip()
+    for item in _refresh_auth_profiles():
+        if str(item.get("profile") or "").strip() == target:
+            return item
+    return None
+
+
+def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
+    profile = str(runtime.auth_profile or "").strip()
+    if profile:
+        runtime.client.env["CODEX_HOME"] = str(_profile_home_dir(profile))
+    else:
+        runtime.client.env.pop("CODEX_HOME", None)
 
 
 def _ensure_thread(runtime: ChatRuntime, reset_thread: bool = False) -> str:
@@ -324,6 +484,8 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
     rate_limits: Dict[str, Any] = {}
     turn_progress: Dict[str, Any] = {}
     active_turn_id = str(runtime.active_turn_id or persisted.get("active_turn_id") or "")
+    auth_profile = str(runtime.auth_profile or persisted.get("auth_profile") or "")
+    auth_meta = _get_auth_profile(auth_profile) if auth_profile else None
 
     if thread_id and runtime.is_client_running():
         thread_status = runtime.client.get_thread_status(thread_id)
@@ -358,9 +520,83 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
             "sandbox": str(runtime.sandbox or persisted.get("sandbox") or DEFAULT_SANDBOX),
             "approval_policy": str(runtime.approval_policy or persisted.get("approval_policy") or DEFAULT_APPROVAL),
             "personality": str(runtime.personality or persisted.get("personality") or DEFAULT_PERSONALITY),
+            "auth_profile": auth_profile,
+            "auth_identity": str((auth_meta or {}).get("email") or (auth_meta or {}).get("sub") or ""),
             "state": persisted,
         },
     }
+
+
+@ROUTER.get("/auth/profiles", dependencies=[Depends(require_api_token)])
+def auth_profiles_list() -> Dict[str, Any]:
+    profiles = _refresh_auth_profiles()
+    return {
+        "ok": True,
+        "data": {
+            "profiles": [
+                {
+                    "profile": "",
+                    "label": "default",
+                    "email": "",
+                    "valid": True,
+                    "reason": "",
+                    "home_dir": "",
+                    "source_auth_json": "",
+                }
+            ]
+            + profiles
+        },
+    }
+
+
+@ROUTER.post("/chat/{chat_id}/config", dependencies=[Depends(require_api_token)])
+def chat_config_update(chat_id: str, body: UpdateChatConfigRequest) -> Dict[str, Any]:
+    runtime = RUNTIMES.get(chat_id)
+    with runtime.lock:
+        _resolve_chat_config(runtime, body)
+        state = _persist_runtime(runtime, {"last_error": ""})
+        return {
+            "ok": True,
+            "data": {
+                "chat_id": chat_id,
+                "cwd": runtime.cwd,
+                "model": runtime.model,
+                "sandbox": runtime.sandbox,
+                "approval_policy": runtime.approval_policy,
+                "personality": runtime.personality,
+                "state": state,
+            },
+        }
+
+
+@ROUTER.post("/chat/{chat_id}/auth-profile", dependencies=[Depends(require_api_token)])
+def chat_auth_profile_update(chat_id: str, body: UpdateChatAuthProfileRequest) -> Dict[str, Any]:
+    runtime = RUNTIMES.get(chat_id)
+    profile = str(body.profile or "").strip()
+    meta = _get_auth_profile(profile) if profile else None
+    if profile and (not meta or not bool(meta.get("valid"))):
+        raise HTTPException(status_code=400, detail=f"invalid auth profile: {profile}")
+
+    with runtime.lock:
+        runtime.auth_profile = profile
+        runtime.thread_id = ""
+        runtime.active_turn_id = ""
+        try:
+            runtime.client.stop()
+        except Exception:
+            pass
+        _apply_runtime_auth_profile(runtime)
+        state = _persist_runtime(runtime, {"last_error": ""})
+        return {
+            "ok": True,
+            "data": {
+                "chat_id": chat_id,
+                "auth_profile": profile,
+                "auth_identity": str((meta or {}).get("email") or (meta or {}).get("sub") or ""),
+                "home_dir": str((meta or {}).get("home_dir") or ""),
+                "state": state,
+            },
+        }
 
 
 @ROUTER.post("/chat/{chat_id}/thread/reset", dependencies=[Depends(require_api_token)])
@@ -369,6 +605,7 @@ def chat_thread_reset(chat_id: str, body: ResetThreadRequest) -> Dict[str, Any]:
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
+        _apply_runtime_auth_profile(runtime)
         runtime.active_turn_id = ""
         try:
             runtime.client.stop()
@@ -397,6 +634,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
+        _apply_runtime_auth_profile(runtime)
         try:
             thread_id = _ensure_thread(runtime, reset_thread=bool(body.reset_thread))
         except AppServerError as exc:
@@ -409,6 +647,13 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         if active_now != str(runtime.active_turn_id or ""):
             runtime.active_turn_id = active_now
             _persist_runtime(runtime)
+        if active_now and not bool(body.reset_thread):
+            thread_status = runtime.client.get_thread_status(thread_id)
+            if str(thread_status.get("type") or "").lower() == "idle":
+                # get_active_turn_id can lag briefly after completion; trust idle status.
+                active_now = ""
+                runtime.active_turn_id = ""
+                _persist_runtime(runtime, {"last_error": ""})
         if active_now and not bool(body.reset_thread):
             state = _persist_runtime(runtime, {"last_error": "turn already running", "last_turn_status": "running"})
             raise HTTPException(

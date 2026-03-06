@@ -7,7 +7,7 @@
 - 文本消息直通 Codex。
 - 附件消息自动下载并暂存，供下一轮对话使用。
 - 菜单点击可打开项目/会话管理卡片。
-- 卡片交互支持项目切换、会话管理、模型切换等流程。
+- 卡片交互支持项目切换、会话管理、模型切换、账号切换等流程。
 - 会话在无任务执行且 10 分钟无新消息时自动回收，后续可通过 Codex `resume` 恢复。
 
 ## 前置条件
@@ -59,6 +59,8 @@
 
 - 状态文件：`./data/state.json`
 - 上传目录：`./data/uploads`
+- 账号源文件目录：`./data/auth_profiles`
+- 账号运行目录：`./data/auth_homes`
 - 默认工作目录：`.`
 - 单轮超时：`BRIDGE_TURN_TIMEOUT_SEC=21600`（默认 6 小时）
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
@@ -72,6 +74,8 @@
 默认前缀：`/appbridge/api`（可通过 `BRIDGE_API_PREFIX` 修改）
 
 - `GET /chat/{chat_id}/status`
+- `GET /auth/profiles`
+- `POST /chat/{chat_id}/auth-profile`
 - `POST /chat/{chat_id}/thread/reset`
 - `POST /chat/{chat_id}/turn`
 - `POST /chat/{chat_id}/interrupt`
@@ -85,6 +89,35 @@
 ```bash
 ./.venv/bin/python smoke_test.py
 ```
+
+## 多账号切换
+
+将账号认证文件放到：
+
+- `data/auth_profiles/<profile>.auth.json`
+
+可选配套：
+
+- `data/auth_profiles/<profile>.config.toml`
+
+示例：
+
+- `data/auth_profiles/work.auth.json`
+- `data/auth_profiles/personal.auth.json`
+
+桥接会自动校验这些账号能否通过 `codex login status`，并把可用结果写入：
+
+- `data/auth_profiles_registry.json`
+
+实际运行时，每个账号会使用独立 `CODEX_HOME`：
+
+- `data/auth_homes/<profile>/`
+
+在飞书里通过：
+
+- `会话管理 -> 切换账号`
+
+即可切换当前 chat 绑定的账号。切换后会自动重置线程，后续消息使用新的账号继续运行。
 
 ## systemd 部署（可选）
 

@@ -54,6 +54,38 @@ UPLOAD_ROOT = Path(os.getenv("BRIDGE_UPLOAD_ROOT", str(APP_DIR / "data" / "uploa
 if not UPLOAD_ROOT.is_absolute():
     UPLOAD_ROOT = APP_DIR / UPLOAD_ROOT
 UPLOAD_ROOT = UPLOAD_ROOT.resolve()
+PROJECT_ROOT = Path(os.getenv("BRIDGE_PROJECT_ROOT", str(APP_DIR.parent / "projects"))).expanduser()
+if not PROJECT_ROOT.is_absolute():
+    PROJECT_ROOT = APP_DIR / PROJECT_ROOT
+PROJECT_ROOT = PROJECT_ROOT.resolve()
+PROJECTS_STORE_PATH = Path(os.getenv("BRIDGE_PROJECTS_STORE_PATH", str(APP_DIR / "data" / "projects.json"))).expanduser()
+if not PROJECTS_STORE_PATH.is_absolute():
+    PROJECTS_STORE_PATH = APP_DIR / PROJECTS_STORE_PATH
+PROJECTS_STORE_PATH = PROJECTS_STORE_PATH.resolve()
+USER_CHAT_MAP_PATH = Path(os.getenv("BRIDGE_USER_CHAT_MAP_PATH", str(APP_DIR / "data" / "user_chat_map.json"))).expanduser()
+if not USER_CHAT_MAP_PATH.is_absolute():
+    USER_CHAT_MAP_PATH = APP_DIR / USER_CHAT_MAP_PATH
+USER_CHAT_MAP_PATH = USER_CHAT_MAP_PATH.resolve()
+CARD_AUTO_DELETE_ON_ACTION = str(os.getenv("BRIDGE_CARD_AUTO_DELETE_ON_ACTION", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+OUTPUT_FILE_AUTO_SEND = str(os.getenv("BRIDGE_OUTPUT_FILE_AUTO_SEND", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FEISHU_FILE_UPLOAD_MAX_SIZE_MB = 30
+OUTPUT_FILE_MAX_COUNT = int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_COUNT", "0"))
+OUTPUT_FILE_MAX_SIZE_MB = min(
+    FEISHU_FILE_UPLOAD_MAX_SIZE_MB,
+    max(1, int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_SIZE_MB", str(FEISHU_FILE_UPLOAD_MAX_SIZE_MB)))),
+)
+OUTPUT_FILE_MAX_AGE_SEC = max(60, int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_AGE_SEC", "3600")))
+OUTPUT_FILE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt"}
 
 DEFAULT_MENU_ACTIONS = {
     "menu_project_manage": "open_project_manage",
@@ -166,21 +198,42 @@ def _parse_model_candidates(text: str) -> List[str]:
         if val not in out:
             out.append(val)
 
-    for line in str(text or "").splitlines():
-        m = re.match(r"^\s*\d+\.\s*`?([A-Za-z0-9._:-]+)`?\s*$", line)
-        if m:
-            _add(m.group(1))
+    section_visibility = "list"
+    for raw_line in str(text or "").splitlines():
+        line = str(raw_line or "").strip()
+        lower = line.lower()
+        if "visibility=hide" in lower or line.startswith("隐藏"):
+            section_visibility = "hide"
             continue
-        m = re.match(r"^\s*-\s*`?([A-Za-z0-9._:-]+)`?\s*$", line)
-        if m:
-            _add(m.group(1))
+        if "visibility=list" in lower or line.startswith("可见"):
+            section_visibility = "list"
             continue
+
+        m = re.match(
+            r"^\s*(?:\d+\.\s*|-\s*)`?([A-Za-z0-9._:-]+)`?(?:\s*\(`?(list|hide)`?\))?\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if not m:
+            continue
+        visibility = str(m.group(2) or section_visibility).strip().lower()
+        if visibility == "hide":
+            continue
+        _add(m.group(1))
 
     for line in str(text or "").splitlines():
         if "effective" in line and "=" in line:
             _add(line.split("=", 1)[1])
 
     return out
+
+
+def _extract_status_value(text: str, key: str) -> str:
+    pattern = re.compile(rf"(?mi)^\s*{re.escape(str(key or '').strip())}\s*=\s*(.+?)\s*$")
+    m = pattern.search(str(text or ""))
+    if not m:
+        return ""
+    return str(m.group(1) or "").strip().strip("`")
 
 
 def _format_limit_line(label: str, node: Dict[str, Any]) -> str:
@@ -340,6 +393,47 @@ class FeishuClient:
         if data.get("code") != 0:
             raise RuntimeError(f"send_card feishu err: {data}")
 
+    def upload_file(self, file_path: str, file_name: str = "") -> str:
+        path = Path(str(file_path or "")).expanduser().resolve()
+        if not path.exists() or (not path.is_file()):
+            raise RuntimeError(f"file not found: {path}")
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        with path.open("rb") as f:
+            files = {"file": (str(file_name or path.name), f)}
+            data = {"file_type": "stream", "file_name": str(file_name or path.name)}
+            resp = requests.post(f"{FEISHU_API}/im/v1/files", headers=headers, data=data, files=files, timeout=60)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"upload_file failed status={resp.status_code} body={resp.text}")
+        payload = resp.json()
+        if payload.get("code") != 0:
+            raise RuntimeError(f"upload_file feishu err: {payload}")
+        file_key = str((payload.get("data") or {}).get("file_key") or "").strip()
+        if not file_key:
+            raise RuntimeError(f"upload_file missing file_key: {payload}")
+        return file_key
+
+    def send_file_by_receive_id(self, receive_id: str, file_key: str, receive_id_type: str = "chat_id") -> str:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type={receive_id_type}"
+        payload = {
+            "receive_id": str(receive_id or ""),
+            "msg_type": "file",
+            "content": json.dumps({"file_key": str(file_key or "")}, ensure_ascii=False),
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"send_file failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_file feishu err: {data}")
+        return str((data.get("data") or {}).get("message_id") or "")
+
+    def send_file(self, chat_id: str, file_path: str, file_name: str = "") -> str:
+        file_key = self.upload_file(file_path=file_path, file_name=file_name)
+        return self.send_file_by_receive_id(chat_id, file_key, receive_id_type="chat_id")
+
     def create_reply_status(self, user_open_id: str, biz_id: str, text: str = "🤖 正在回复") -> bool:
         open_id = str(user_open_id or "").strip()
         biz = str(biz_id or "").strip()
@@ -455,6 +549,30 @@ class ControlAPI:
     def status(self, chat_id: str) -> Dict[str, Any]:
         return self._call("GET", f"/chat/{chat_id}/status", None, timeout=20)
 
+    def auth_profiles(self) -> Dict[str, Any]:
+        return self._call("GET", "/auth/profiles", None, timeout=30)
+
+    def update_config(
+        self,
+        chat_id: str,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
+        body = {
+            "cwd": str(cwd or ""),
+            "model": str(model or ""),
+            "sandbox": str(sandbox or ""),
+            "approval_policy": str(approval_policy or ""),
+            "personality": str(personality or ""),
+        }
+        return self._call("POST", f"/chat/{chat_id}/config", body, timeout=20)
+
+    def update_auth_profile(self, chat_id: str, profile: str = "") -> Dict[str, Any]:
+        return self._call("POST", f"/chat/{chat_id}/auth-profile", {"profile": str(profile or "")}, timeout=30)
+
     def reset(self, chat_id: str, cwd: str = "") -> Dict[str, Any]:
         body: Dict[str, Any] = {}
         if cwd:
@@ -494,15 +612,23 @@ class AppServerBotBridge:
         upload_root: Path,
         menu_actions: Dict[str, str],
         projects: Dict[str, str],
+        project_root: Path,
+        projects_store_path: Path,
+        user_chat_map_path: Path,
     ):
         self.feishu = feishu
         self.control = control
         self.upload_root = upload_root
         self.menu_actions = dict(menu_actions)
+        self.project_root = Path(project_root).expanduser().resolve()
+        self.projects_store_path = Path(projects_store_path).expanduser().resolve()
+        self.user_chat_map_path = Path(user_chat_map_path).expanduser().resolve()
         self.projects = {str(k): str(v) for k, v in projects.items() if str(k).strip() and str(v).strip()}
 
         self._event_lock = threading.Lock()
         self._seen_event_ids: List[str] = []
+
+        self._projects_lock = threading.Lock()
 
         self._chat_locks_guard = threading.Lock()
         self._chat_locks: Dict[str, threading.Lock] = {}
@@ -515,6 +641,11 @@ class AppServerBotBridge:
 
         self._user_chat_lock = threading.Lock()
         self._user_chat_map: Dict[str, str] = {}
+        self._await_project_name_lock = threading.Lock()
+        self._await_project_name: Dict[str, bool] = {}
+
+        self._load_persisted_projects()
+        self._load_persisted_user_chat_map()
 
     def handle_event_async(self, payload: Dict[str, Any]) -> None:
         threading.Thread(target=self._handle_event_safe, args=(payload,), daemon=True).start()
@@ -565,18 +696,137 @@ class AppServerBotBridge:
             self._chat_locks[clean_chat] = lock
             return lock
 
+    def _load_persisted_projects(self) -> None:
+        path = self.projects_store_path
+        if not path.exists():
+            return
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load projects store failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(obj, dict):
+            return
+        loaded: Dict[str, str] = {}
+        for k, v in obj.items():
+            name = str(k or "").strip()
+            p = str(v or "").strip()
+            if not name or not p:
+                continue
+            loaded[name] = str(Path(p).expanduser().resolve())
+        if not loaded:
+            return
+        with self._projects_lock:
+            self.projects.update(loaded)
+
+    def _persist_projects(self) -> None:
+        path = self.projects_store_path
+        payload: Dict[str, str] = {}
+        with self._projects_lock:
+            for k, v in sorted(self.projects.items()):
+                name = str(k or "").strip()
+                p = str(v or "").strip()
+                if name and p:
+                    payload[name] = p
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _load_persisted_user_chat_map(self) -> None:
+        path = self.user_chat_map_path
+        if not path.exists():
+            return
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load user chat map failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(obj, dict):
+            return
+        loaded: Dict[str, str] = {}
+        for k, v in obj.items():
+            key = str(k or "").strip()
+            chat = str(v or "").strip()
+            if not key or not chat:
+                continue
+            loaded[key] = chat
+        if not loaded:
+            return
+        with self._user_chat_lock:
+            self._user_chat_map.update(loaded)
+
+    def _persist_user_chat_map(self) -> None:
+        path = self.user_chat_map_path
+        with self._user_chat_lock:
+            payload = {str(k): str(v) for k, v in self._user_chat_map.items() if str(k).strip() and str(v).strip()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _set_await_project_name(self, chat_id: str, enabled: bool) -> None:
+        cid = str(chat_id or "")
+        with self._await_project_name_lock:
+            if enabled:
+                self._await_project_name[cid] = True
+            else:
+                self._await_project_name.pop(cid, None)
+
+    def _consume_await_project_name(self, chat_id: str) -> bool:
+        cid = str(chat_id or "")
+        with self._await_project_name_lock:
+            if self._await_project_name.get(cid):
+                self._await_project_name.pop(cid, None)
+                return True
+        return False
+
+    def _is_await_project_name(self, chat_id: str) -> bool:
+        cid = str(chat_id or "")
+        with self._await_project_name_lock:
+            return bool(self._await_project_name.get(cid))
+
+    def _create_project_from_name(self, chat_id: str, raw_name: str) -> str:
+        name = _sanitize_filename(raw_name, "")
+        if not name:
+            return "项目名无效，请使用字母/数字/.-_ 组合。"
+        root = self.project_root
+        root.mkdir(parents=True, exist_ok=True)
+        proj_path = (root / name).resolve()
+        created = False
+        if not proj_path.exists():
+            proj_path.mkdir(parents=True, exist_ok=True)
+            created = True
+
+        with self._projects_lock:
+            self.projects[name] = str(proj_path)
+        self._persist_projects()
+
+        try:
+            self.control.reset(chat_id=chat_id, cwd=str(proj_path))
+        except Exception as exc:
+            return f"项目已{'创建' if created else '注册'}，但切换失败: {exc}\nname={name}\npath={proj_path}"
+        return f"项目已{'创建' if created else '注册'}并切换成功。\nname={name}\npath={proj_path}"
+
     def _bind_user_chat(self, sender_id: Dict[str, Any], chat_id: str) -> None:
         open_id = str(sender_id.get("open_id") or "").strip()
         user_id = str(sender_id.get("user_id") or "").strip()
         union_id = str(sender_id.get("union_id") or "").strip()
+        changed = False
         with self._user_chat_lock:
             if open_id:
+                if self._user_chat_map.get(open_id) != chat_id:
+                    changed = True
                 self._user_chat_map[open_id] = chat_id
+                if self._user_chat_map.get(f"open:{open_id}") != chat_id:
+                    changed = True
                 self._user_chat_map[f"open:{open_id}"] = chat_id
             if user_id:
+                if self._user_chat_map.get(f"user:{user_id}") != chat_id:
+                    changed = True
                 self._user_chat_map[f"user:{user_id}"] = chat_id
             if union_id:
+                if self._user_chat_map.get(f"union:{union_id}") != chat_id:
+                    changed = True
                 self._user_chat_map[f"union:{union_id}"] = chat_id
+        if changed:
+            self._persist_user_chat_map()
 
     def _resolve_chat_by_user(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
         with self._user_chat_lock:
@@ -674,6 +924,60 @@ class AppServerBotBridge:
         ]
         return "\n".join(lines).strip(), image_paths
 
+    def _extract_output_files(self, answer_text: str, exclude_paths: Optional[List[str]] = None) -> List[Path]:
+        if not OUTPUT_FILE_AUTO_SEND:
+            return []
+        raw = str(answer_text or "")
+        if not raw:
+            return []
+        excludes = {str(Path(p).resolve()) for p in (exclude_paths or []) if str(p).strip()}
+        now = time.time()
+        paths: List[Path] = []
+        seen: set[str] = set()
+        for token in re.findall(r"/[A-Za-z0-9._/\- ]+", raw):
+            candidate = token.strip().rstrip("`'\".,;:!?)]")
+            if not candidate:
+                continue
+            p = Path(candidate).expanduser()
+            if not p.is_absolute():
+                continue
+            try:
+                resolved = p.resolve()
+            except Exception:
+                continue
+            if str(resolved) in seen or str(resolved) in excludes:
+                continue
+            if not resolved.exists() or (not resolved.is_file()):
+                continue
+            if resolved.suffix.lower() not in OUTPUT_FILE_SUFFIXES:
+                continue
+            try:
+                st = resolved.stat()
+            except Exception:
+                continue
+            if st.st_size > OUTPUT_FILE_MAX_SIZE_MB * 1024 * 1024:
+                continue
+            if (now - float(st.st_mtime)) > float(OUTPUT_FILE_MAX_AGE_SEC):
+                continue
+            seen.add(str(resolved))
+            paths.append(resolved)
+            if OUTPUT_FILE_MAX_COUNT > 0 and len(paths) >= OUTPUT_FILE_MAX_COUNT:
+                break
+        return paths
+
+    def _send_output_files(self, chat_id: str, files: List[Path]) -> None:
+        if not files:
+            return
+        sent: List[str] = []
+        for p in files:
+            try:
+                self.feishu.send_file(chat_id=chat_id, file_path=str(p), file_name=p.name)
+                sent.append(p.name)
+            except Exception as exc:
+                LOG.warning("send output file failed chat_id=%s path=%s err=%s", chat_id, p, exc)
+        if sent:
+            self.feishu.send_text(chat_id, "已回传结果文件: " + ", ".join(sent))
+
     def _extract_resource_key(self, msg_type: str, content: Dict[str, Any]) -> str:
         if str(msg_type) == "image":
             return str(content.get("image_key") or "").strip()
@@ -682,6 +986,70 @@ class AppServerBotBridge:
             if val:
                 return val
         return ""
+
+    def _extract_post_text_and_resources(self, content: Dict[str, Any]) -> Tuple[str, List[Tuple[str, Dict[str, Any]]]]:
+        post = content.get("post") if isinstance(content.get("post"), dict) else {}
+        lines: List[str] = []
+        resources: List[Tuple[str, Dict[str, Any]]] = []
+        for lang_payload in post.values():
+            if not isinstance(lang_payload, dict):
+                continue
+            rows = lang_payload.get("content")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, list):
+                    continue
+                segs: List[str] = []
+                for node in row:
+                    if not isinstance(node, dict):
+                        continue
+                    tag = str(node.get("tag") or "").strip().lower()
+                    if tag == "text":
+                        txt = str(node.get("text") or "").strip()
+                        if txt:
+                            segs.append(txt)
+                        continue
+                    if tag == "a":
+                        txt = str(node.get("text") or node.get("href") or "").strip()
+                        if txt:
+                            segs.append(txt)
+                        continue
+                    if tag == "at":
+                        txt = str(node.get("user_name") or node.get("name") or "").strip()
+                        if txt:
+                            segs.append(f"@{txt}")
+                        continue
+                    if tag == "img":
+                        image_key = str(node.get("image_key") or "").strip()
+                        if image_key:
+                            resources.append(("image", {"image_key": image_key}))
+                        continue
+                    if tag in {"file", "media", "audio", "video"}:
+                        obj: Dict[str, Any] = {}
+                        for key in ("file_key", "media_key", "audio_key", "video_key", "file_token", "file_name", "name", "title"):
+                            val = node.get(key)
+                            if val not in (None, ""):
+                                obj[key] = val
+                        if obj:
+                            resources.append((tag, obj))
+                        continue
+                line = "".join(segs).strip()
+                if line:
+                    lines.append(line)
+        text = "\n".join(lines).strip()
+        uniq: List[Tuple[str, Dict[str, Any]]] = []
+        seen: set[str] = set()
+        for t, obj in resources:
+            key = self._extract_resource_key(t, obj)
+            if not key:
+                continue
+            sig = f"{t}:{key}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append((t, obj))
+        return text, uniq
 
     def _download_attachment(self, chat_id: str, msg_type: str, message_id: str, content: Dict[str, Any]) -> str:
         file_key = self._extract_resource_key(msg_type, content)
@@ -804,7 +1172,9 @@ class AppServerBotBridge:
             f"active_turn_id={turn_id}\n"
             f"thread_status={json.dumps(tstatus, ensure_ascii=False)}\n"
             f"pending_files={pending_count}\n"
-            f"model={data.get('model') or ''}"
+            f"model={data.get('model') or ''}\n"
+            f"auth_profile={data.get('auth_profile') or 'default'}\n"
+            f"auth_identity={data.get('auth_identity') or ''}"
             + ("\n" + "\n".join(usage_lines) if usage_lines else "")
         )
 
@@ -917,13 +1287,17 @@ class AppServerBotBridge:
             f"cwd: `{cwd}`",
             f"thread: `{status.get('thread_id') or '<none>'}`",
         ]
+        if self._is_await_project_name(chat_id):
+            lines.append("新建项目流程中：请直接发送项目名，或发送 `/cancel` 取消。")
 
         rows: List[Dict[str, Any]] = [
             {"tag": "markdown", "content": "\n".join(lines)},
         ]
 
         proj_buttons: List[Dict[str, Any]] = []
-        for name, path in sorted(self.projects.items()):
+        with self._projects_lock:
+            items = sorted(self.projects.items())
+        for name, path in items:
             label = name if len(name) <= 18 else (name[:15] + "...")
             btype = "primary" if name == project_name else "default"
             proj_buttons.append(self._action_button(label, {"op": "project_switch", "project": name}, btn_type=btype))
@@ -937,6 +1311,7 @@ class AppServerBotBridge:
             {
                 "tag": "action",
                 "actions": [
+                    self._action_button("新建项目", {"op": "project_create_begin"}, btn_type="primary"),
                     self._action_button("刷新状态", {"op": "open_project_manage"}),
                     self._action_button("会话管理", {"op": "open_session_manage"}),
                 ],
@@ -952,11 +1327,14 @@ class AppServerBotBridge:
     def _build_session_manage_card(self, chat_id: str) -> Dict[str, Any]:
         status = self._status_data(chat_id)
         tstatus = status.get("thread_status") if isinstance(status.get("thread_status"), dict) else {}
+        auth_profile = str(status.get("auth_profile") or "").strip() or "default"
+        auth_identity = str(status.get("auth_identity") or "").strip()
         lines = [
             f"thread: `{status.get('thread_id') or '<none>'}`",
             f"active_turn: `{status.get('active_turn_id') or '<none>'}`",
             f"thread_status: `{json.dumps(tstatus, ensure_ascii=False)}`",
             f"model: `{status.get('model') or ''}`",
+            f"account: `{auth_profile}`" + (f" ({auth_identity})" if auth_identity else ""),
             f"pending_files: `{len(self._list_pending_files(chat_id))}`",
         ]
         return {
@@ -976,10 +1354,11 @@ class AppServerBotBridge:
                     "tag": "action",
                     "actions": [
                         self._action_button("切换模型", {"op": "session_model_start"}, btn_type="primary"),
+                        self._action_button("切换账号", {"op": "session_auth_start"}),
                         self._action_button("中断", {"op": "session_interrupt"}),
-                        self._action_button("项目管理", {"op": "open_project_manage"}),
                     ],
                 },
+                {"tag": "action", "actions": [self._action_button("项目管理", {"op": "open_project_manage"})]},
                 {
                     "tag": "note",
                     "elements": [
@@ -990,6 +1369,36 @@ class AppServerBotBridge:
                     ],
                 },
             ],
+        }
+
+    def _build_auth_select_card(self, current_profile: str, profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+        rows: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": "选择要切换的账号。\n\n放置规范：`data/auth_profiles/<profile>.auth.json`，可选配套 `data/auth_profiles/<profile>.config.toml`。",
+            }
+        ]
+        buttons: List[Dict[str, Any]] = []
+        for item in profiles:
+            profile = str(item.get("profile") or "").strip()
+            label = profile or "default"
+            identity = str(item.get("email") or "").strip()
+            valid = bool(item.get("valid"))
+            if identity:
+                rows.append({"tag": "markdown", "content": f"- `{label}` : `{identity}`"})
+            else:
+                rows.append({"tag": "markdown", "content": f"- `{label}`"})
+            btn_type = "primary" if (profile or "default") == (current_profile or "default") else "default"
+            if valid:
+                buttons.append(self._action_button(label, {"op": "session_auth_apply", "profile": profile}, btn_type=btn_type))
+        if buttons:
+            for idx in range(0, len(buttons), 3):
+                rows.append({"tag": "action", "actions": buttons[idx : idx + 3]})
+        rows.append({"tag": "action", "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"})]})
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("切换账号"),
+            "elements": rows,
         }
 
     def _build_model_select_card(self, models: List[str]) -> Dict[str, Any]:
@@ -1045,6 +1454,14 @@ class AppServerBotBridge:
     def _handle_text(self, chat_id: str, text: str, sender_open_id: str = "", message_id: str = "") -> None:
         raw = str(text or "").strip()
         if not raw:
+            return
+        if self._consume_await_project_name(chat_id):
+            if raw.lower() in {"/cancel", "cancel", "取消"}:
+                self.feishu.send_text(chat_id, "已取消新建项目。")
+                return
+            result = self._create_project_from_name(chat_id=chat_id, raw_name=raw)
+            self.feishu.send_text(chat_id, result)
+            self.feishu.send_card(chat_id, self._build_project_manage_card(chat_id))
             return
 
         pending_files = self._consume_pending_files(chat_id)
@@ -1104,6 +1521,7 @@ class AppServerBotBridge:
                 if pending_files:
                     self.feishu.send_text(chat_id, f"检测到 {len(pending_files)} 个附件，已自动带入本轮对话。")
                 answer = self._run_turn(chat_id=chat_id, text=prompt, image_paths=image_paths)
+                output_files = self._extract_output_files(answer_text=answer, exclude_paths=pending_files)
                 progress_stop.set()
                 if progress_thread:
                     progress_thread.join(timeout=1.0)
@@ -1119,6 +1537,7 @@ class AppServerBotBridge:
                         self.feishu.send_text(chat_id, answer)
                 else:
                     self.feishu.send_text(chat_id, answer)
+                self._send_output_files(chat_id, output_files)
                 self._drain_queued_inputs(chat_id)
                 LOG.info("turn done chat_id=%s message_id=%s elapsed=%.3fs", chat_id, message_id or "<none>", time.time() - start)
             except Exception as exc:
@@ -1201,6 +1620,42 @@ class AppServerBotBridge:
                 self.feishu.send_text(chat_id, f"附件下载失败: {exc}")
             return
 
+        if msg_type == "post":
+            message_id = str(message.get("message_id") or "")
+            sender_open_id = str(sender_id.get("open_id") or "").strip()
+            post_text, post_resources = self._extract_post_text_and_resources(content)
+
+            if post_resources:
+                for rtype, rcontent in post_resources:
+                    try:
+                        saved = self._download_attachment(
+                            chat_id=chat_id,
+                            msg_type=rtype,
+                            message_id=message_id,
+                            content=rcontent,
+                        )
+                        self._append_pending_file(chat_id, saved)
+                    except Exception as exc:
+                        LOG.warning(
+                            "post resource download failed chat_id=%s message_id=%s type=%s err=%s",
+                            chat_id,
+                            message_id,
+                            rtype,
+                            exc,
+                        )
+
+            if post_text:
+                self._handle_text(chat_id, post_text, sender_open_id=sender_open_id, message_id=message_id)
+                return
+
+            staged = len(self._list_pending_files(chat_id))
+            if staged > 0:
+                self.feishu.send_text(chat_id, f"已暂存 {staged} 个 post 附件。请再发一条文本指令继续处理。")
+                return
+
+            self.feishu.send_text(chat_id, "post 消息未解析到可处理内容，请补发文本或文件。")
+            return
+
         self.feishu.send_text(chat_id, f"Unsupported message type: {msg_type}")
 
     def _handle_menu_event(self, payload: Dict[str, Any]) -> None:
@@ -1258,6 +1713,7 @@ class AppServerBotBridge:
 
         ctx = event.context
         chat_id = str(getattr(ctx, "open_chat_id", "") or "")
+        source_message_id = str(getattr(ctx, "open_message_id", "") or "")
         if not chat_id:
             chat_id = self._resolve_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
         if not chat_id:
@@ -1266,6 +1722,11 @@ class AppServerBotBridge:
 
         self._bind_user_chat({"open_id": open_id, "user_id": user_id, "union_id": union_id}, chat_id)
         self._run_card_action(chat_id=chat_id, op=op, value=value)
+        if CARD_AUTO_DELETE_ON_ACTION and source_message_id:
+            try:
+                self.feishu.delete_message(source_message_id)
+            except Exception as exc:
+                LOG.warning("delete card message failed message_id=%s op=%s err=%s", source_message_id, op, exc)
 
     def _run_card_action(self, chat_id: str, op: str, value: Dict[str, Any]) -> None:
         LOG.info("card action: op=%s chat_id=%s value=%s", op, chat_id, value)
@@ -1285,10 +1746,19 @@ class AppServerBotBridge:
                 self.feishu.send_text(chat_id, f"未知项目: {project}")
                 return
             try:
+                self._set_await_project_name(chat_id, False)
                 self.control.reset(chat_id=chat_id, cwd=cwd)
                 self.feishu.send_text(chat_id, f"已切换项目: {project}\ncwd={cwd}")
             except Exception as exc:
                 self.feishu.send_text(chat_id, f"切换项目失败: {exc}")
+            return
+
+        if op == "project_create_begin":
+            self._set_await_project_name(chat_id, True)
+            self.feishu.send_text(
+                chat_id,
+                f"请输入新项目名（将创建到 `{self.project_root}`）。\n示例：`my_new_project`\n发送 `/cancel` 可取消。",
+            )
             return
 
         if op == "session_interrupt":
@@ -1320,6 +1790,28 @@ class AppServerBotBridge:
             self.feishu.send_card(chat_id, self._build_model_select_card(models))
             return
 
+        if op == "session_auth_start":
+            resp = self.control.auth_profiles()
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+            current_profile = str(self._status_data(chat_id).get("auth_profile") or "").strip()
+            self.feishu.send_card(chat_id, self._build_auth_select_card(current_profile=current_profile, profiles=profiles))
+            return
+
+        if op == "session_auth_apply":
+            profile = str(value.get("profile") or "").strip()
+            try:
+                result = self.control.update_auth_profile(chat_id=chat_id, profile=profile)
+                data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                self.control.reset(chat_id=chat_id)
+                label = str(data.get("auth_profile") or "").strip() or "default"
+                identity = str(data.get("auth_identity") or "").strip()
+                suffix = f" ({identity})" if identity else ""
+                self.feishu.send_text(chat_id, f"已切换账号: {label}{suffix}")
+            except Exception as exc:
+                self.feishu.send_text(chat_id, f"切换账号失败: {exc}")
+            return
+
         if op == "session_model_pick":
             model = str(value.get("model") or "").strip()
             if not model:
@@ -1338,13 +1830,19 @@ class AppServerBotBridge:
             result_model = self._run_session_command(chat_id=chat_id, cmd_text=f"/model use {model}")
             result_effort = self._run_session_command(chat_id=chat_id, cmd_text=f"/effort {effort}")
             verify = self._run_session_command(chat_id=chat_id, cmd_text="/status")
+            synced_model = _extract_status_value(verify, "effective_model") or _extract_status_value(verify, "model") or model
+            sync_note = ""
+            try:
+                self.control.update_config(chat_id=chat_id, model=synced_model)
+            except Exception as exc:
+                sync_note = f"\n\nconfig_sync_failed: {exc}"
             self.feishu.send_text(
                 chat_id,
                 _trim(
                     "模型切换完成。\n\n"
                     f"/model use {model}\n{result_model}\n\n"
                     f"/effort {effort}\n{result_effort}\n\n"
-                    f"verify:\n{verify}",
+                    f"verify:\n{verify}{sync_note}",
                     3500,
                 ),
             )
@@ -1464,12 +1962,27 @@ def main() -> None:
 
     feishu = FeishuClient(APP_ID, APP_SECRET)
     control = ControlAPI(base=CONTROL_BASE, api_prefix=API_PREFIX, api_token=API_TOKEN)
-    bridge = AppServerBotBridge(feishu=feishu, control=control, upload_root=UPLOAD_ROOT, menu_actions=menu_actions, projects=projects)
+    bridge = AppServerBotBridge(
+        feishu=feishu,
+        control=control,
+        upload_root=UPLOAD_ROOT,
+        menu_actions=menu_actions,
+        projects=projects,
+        project_root=PROJECT_ROOT,
+        projects_store_path=PROJECTS_STORE_PATH,
+        user_chat_map_path=USER_CHAT_MAP_PATH,
+    )
     level = _log_level_from_env()
 
     LOG.info("menu actions: %s", json.dumps(menu_actions, ensure_ascii=False))
     LOG.info("projects: %s", json.dumps(projects, ensure_ascii=False))
     LOG.info("attachment upload root: %s", str(UPLOAD_ROOT))
+    LOG.info("user chat map path: %s", str(USER_CHAT_MAP_PATH))
+    LOG.info(
+        "output auto send limits: max_count=%s max_size_mb=%s",
+        "unlimited" if OUTPUT_FILE_MAX_COUNT <= 0 else OUTPUT_FILE_MAX_COUNT,
+        OUTPUT_FILE_MAX_SIZE_MB,
+    )
 
     def _on_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
         bridge.handle_event_async(_message_event_to_payload(data))
