@@ -66,6 +66,8 @@
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
 - 空闲会话回收：`BRIDGE_IDLE_EVICT_SEC=600`（默认 10 分钟）
 - 回收扫描间隔：`BRIDGE_IDLE_SWEEP_INTERVAL_SEC=60`（默认 60 秒）
+- 自动切号：`BRIDGE_AUTO_AUTH_SWITCH_ENABLED=true`
+- 自动切号阈值：`BRIDGE_AUTO_AUTH_SWITCH_THRESHOLD_PCT=100`
 
 `app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 
@@ -118,6 +120,8 @@
 - `会话管理 -> 切换账号`
 
 即可切换当前 chat 绑定的账号。切换后会自动重置线程，后续消息使用新的账号继续运行。
+
+如果开启 `BRIDGE_AUTO_AUTH_SWITCH_ENABLED=true`，当当前账号额度达到阈值（默认 `100%`）时，桥接会自动切到下一个可用账号，并在返回消息顶部提示切换结果。
 
 ## systemd 部署（可选）
 

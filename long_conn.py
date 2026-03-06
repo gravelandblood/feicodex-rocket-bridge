@@ -1216,6 +1216,15 @@ class AppServerBotBridge:
         resp = self.control.turn(chat_id=chat_id, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         answer = str(data.get("assistant_text") or "").strip()
+        switch_info = data.get("auto_auth_switch") if isinstance(data.get("auto_auth_switch"), dict) else {}
+        if switch_info:
+            from_profile = str(switch_info.get("from") or "").strip() or "default"
+            to_profile = str(switch_info.get("to") or "").strip() or "default"
+            identity = str(switch_info.get("identity") or "").strip()
+            note = f"已自动切换账号：`{from_profile}` -> `{to_profile}`"
+            if identity:
+                note += f" ({identity})"
+            answer = (note + "\n\n" + answer).strip()
         return answer or "(assistant returned empty text)"
 
     def _run_session_command(self, chat_id: str, cmd_text: str) -> str:

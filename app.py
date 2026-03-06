@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -37,6 +38,13 @@ DEFAULT_PERSONALITY = os.environ.get("BRIDGE_DEFAULT_PERSONALITY", "pragmatic")
 DEFAULT_TURN_TIMEOUT_SEC = int(os.environ.get("BRIDGE_TURN_TIMEOUT_SEC", "21600"))
 IDLE_EVICT_SEC = max(0, int(os.environ.get("BRIDGE_IDLE_EVICT_SEC", "600")))
 IDLE_SWEEP_INTERVAL_SEC = max(10, int(os.environ.get("BRIDGE_IDLE_SWEEP_INTERVAL_SEC", "60")))
+AUTO_AUTH_SWITCH_ENABLED = str(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+AUTO_AUTH_SWITCH_THRESHOLD_PCT = max(1, min(100, int(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_THRESHOLD_PCT", "100"))))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -406,12 +414,105 @@ def _get_auth_profile(profile: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _list_switchable_auth_profiles() -> List[Dict[str, Any]]:
+    return [{"profile": "", "label": "default", "valid": True, "email": ""}] + [
+        item for item in _refresh_auth_profiles() if bool(item.get("valid"))
+    ]
+
+
+def _pick_next_auth_profile(current_profile: str) -> Optional[Dict[str, Any]]:
+    items = _list_switchable_auth_profiles()
+    keys = [str(item.get("profile") or "").strip() for item in items]
+    current = str(current_profile or "").strip()
+    if not keys:
+        return None
+    try:
+        start = keys.index(current)
+    except ValueError:
+        start = -1
+    for idx in range(1, len(items) + 1):
+        item = items[(start + idx) % len(items)]
+        if str(item.get("profile") or "").strip() != current:
+            return item
+    return None
+
+
+def _is_auth_limit_error(message: str) -> bool:
+    return bool(re.search(r"(429|rate[\s_-]*limit|quota|insufficient[\s_-]*quota|usage limit)", str(message or ""), re.I))
+
+
+def _rate_limit_exhausted(rate_limits: Dict[str, Any]) -> bool:
+    if not isinstance(rate_limits, dict):
+        return False
+    for key in ("primary", "secondary"):
+        node = rate_limits.get(key) if isinstance(rate_limits.get(key), dict) else {}
+        try:
+            used_percent = float(node.get("usedPercent"))
+        except Exception:
+            continue
+        if used_percent >= float(AUTO_AUTH_SWITCH_THRESHOLD_PCT):
+            return True
+    return False
+
+
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     profile = str(runtime.auth_profile or "").strip()
     if profile:
         runtime.client.env["CODEX_HOME"] = str(_profile_home_dir(profile))
     else:
         runtime.client.env.pop("CODEX_HOME", None)
+
+
+def _switch_runtime_auth_profile(runtime: ChatRuntime, profile: str, reason: str = "") -> Dict[str, Any]:
+    target = str(profile or "").strip()
+    meta = _get_auth_profile(target) if target else {"profile": "", "email": "", "home_dir": ""}
+    if target and (not meta or not bool(meta.get("valid"))):
+        raise HTTPException(status_code=400, detail=f"invalid auth profile: {target}")
+    previous = str(runtime.auth_profile or "").strip()
+    runtime.auth_profile = target
+    runtime.thread_id = ""
+    runtime.active_turn_id = ""
+    try:
+        runtime.client.stop()
+    except Exception:
+        pass
+    _apply_runtime_auth_profile(runtime)
+    _persist_runtime(
+        runtime,
+        {
+            "last_error": "",
+            "last_auto_auth_switch_from": previous,
+            "last_auto_auth_switch_to": target,
+            "last_auto_auth_switch_reason": str(reason or ""),
+            "last_auto_auth_switch_at": int(time.time()),
+        },
+    )
+    return {
+        "from": previous,
+        "to": target,
+        "identity": str((meta or {}).get("email") or (meta or {}).get("sub") or ""),
+        "home_dir": str((meta or {}).get("home_dir") or ""),
+    }
+
+
+def _maybe_auto_switch_auth_profile(runtime: ChatRuntime, reason: str = "") -> Optional[Dict[str, Any]]:
+    if not AUTO_AUTH_SWITCH_ENABLED:
+        return None
+    target = _pick_next_auth_profile(runtime.auth_profile)
+    if not target:
+        return None
+    profile = str(target.get("profile") or "").strip()
+    if profile == str(runtime.auth_profile or "").strip():
+        return None
+    info = _switch_runtime_auth_profile(runtime, profile=profile, reason=reason)
+    LOG.warning(
+        "auto auth switch chat_id=%s from=%s to=%s reason=%s",
+        runtime.chat_id,
+        info.get("from") or "default",
+        info.get("to") or "default",
+        reason,
+    )
+    return info
 
 
 def _ensure_thread(runtime: ChatRuntime, reset_thread: bool = False) -> str:
@@ -573,27 +674,17 @@ def chat_config_update(chat_id: str, body: UpdateChatConfigRequest) -> Dict[str,
 def chat_auth_profile_update(chat_id: str, body: UpdateChatAuthProfileRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     profile = str(body.profile or "").strip()
-    meta = _get_auth_profile(profile) if profile else None
-    if profile and (not meta or not bool(meta.get("valid"))):
-        raise HTTPException(status_code=400, detail=f"invalid auth profile: {profile}")
 
     with runtime.lock:
-        runtime.auth_profile = profile
-        runtime.thread_id = ""
-        runtime.active_turn_id = ""
-        try:
-            runtime.client.stop()
-        except Exception:
-            pass
-        _apply_runtime_auth_profile(runtime)
-        state = _persist_runtime(runtime, {"last_error": ""})
+        info = _switch_runtime_auth_profile(runtime, profile=profile, reason="manual")
+        state = STORE.get_chat(chat_id)
         return {
             "ok": True,
             "data": {
                 "chat_id": chat_id,
                 "auth_profile": profile,
-                "auth_identity": str((meta or {}).get("email") or (meta or {}).get("sub") or ""),
-                "home_dir": str((meta or {}).get("home_dir") or ""),
+                "auth_identity": str(info.get("identity") or ""),
+                "home_dir": str(info.get("home_dir") or ""),
                 "state": state,
             },
         }
@@ -631,10 +722,17 @@ def chat_thread_reset(chat_id: str, body: ResetThreadRequest) -> Dict[str, Any]:
 @ROUTER.post("/chat/{chat_id}/turn", dependencies=[Depends(require_api_token)])
 def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
+    auto_auth_switch: Optional[Dict[str, Any]] = None
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
         _apply_runtime_auth_profile(runtime)
+        preflight_limits = _read_rate_limits(runtime, allow_request=runtime.is_client_running())
+        if not preflight_limits:
+            persisted = STORE.get_chat(chat_id)
+            preflight_limits = dict(persisted.get("last_rate_limits") or {}) if isinstance(persisted.get("last_rate_limits"), dict) else {}
+        if _rate_limit_exhausted(preflight_limits):
+            auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="preflight rate limit exhausted")
         try:
             thread_id = _ensure_thread(runtime, reset_thread=bool(body.reset_thread))
         except AppServerError as exc:
@@ -674,11 +772,27 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
             )
         except AppServerError as exc:
-            state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
-            raise HTTPException(
-                status_code=502,
-                detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
-            ) from exc
+            if _is_auth_limit_error(str(exc)) and not auto_auth_switch:
+                auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason=str(exc))
+                if auto_auth_switch:
+                    thread_id = _ensure_thread(runtime, reset_thread=True)
+                    turn_start = runtime.client.turn_start(
+                        thread_id=thread_id,
+                        text=body.text,
+                        image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                    )
+                else:
+                    state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
+                    ) from exc
+            else:
+                state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
+                raise HTTPException(
+                    status_code=502,
+                    detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
+                ) from exc
 
         turn = turn_start.get("turn") if isinstance(turn_start.get("turn"), dict) else {}
         turn_id = str(turn.get("id") or "")
@@ -717,6 +831,8 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     "last_rate_limits": rate_limits,
                 },
             )
+            if _rate_limit_exhausted(rate_limits) and not auto_auth_switch:
+                auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="post-turn rate limit exhausted")
         return {
             "ok": True,
             "data": {
@@ -728,6 +844,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 "thread_status": thread_status,
                 "token_usage": token_usage,
                 "rate_limits": rate_limits,
+                "auto_auth_switch": auto_auth_switch,
                 "state": state,
             },
         }
