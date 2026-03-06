@@ -1131,6 +1131,9 @@ class AppServerBotBridge:
         pending_count = len(self._list_pending_files(chat_id))
         cwd = str(data.get("cwd") or "")
         proj = self._current_project_name(cwd)
+        auto_switch_enabled = bool(data.get("auto_auth_switch_enabled"))
+        auto_switch_threshold = int(data.get("auto_auth_switch_threshold_pct") or 0)
+        last_auto_switch = data.get("last_auto_auth_switch") if isinstance(data.get("last_auto_auth_switch"), dict) else {}
         usage_lines: List[str] = []
         if total_usage:
             usage_lines.append(
@@ -1163,6 +1166,17 @@ class AppServerBotBridge:
         if model_ctx is not None:
             usage_lines.append(f"model_context_window={model_ctx}")
         usage_lines.extend(_format_rate_limit_lines(rate_limits))
+        last_from = str(last_auto_switch.get("from") or "").strip() or "default"
+        last_to = str(last_auto_switch.get("to") or "").strip() or "default"
+        last_reason = str(last_auto_switch.get("reason") or "").strip()
+        last_at = int(last_auto_switch.get("at") or 0)
+        auto_switch_lines = [f"auto_auth_switch={'on' if auto_switch_enabled else 'off'} threshold={auto_switch_threshold}%"]
+        if last_at > 0:
+            last_when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_at))
+            line = f"last_auto_switch={last_from}->{last_to} at={last_when}"
+            if last_reason:
+                line += f" reason={last_reason}"
+            auto_switch_lines.append(line)
         return (
             "Status\n"
             f"chat_id={chat_id}\n"
@@ -1174,7 +1188,8 @@ class AppServerBotBridge:
             f"pending_files={pending_count}\n"
             f"model={data.get('model') or ''}\n"
             f"auth_profile={data.get('auth_profile') or 'default'}\n"
-            f"auth_identity={data.get('auth_identity') or ''}"
+            f"auth_identity={data.get('auth_identity') or ''}\n"
+            + "\n".join(auto_switch_lines)
             + ("\n" + "\n".join(usage_lines) if usage_lines else "")
         )
 
@@ -1338,14 +1353,27 @@ class AppServerBotBridge:
         tstatus = status.get("thread_status") if isinstance(status.get("thread_status"), dict) else {}
         auth_profile = str(status.get("auth_profile") or "").strip() or "default"
         auth_identity = str(status.get("auth_identity") or "").strip()
+        auto_switch_enabled = bool(status.get("auto_auth_switch_enabled"))
+        auto_switch_threshold = int(status.get("auto_auth_switch_threshold_pct") or 0)
+        last_auto_switch = status.get("last_auto_auth_switch") if isinstance(status.get("last_auto_auth_switch"), dict) else {}
         lines = [
             f"thread: `{status.get('thread_id') or '<none>'}`",
             f"active_turn: `{status.get('active_turn_id') or '<none>'}`",
             f"thread_status: `{json.dumps(tstatus, ensure_ascii=False)}`",
             f"model: `{status.get('model') or ''}`",
             f"account: `{auth_profile}`" + (f" ({auth_identity})" if auth_identity else ""),
+            f"auto_switch: `{'on' if auto_switch_enabled else 'off'} / {auto_switch_threshold}%`",
             f"pending_files: `{len(self._list_pending_files(chat_id))}`",
         ]
+        last_from = str(last_auto_switch.get("from") or "").strip() or "default"
+        last_to = str(last_auto_switch.get("to") or "").strip() or "default"
+        last_reason = str(last_auto_switch.get("reason") or "").strip()
+        last_at = int(last_auto_switch.get("at") or 0)
+        if last_at > 0:
+            last_when = time.strftime("%m-%d %H:%M", time.localtime(last_at))
+            lines.append(f"last_switch: `{last_from} -> {last_to} @ {last_when}`")
+            if last_reason:
+                lines.append(f"reason: `{_trim(last_reason, 180)}`")
         return {
             "config": {"wide_screen_mode": True},
             "header": self._card_header("会话管理（Codex 内部命令）"),

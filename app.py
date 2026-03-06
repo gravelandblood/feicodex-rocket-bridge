@@ -605,6 +605,12 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
         token_usage = dict(persisted.get("last_token_usage") or {})
     if not rate_limits and isinstance(persisted.get("last_rate_limits"), dict):
         rate_limits = dict(persisted.get("last_rate_limits") or {})
+    last_auto_auth_switch = {
+        "from": str(persisted.get("last_auto_auth_switch_from") or "").strip(),
+        "to": str(persisted.get("last_auto_auth_switch_to") or "").strip(),
+        "reason": str(persisted.get("last_auto_auth_switch_reason") or "").strip(),
+        "at": int(persisted.get("last_auto_auth_switch_at") or 0),
+    }
 
     return {
         "ok": True,
@@ -623,6 +629,9 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
             "personality": str(runtime.personality or persisted.get("personality") or DEFAULT_PERSONALITY),
             "auth_profile": auth_profile,
             "auth_identity": str((auth_meta or {}).get("email") or (auth_meta or {}).get("sub") or ""),
+            "auto_auth_switch_enabled": AUTO_AUTH_SWITCH_ENABLED,
+            "auto_auth_switch_threshold_pct": AUTO_AUTH_SWITCH_THRESHOLD_PCT,
+            "last_auto_auth_switch": last_auto_auth_switch,
             "state": persisted,
         },
     }
