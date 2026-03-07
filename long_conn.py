@@ -120,6 +120,28 @@ def _split_text(text: str, max_len: int = 1500) -> List[str]:
     return out
 
 
+def _split_text_by_boundary(text: str, max_len: int = 1500) -> List[str]:
+    raw = str(text or "")
+    if len(raw) <= max_len:
+        return [raw]
+    out: List[str] = []
+    remaining = raw
+    while len(remaining) > max_len:
+        window = remaining[:max_len]
+        cut = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind("。"), window.rfind("！"), window.rfind("？"))
+        if cut < max_len // 3:
+            cut = max(window.rfind(" "), window.rfind("，"), window.rfind(","), window.rfind("；"), window.rfind(";"))
+        if cut < max_len // 3:
+            cut = max_len
+        else:
+            cut += 1
+        out.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        out.append(remaining)
+    return [item for item in out if item]
+
+
 def _trim(text: str, max_len: int = 1200) -> str:
     txt = str(text or "")
     if len(txt) <= max_len:
@@ -169,6 +191,78 @@ def _sanitize_filename(raw: str, fallback: str) -> str:
     if not safe:
         safe = fallback
     return safe[:120]
+
+
+def _normalize_display_line(line: str, in_code_block: bool = False) -> str:
+    txt = str(line or "").rstrip()
+    if not txt.strip():
+        return ""
+    if in_code_block:
+        return "    " + txt.strip("\n")
+    stripped = txt.strip()
+    heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
+    if heading:
+        stripped = heading.group(1)
+    quote = re.match(r"^>\s*(.+)$", stripped)
+    if quote:
+        stripped = f"引用：{quote.group(1)}"
+    bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
+    if bullet:
+        stripped = f"• {bullet.group(1)}"
+    numbered = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+    if numbered:
+        stripped = f"{numbered.group(1)}. {numbered.group(2)}"
+    stripped = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1", stripped)
+    stripped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", stripped)
+    stripped = stripped.replace("**", "").replace("__", "").replace("`", "")
+    return stripped.strip()
+
+
+def _text_to_post_chunks(text: str, title: str = "Codex 回复", max_chars: int = 4500, max_rows: int = 35) -> List[Dict[str, Any]]:
+    rows: List[List[Dict[str, str]]] = []
+    in_code_block = False
+    for raw_line in str(text or "").splitlines():
+        marker = raw_line.strip()
+        if marker.startswith("```"):
+            in_code_block = not in_code_block
+            if in_code_block:
+                rows.append([{"tag": "text", "text": "代码："}])
+            continue
+        normalized = _normalize_display_line(raw_line, in_code_block=in_code_block)
+        if not normalized:
+            continue
+        for part in _split_text_by_boundary(normalized, 450):
+            rows.append([{"tag": "text", "text": part}])
+    if not rows:
+        rows = [[{"tag": "text", "text": "(empty)"}]]
+
+    chunks: List[Dict[str, Any]] = []
+    current_rows: List[List[Dict[str, str]]] = []
+    current_chars = 0
+    for row in rows:
+        row_chars = sum(len(str(cell.get("text") or "")) for cell in row)
+        if current_rows and (len(current_rows) >= max_rows or current_chars + row_chars > max_chars):
+            chunks.append({"title": title, "rows": current_rows})
+            current_rows = []
+            current_chars = 0
+        current_rows.append(row)
+        current_chars += row_chars
+    if current_rows:
+        chunks.append({"title": title, "rows": current_rows})
+
+    if len(chunks) > 1:
+        total = len(chunks)
+        for idx, item in enumerate(chunks, start=1):
+            item["title"] = f"{title} ({idx}/{total})"
+    return chunks
+
+
+def _text_to_card_chunks(text: str, max_len: int = 8000) -> List[str]:
+    normalized = str(text or "").strip()
+    chunks = [part for part in _split_text_by_boundary(normalized, max_len=max_len) if part.strip()]
+    if not chunks:
+        chunks = ["(empty)"]
+    return chunks
 
 
 def _guess_suffix(msg_type: str) -> str:
@@ -324,6 +418,93 @@ class FeishuClient:
 
     def send_text(self, chat_id: str, text: str) -> None:
         self.send_text_by_receive_id(chat_id, text, receive_id_type="chat_id")
+
+    def send_post_by_receive_id(self, receive_id: str, text: str, title: str = "Codex 回复", receive_id_type: str = "chat_id") -> None:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type={receive_id_type}"
+        for chunk in _text_to_post_chunks(text=text, title=title):
+            payload = {
+                "receive_id": receive_id,
+                "msg_type": "post",
+                "content": json.dumps(
+                    {
+                        "zh_cn": {
+                            "title": str(chunk.get("title") or title),
+                            "content": chunk.get("rows") or [[{"tag": "text", "text": "(empty)"}]],
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"send_post failed status={resp.status_code} body={resp.text}")
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"send_post feishu err: {data}")
+
+    def send_post(self, chat_id: str, text: str, title: str = "Codex 回复") -> None:
+        self.send_post_by_receive_id(chat_id, text=text, title=title, receive_id_type="chat_id")
+
+    def send_markdown_card(self, chat_id: str, text: str, title: str = "Codex 回复") -> None:
+        for idx, chunk in enumerate(_text_to_card_chunks(text=text), start=1):
+            content = chunk
+            if idx > 1:
+                content = f"（续 {idx}）\n\n{content}"
+            self.send_card(
+                chat_id,
+                {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "body": {
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "content": content,
+                            }
+                        ]
+                    },
+                },
+            )
+
+    def smart_send_by_receive_id(
+        self,
+        receive_id: str,
+        text: str,
+        receive_id_type: str = "chat_id",
+        title: str = "Codex 回复",
+        prefer_rich: bool = True,
+    ) -> None:
+        raw = str(text or "").strip()
+        if not raw:
+            return
+        looks_structured = ("\n" in raw) or bool(re.search(r"(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+\.\s|```|>)", raw))
+        use_post = prefer_rich and (len(raw) > 280 or looks_structured)
+        if not use_post:
+            self.send_text_by_receive_id(receive_id, raw, receive_id_type=receive_id_type)
+            return
+        try:
+            if receive_id_type == "chat_id":
+                self.send_markdown_card(receive_id, raw, title=title)
+                return
+            self.send_post_by_receive_id(receive_id, raw, title=title, receive_id_type=receive_id_type)
+        except Exception as card_exc:
+            LOG.warning("smart_send card fallback receive_id=%s err=%s", receive_id, card_exc)
+            try:
+                self.send_post_by_receive_id(receive_id, raw, title=title, receive_id_type=receive_id_type)
+            except Exception as post_exc:
+                LOG.warning("smart_send post fallback to text receive_id=%s err=%s", receive_id, post_exc)
+                self.send_text_by_receive_id(receive_id, raw, receive_id_type=receive_id_type)
+
+    def smart_send(self, chat_id: str, text: str, title: str = "Codex 回复", prefer_rich: bool = True) -> None:
+        self.smart_send_by_receive_id(
+            chat_id,
+            text=text,
+            receive_id_type="chat_id",
+            title=title,
+            prefer_rich=prefer_rich,
+        )
 
     def reply_text(self, message_id: str, text: str) -> str:
         mid = str(message_id or "").strip()
@@ -893,7 +1074,7 @@ class AppServerBotBridge:
                 continue
             try:
                 answer = self._run_turn(chat_id=chat_id, text=text, image_paths=image_paths)
-                self.feishu.send_text(chat_id, answer)
+                self.feishu.smart_send(chat_id, answer)
             except Exception as exc:
                 self.feishu.send_text(chat_id, f"排队任务处理失败:\n{exc}")
 
@@ -1563,17 +1744,15 @@ class AppServerBotBridge:
                 if progress_thread:
                     progress_thread.join(timeout=1.0)
                 if reply_tip_mid:
-                    chunks = _split_text(answer, 1500)
                     try:
-                        self.feishu.update_text(reply_tip_mid, chunks[0] if chunks else "(assistant returned empty text)")
+                        self.feishu.delete_message(reply_tip_mid)
                         reply_tip_consumed = True
-                        for extra in chunks[1:]:
-                            self.feishu.send_text(chat_id, extra)
+                        self.feishu.smart_send(chat_id, answer)
                     except Exception as exc:
                         LOG.warning("reply tip update final failed message_id=%s err=%s", reply_tip_mid, exc)
-                        self.feishu.send_text(chat_id, answer)
+                        self.feishu.smart_send(chat_id, answer)
                 else:
-                    self.feishu.send_text(chat_id, answer)
+                    self.feishu.smart_send(chat_id, answer)
                 self._send_output_files(chat_id, output_files)
                 self._drain_queued_inputs(chat_id)
                 LOG.info("turn done chat_id=%s message_id=%s elapsed=%.3fs", chat_id, message_id or "<none>", time.time() - start)
@@ -1815,7 +1994,7 @@ class AppServerBotBridge:
                 answer = self._status_text(chat_id)
             else:
                 answer = self._run_session_command(chat_id=chat_id, cmd_text=cmd)
-            self.feishu.send_text(chat_id, _trim(answer, 3000))
+            self.feishu.smart_send(chat_id, _trim(answer, 3000), title=f"Codex {cmd}")
             return
 
         if op == "session_model_start":
@@ -1873,15 +2052,16 @@ class AppServerBotBridge:
                 self.control.update_config(chat_id=chat_id, model=synced_model)
             except Exception as exc:
                 sync_note = f"\n\nconfig_sync_failed: {exc}"
-            self.feishu.send_text(
+            self.feishu.smart_send(
                 chat_id,
-                _trim(
+                text=_trim(
                     "模型切换完成。\n\n"
                     f"/model use {model}\n{result_model}\n\n"
                     f"/effort {effort}\n{result_effort}\n\n"
                     f"verify:\n{verify}{sync_note}",
                     3500,
                 ),
+                title="模型切换结果",
             )
             return
 
