@@ -300,6 +300,14 @@ def _merge_streaming_text(previous_text: str, next_text: str) -> str:
     return nxt
 
 
+def _final_stream_card_text(text: str, max_chunk_len: int = 3500) -> str:
+    raw = str(text or "").strip()
+    chunks = _text_to_card_chunks(raw, max_len=max_chunk_len)
+    if len(chunks) <= 1:
+        return raw
+    return f"{chunks[0]}\n\n---\n内容较长，卡片先显示第 1/{len(chunks)} 段。完整内容可在历史页查看。"
+
+
 def _truncate_summary(text: str, max_len: int = 50) -> str:
     clean = str(text or "").replace("\n", " ").strip()
     if len(clean) <= max_len:
@@ -797,7 +805,7 @@ class FeishuStreamingCardSession:
                 return
             final_merged = _merge_streaming_text(self.current_text, final_text)
             if final_merged and final_merged != self.current_text:
-                self._update_content(final_merged)
+                self._update_content(_final_stream_card_text(final_merged))
                 self.current_text = final_merged
             self.sequence += 1
             token = self.feishu._tenant_access_token()
