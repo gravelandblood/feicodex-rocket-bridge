@@ -50,6 +50,7 @@ API_PREFIX = str(os.getenv("BRIDGE_API_PREFIX", "/appbridge/api")).strip()
 API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
 TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
 PROGRESS_PING_INTERVAL_SEC = max(30, int(os.getenv("BRIDGE_PROGRESS_PING_INTERVAL_SEC", "180")))
+STREAMING_CARD_UPDATE_INTERVAL_SEC = max(2, int(os.getenv("BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC", "5")))
 UPLOAD_ROOT = Path(os.getenv("BRIDGE_UPLOAD_ROOT", str(APP_DIR / "data" / "uploads"))).expanduser()
 if not UPLOAD_ROOT.is_absolute():
     UPLOAD_ROOT = APP_DIR / UPLOAD_ROOT
@@ -67,6 +68,18 @@ if not USER_CHAT_MAP_PATH.is_absolute():
     USER_CHAT_MAP_PATH = APP_DIR / USER_CHAT_MAP_PATH
 USER_CHAT_MAP_PATH = USER_CHAT_MAP_PATH.resolve()
 CARD_AUTO_DELETE_ON_ACTION = str(os.getenv("BRIDGE_CARD_AUTO_DELETE_ON_ACTION", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+STREAMING_CARD_ENABLED = str(os.getenv("BRIDGE_STREAMING_CARD_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+TYPING_REACTION_ENABLED = str(os.getenv("BRIDGE_TYPING_REACTION_ENABLED", "true")).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -263,6 +276,55 @@ def _text_to_card_chunks(text: str, max_len: int = 8000) -> List[str]:
     if not chunks:
         chunks = ["(empty)"]
     return chunks
+
+
+def _merge_streaming_text(previous_text: str, next_text: str) -> str:
+    previous = str(previous_text or "")
+    nxt = str(next_text or "")
+    if not nxt:
+        return previous
+    if not previous or nxt == previous:
+        return nxt
+    if nxt.startswith(previous) or nxt.endswith(previous):
+        return nxt
+    if previous.startswith(nxt) or previous.endswith(nxt):
+        return previous
+    if nxt in previous:
+        return previous
+    if previous in nxt:
+        return nxt
+    max_overlap = min(len(previous), len(nxt))
+    for overlap in range(max_overlap, 0, -1):
+        if previous[-overlap:] == nxt[:overlap]:
+            return previous + nxt[overlap:]
+    return nxt
+
+
+def _truncate_summary(text: str, max_len: int = 50) -> str:
+    clean = str(text or "").replace("\n", " ").strip()
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 3] + "..."
+
+
+def _format_elapsed_human(total_sec: int) -> str:
+    total = max(0, int(total_sec or 0))
+    hours, rem = divmod(total, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}小时{mins}分{secs}秒"
+    if mins > 0:
+        return f"{mins}分{secs}秒"
+    return f"{secs}秒"
+
+
+def _clean_progress_preview(text: str, max_len: int = 480) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return _trim(raw, max_len)
 
 
 def _guess_suffix(msg_type: str) -> str:
@@ -503,46 +565,59 @@ class FeishuClient:
             text=text,
             receive_id_type="chat_id",
             title=title,
-            prefer_rich=prefer_rich,
-        )
+                prefer_rich=prefer_rich,
+            )
 
-    def reply_text(self, message_id: str, text: str) -> str:
+    def send_card_reference(self, chat_id: str, card_id: str, reply_to_message_id: str = "") -> str:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        content = json.dumps({"type": "card", "data": {"card_id": str(card_id)}}, ensure_ascii=False)
+        if str(reply_to_message_id or "").strip():
+            url = f"{FEISHU_API}/im/v1/messages/{reply_to_message_id}/reply"
+            payload = {"msg_type": "interactive", "content": content}
+        else:
+            url = f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"
+            payload = {"receive_id": chat_id, "msg_type": "interactive", "content": content}
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"send_card_reference failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_card_reference feishu err: {data}")
+        out = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return str(out.get("message_id") or "").strip()
+
+    def add_typing_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
         mid = str(message_id or "").strip()
         if not mid:
             return ""
         token = self._tenant_access_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{FEISHU_API}/im/v1/messages/{mid}/reply"
-        payload = {
-            "msg_type": "text",
-            "content": json.dumps({"text": str(text or "")}, ensure_ascii=False),
-        }
+        url = f"{FEISHU_API}/im/v1/messages/{mid}/reactions"
+        payload = {"reaction_type": {"emoji_type": emoji_type}}
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         if resp.status_code >= 300:
-            raise RuntimeError(f"reply_text failed status={resp.status_code} body={resp.text}")
+            raise RuntimeError(f"add_typing_reaction failed status={resp.status_code} body={resp.text}")
         data = resp.json()
         if data.get("code") != 0:
-            raise RuntimeError(f"reply_text feishu err: {data}")
-        out = data.get("data") if isinstance(data.get("data"), dict) else {}
-        return str(out.get("message_id") or "").strip()
+            raise RuntimeError(f"add_typing_reaction feishu err: {data}")
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return str(body.get("reaction_id") or "").strip()
 
-    def update_text(self, message_id: str, text: str) -> None:
+    def delete_typing_reaction(self, message_id: str, reaction_id: str) -> None:
         mid = str(message_id or "").strip()
-        if not mid:
+        rid = str(reaction_id or "").strip()
+        if not mid or not rid:
             return
         token = self._tenant_access_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{FEISHU_API}/im/v1/messages/{mid}"
-        payload = {
-            "msg_type": "text",
-            "content": json.dumps({"text": str(text or "")}, ensure_ascii=False),
-        }
-        resp = requests.put(url, headers=headers, json=payload, timeout=20)
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}/reactions/{rid}"
+        resp = requests.delete(url, headers=headers, timeout=20)
         if resp.status_code >= 300:
-            raise RuntimeError(f"update_text failed status={resp.status_code} body={resp.text}")
+            raise RuntimeError(f"delete_typing_reaction failed status={resp.status_code} body={resp.text}")
         data = resp.json()
         if data.get("code") != 0:
-            raise RuntimeError(f"update_text feishu err: {data}")
+            raise RuntimeError(f"delete_typing_reaction feishu err: {data}")
 
     def delete_message(self, message_id: str) -> None:
         mid = str(message_id or "").strip()
@@ -615,75 +690,6 @@ class FeishuClient:
         file_key = self.upload_file(file_path=file_path, file_name=file_name)
         return self.send_file_by_receive_id(chat_id, file_key, receive_id_type="chat_id")
 
-    def create_reply_status(self, user_open_id: str, biz_id: str, text: str = "🤖 正在回复") -> bool:
-        open_id = str(user_open_id or "").strip()
-        biz = str(biz_id or "").strip()
-        if not open_id or not biz:
-            return False
-        token = self._tenant_access_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{FEISHU_API}/im/v2/app_feed_card?user_id_type=open_id"
-        payload = {
-            "user_ids": [open_id],
-            "app_feed_card": {
-                "biz_id": biz,
-                "status_label": {
-                    "text": str(text or "🤖 正在回复"),
-                    "type": "primary",
-                },
-            },
-        }
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=20)
-        except Exception as exc:
-            LOG.warning("create_reply_status request failed open_id=%s biz_id=%s err=%s", open_id, biz, exc)
-            return False
-        if resp.status_code >= 300:
-            LOG.warning("create_reply_status failed status=%s body=%s", resp.status_code, resp.text)
-            return False
-        try:
-            data = resp.json()
-        except Exception:
-            LOG.warning("create_reply_status invalid json body=%s", resp.text[:400])
-            return False
-        if data.get("code") != 0:
-            LOG.warning("create_reply_status feishu err: %s", data)
-            return False
-        failed = ((data.get("data") or {}).get("failed_cards") or []) if isinstance(data.get("data"), dict) else []
-        if failed:
-            LOG.warning("create_reply_status has failed_cards: %s", failed)
-            return False
-        return True
-
-    def delete_reply_status(self, user_open_id: str, biz_id: str) -> None:
-        open_id = str(user_open_id or "").strip()
-        biz = str(biz_id or "").strip()
-        if not open_id or not biz:
-            return
-        token = self._tenant_access_token()
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{FEISHU_API}/im/v2/app_feed_card/batch?user_id_type=open_id"
-        payload = {"feed_cards": [{"biz_id": biz, "user_id": open_id}]}
-        try:
-            resp = requests.delete(url, headers=headers, json=payload, timeout=20)
-        except Exception as exc:
-            LOG.warning("delete_reply_status request failed open_id=%s biz_id=%s err=%s", open_id, biz, exc)
-            return
-        if resp.status_code >= 300:
-            LOG.warning("delete_reply_status failed status=%s body=%s", resp.status_code, resp.text)
-            return
-        try:
-            data = resp.json()
-        except Exception:
-            LOG.warning("delete_reply_status invalid json body=%s", resp.text[:400])
-            return
-        if data.get("code") != 0:
-            LOG.warning("delete_reply_status feishu err: %s", data)
-            return
-        failed = ((data.get("data") or {}).get("failed_cards") or []) if isinstance(data.get("data"), dict) else []
-        if failed:
-            LOG.warning("delete_reply_status has failed_cards: %s", failed)
-
     def download_image(self, image_key: str, save_path: Path) -> None:
         token = self._tenant_access_token()
         headers = {"Authorization": f"Bearer {token}"}
@@ -701,6 +707,126 @@ class FeishuClient:
         resp.raise_for_status()
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_bytes(resp.content)
+
+
+class FeishuStreamingCardSession:
+    def __init__(self, feishu: FeishuClient, chat_id: str, reply_to_message_id: str = "") -> None:
+        self.feishu = feishu
+        self.chat_id = str(chat_id or "").strip()
+        self.reply_to_message_id = str(reply_to_message_id or "").strip()
+        self.card_id = ""
+        self.message_id = ""
+        self.sequence = 0
+        self.current_text = ""
+        self.closed = False
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        if self.card_id:
+            return
+        token = self.feishu._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        card_json = {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": "处理中..."},
+                "streaming_config": {"print_frequency_ms": {"default": 50}, "print_step": {"default": 1}},
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "正在处理你的请求\n\n稍后会把进展显示在这里。",
+                        "element_id": "content",
+                    },
+                ]
+            },
+        }
+        payload = {"type": "card_json", "data": json.dumps(card_json, ensure_ascii=False)}
+        resp = requests.post(f"{FEISHU_API}/cardkit/v1/cards", headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"stream card create failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"stream card create feishu err: {data}")
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        self.card_id = str(body.get("card_id") or "").strip()
+        if not self.card_id:
+            raise RuntimeError(f"stream card create missing card_id: {data}")
+        self.message_id = self.feishu.send_card_reference(
+            chat_id=self.chat_id,
+            card_id=self.card_id,
+            reply_to_message_id=self.reply_to_message_id,
+        )
+
+    def _update_content(self, text: str) -> None:
+        if not self.card_id:
+            return
+        self.sequence += 1
+        token = self.feishu._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {"content": text, "sequence": self.sequence, "uuid": f"s_{self.card_id}_{self.sequence}"}
+        resp = requests.put(
+            f"{FEISHU_API}/cardkit/v1/cards/{self.card_id}/elements/content/content",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"stream card update failed status={resp.status_code} body={resp.text}")
+
+    def update(self, text: str) -> None:
+        if self.closed or not self.card_id:
+            return
+        merged = _merge_streaming_text(self.current_text, text)
+        if not merged or merged == self.current_text:
+            return
+        with self._lock:
+            merged = _merge_streaming_text(self.current_text, merged)
+            if not merged or merged == self.current_text:
+                return
+            self._update_content(merged)
+            self.current_text = merged
+
+    def close(self, final_text: str = "") -> None:
+        if self.closed or not self.card_id:
+            return
+        with self._lock:
+            if self.closed:
+                return
+            final_merged = _merge_streaming_text(self.current_text, final_text)
+            if final_merged and final_merged != self.current_text:
+                self._update_content(final_merged)
+                self.current_text = final_merged
+            self.sequence += 1
+            token = self.feishu._tenant_access_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+            payload = {
+                "settings": json.dumps(
+                    {
+                        "config": {
+                            "streaming_mode": False,
+                            "summary": {"content": _truncate_summary(self.current_text)},
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                "sequence": self.sequence,
+                "uuid": f"c_{self.card_id}_{self.sequence}",
+            }
+            resp = requests.patch(
+                f"{FEISHU_API}/cardkit/v1/cards/{self.card_id}/settings",
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            if resp.status_code >= 300:
+                raise RuntimeError(f"stream card close failed status={resp.status_code} body={resp.text}")
+            self.closed = True
+
+    def is_active(self) -> bool:
+        return bool(self.card_id) and not self.closed
 
 
 class ControlAPI:
@@ -1376,19 +1502,36 @@ class AppServerBotBridge:
 
     def _progress_ping_text(self, chat_id: str, started_at: float) -> str:
         data = self._status_data(chat_id)
-        elapsed = max(0, int(time.time() - float(started_at or time.time())))
-        mins, secs = divmod(elapsed, 60)
-        active_turn = str(data.get("active_turn_id") or "<none>")
-        thread_status = data.get("thread_status") if isinstance(data.get("thread_status"), dict) else {}
         progress = data.get("turn_progress") if isinstance(data.get("turn_progress"), dict) else {}
-        preview = _trim(str(progress.get("preview") or "").strip().replace("\n", " "), 320)
+        turn_events = data.get("turn_events") if isinstance(data.get("turn_events"), list) else []
+        elapsed = max(
+            int(progress.get("elapsed_sec") or 0),
+            max(0, int(time.time() - float(started_at or time.time()))),
+        )
+        last_event_at = int(progress.get("last_event_at") or 0)
+        silent_for = max(0, int(time.time()) - last_event_at) if last_event_at > 0 else 0
+        preview = _clean_progress_preview(str(progress.get("preview") or ""))
         lines = [
-            f"⏳ 任务仍在执行（{mins}m{secs:02d}s）",
-            f"turn={active_turn}",
-            f"thread_status={json.dumps(thread_status, ensure_ascii=False)}",
+            "正在处理你的请求",
+            "",
+            f"已处理 {_format_elapsed_human(elapsed)}。",
         ]
         if preview:
-            lines.append(f"current: {preview}")
+            lines.extend(["", "当前进展：", "", preview])
+        elif elapsed < 20:
+            lines.extend(["", "我正在理解你的问题，并准备接下来的处理步骤。"])
+        else:
+            lines.extend(["", "任务还在继续，暂时还没有适合展示的中间文字。"])
+        recent_events = [
+            str(evt.get("text") or "").strip()
+            for evt in turn_events[-3:]
+            if isinstance(evt, dict) and str(evt.get("text") or "").strip()
+        ]
+        if recent_events:
+            lines.extend(["", "最近在做："])
+            lines.extend([f"- {item}" for item in recent_events])
+        if silent_for >= 30:
+            lines.extend(["", f"最近 {_format_elapsed_human(silent_for)} 没有新的文字输出，可能正在读取文件或执行命令。"])
         return "\n".join(lines)
 
     def _progress_ping_loop(
@@ -1396,13 +1539,14 @@ class AppServerBotBridge:
         chat_id: str,
         started_at: float,
         stop_event: threading.Event,
-        reply_tip_mid: str,
+        streaming_card: Optional[FeishuStreamingCardSession],
     ) -> None:
-        while not stop_event.wait(PROGRESS_PING_INTERVAL_SEC):
+        interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if (streaming_card and streaming_card.is_active()) else PROGRESS_PING_INTERVAL_SEC
+        while not stop_event.wait(interval_sec):
             try:
                 text = self._progress_ping_text(chat_id=chat_id, started_at=started_at)
-                if reply_tip_mid:
-                    self.feishu.update_text(reply_tip_mid, text)
+                if streaming_card and streaming_card.is_active():
+                    streaming_card.update(text)
                 else:
                     self.feishu.send_text(chat_id, text)
             except Exception as exc:
@@ -1684,25 +1828,15 @@ class AppServerBotBridge:
 
         pending_files = self._consume_pending_files(chat_id)
         prompt, image_paths = self._build_prompt_with_files(raw, pending_files)
-        typing_biz_id = ""
-        has_app_feed_status = False
-        reply_tip_mid = ""
-        reply_tip_consumed = False
+        typing_reaction_id = ""
         progress_stop = threading.Event()
         progress_thread: Optional[threading.Thread] = None
-        sender_open_id = str(sender_open_id or "").strip()
-        if sender_open_id:
-            msg = str(message_id or "").strip()
-            if msg:
-                typing_biz_id = f"typing:{msg}"
-            else:
-                typing_biz_id = f"typing:{chat_id}:{int(time.time() * 1000)}"
-            has_app_feed_status = self.feishu.create_reply_status(sender_open_id, typing_biz_id, "🤖 正在回复")
-        if (not has_app_feed_status) and str(message_id or "").strip():
+        streaming_card: Optional[FeishuStreamingCardSession] = None
+        if TYPING_REACTION_ENABLED and str(message_id or "").strip():
             try:
-                reply_tip_mid = self.feishu.reply_text(str(message_id), "🤖 正在回复...")
+                typing_reaction_id = self.feishu.add_typing_reaction(str(message_id))
             except Exception as exc:
-                LOG.warning("reply tip create failed message_id=%s err=%s", message_id or "<none>", exc)
+                LOG.warning("typing reaction create failed message_id=%s err=%s", message_id or "<none>", exc)
 
         try:
             lock = self._chat_lock(chat_id)
@@ -1710,29 +1844,27 @@ class AppServerBotBridge:
                 LOG.info("chat busy, steering message chat_id=%s message_id=%s", chat_id, message_id or "<none>")
                 try:
                     self.control.steer(chat_id=chat_id, text=prompt, image_paths=image_paths)
-                    if reply_tip_mid:
-                        try:
-                            self.feishu.delete_message(reply_tip_mid)
-                        except Exception as exc:
-                            LOG.warning("reply tip delete failed message_id=%s err=%s", reply_tip_mid, exc)
                 except Exception as steer_exc:
                     queued = self._enqueue_input(chat_id=chat_id, text=prompt, image_paths=image_paths)
-                    if reply_tip_mid:
-                        try:
-                            self.feishu.update_text(reply_tip_mid, f"已加入队列（第{queued}条）")
-                            reply_tip_consumed = True
-                        except Exception as exc:
-                            LOG.warning("reply tip update failed message_id=%s err=%s", reply_tip_mid, exc)
-                            self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
-                    else:
-                        self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
+                    self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
                 return
             try:
                 start = time.time()
                 LOG.info("turn start chat_id=%s message_id=%s", chat_id, message_id or "<none>")
+                if STREAMING_CARD_ENABLED and str(message_id or "").strip():
+                    try:
+                        streaming_card = FeishuStreamingCardSession(
+                            self.feishu,
+                            chat_id=chat_id,
+                            reply_to_message_id=str(message_id or ""),
+                        )
+                        streaming_card.start()
+                    except Exception as exc:
+                        LOG.warning("stream card start failed message_id=%s err=%s", message_id or "<none>", exc)
+                        streaming_card = None
                 progress_thread = threading.Thread(
                     target=self._progress_ping_loop,
-                    args=(chat_id, start, progress_stop, reply_tip_mid),
+                    args=(chat_id, start, progress_stop, streaming_card),
                     daemon=True,
                 )
                 progress_thread.start()
@@ -1743,13 +1875,11 @@ class AppServerBotBridge:
                 progress_stop.set()
                 if progress_thread:
                     progress_thread.join(timeout=1.0)
-                if reply_tip_mid:
+                if streaming_card and streaming_card.is_active():
                     try:
-                        self.feishu.delete_message(reply_tip_mid)
-                        reply_tip_consumed = True
-                        self.feishu.smart_send(chat_id, answer)
+                        streaming_card.close(answer)
                     except Exception as exc:
-                        LOG.warning("reply tip update final failed message_id=%s err=%s", reply_tip_mid, exc)
+                        LOG.warning("stream card close failed message_id=%s err=%s", message_id or "<none>", exc)
                         self.feishu.smart_send(chat_id, answer)
                 else:
                     self.feishu.smart_send(chat_id, answer)
@@ -1761,10 +1891,9 @@ class AppServerBotBridge:
                 progress_stop.set()
                 if progress_thread:
                     progress_thread.join(timeout=1.0)
-                if reply_tip_mid:
+                if streaming_card and streaming_card.is_active():
                     try:
-                        self.feishu.update_text(reply_tip_mid, f"处理失败:\n{exc}")
-                        reply_tip_consumed = True
+                        streaming_card.close(f"处理失败:\n{exc}")
                     except Exception:
                         self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
                 else:
@@ -1778,13 +1907,16 @@ class AppServerBotBridge:
             progress_stop.set()
             if progress_thread and progress_thread.is_alive():
                 progress_thread.join(timeout=0.5)
-            if typing_biz_id and sender_open_id and has_app_feed_status:
-                self.feishu.delete_reply_status(sender_open_id, typing_biz_id)
-            if reply_tip_mid and (not reply_tip_consumed):
+            if typing_reaction_id and str(message_id or "").strip():
                 try:
-                    self.feishu.delete_message(reply_tip_mid)
+                    self.feishu.delete_typing_reaction(str(message_id), typing_reaction_id)
                 except Exception as exc:
-                    LOG.warning("reply tip cleanup failed message_id=%s err=%s", reply_tip_mid, exc)
+                    LOG.warning("typing reaction cleanup failed message_id=%s err=%s", message_id or "<none>", exc)
+            if streaming_card and streaming_card.is_active():
+                try:
+                    streaming_card.close()
+                except Exception as exc:
+                    LOG.warning("stream card cleanup failed message_id=%s err=%s", message_id or "<none>", exc)
 
     def _handle_event(self, payload: Dict[str, Any]) -> None:
         header = payload.get("header") if isinstance(payload.get("header"), dict) else {}

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -79,6 +80,8 @@ class CodexAppServerClient:
         self._turn_started_at_by_thread: Dict[str, float] = {}
         self._turn_last_event_at_by_thread: Dict[str, float] = {}
         self._turn_preview_by_thread: Dict[str, str] = {}
+        self._turn_events_by_thread: Dict[str, List[Dict[str, Any]]] = {}
+        self._last_status_type_by_thread: Dict[str, str] = {}
 
     def start(self, experimental_api: bool = True) -> Dict[str, Any]:
         if self.proc and self.proc.poll() is None and self._ready:
@@ -366,6 +369,18 @@ class CodexAppServerClient:
             "preview": preview,
         }
 
+    def get_turn_events(self, thread_id: str, turn_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        tid = str(thread_id or "")
+        target_turn = str(turn_id or "").strip()
+        cap = max(1, int(limit or 20))
+        with self._thread_status_lock:
+            items = list(self._turn_events_by_thread.get(tid) or [])
+        if target_turn:
+            items = [item for item in items if str(item.get("turn_id") or "") in {"", target_turn}]
+        if len(items) > cap:
+            items = items[-cap:]
+        return [dict(item) for item in items]
+
     @staticmethod
     def extract_agent_text_from_turn(turn: Dict[str, Any]) -> str:
         items = turn.get("items") if isinstance(turn.get("items"), list) else []
@@ -424,6 +439,7 @@ class CodexAppServerClient:
             if thread_id and isinstance(status, dict):
                 with self._thread_status_lock:
                     self._thread_status[thread_id] = dict(status)
+                self._append_turn_event(thread_id, self._event_from_status_change(thread_id, status))
         elif method == "thread/tokenUsage/updated":
             thread_id = str(params.get("threadId") or "")
             token_usage = params.get("tokenUsage")
@@ -449,6 +465,11 @@ class CodexAppServerClient:
                     self._turn_started_at_by_thread[thread_id] = time.time()
                     self._turn_last_event_at_by_thread[thread_id] = time.time()
                     self._turn_preview_by_thread[thread_id] = ""
+                    self._turn_events_by_thread[thread_id] = []
+                self._append_turn_event(
+                    thread_id,
+                    {"ts": int(time.time()), "turn_id": turn_id, "kind": "status", "text": "已开始处理你的请求"},
+                )
         elif method == "turn/completed":
             thread_id = str(params.get("threadId") or "")
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
@@ -460,6 +481,10 @@ class CodexAppServerClient:
                         self._active_turn_by_thread.pop(thread_id, None)
                         self._turn_started_at_by_thread.pop(thread_id, None)
                         # Keep preview for short-term status visibility after completion.
+                self._append_turn_event(
+                    thread_id,
+                    {"ts": int(time.time()), "turn_id": turn_id, "kind": "status", "text": "已完成当前处理"},
+                )
         elif method == "item/agentMessage/delta":
             thread_id = str(params.get("threadId") or "")
             turn_id = str(params.get("turnId") or "")
@@ -484,8 +509,118 @@ class CodexAppServerClient:
                         if self._active_turn_by_thread.get(thread_id) == turn_id:
                             self._turn_preview_by_thread[thread_id] = txt[-1200:]
                             self._turn_last_event_at_by_thread[thread_id] = time.time()
+            if thread_id and turn_id:
+                self._append_turn_event(thread_id, self._event_from_item_completed(turn_id, item))
 
         self._notifications.put(msg)
+
+    def _append_turn_event(self, thread_id: str, event: Optional[Dict[str, Any]]) -> None:
+        if not event:
+            return
+        tid = str(thread_id or "")
+        if not tid:
+            return
+        payload = {
+            "ts": int(event.get("ts") or time.time()),
+            "turn_id": str(event.get("turn_id") or ""),
+            "kind": str(event.get("kind") or "info"),
+            "text": str(event.get("text") or "").strip(),
+        }
+        if not payload["text"]:
+            return
+        with self._thread_status_lock:
+            items = list(self._turn_events_by_thread.get(tid) or [])
+            if items and items[-1].get("text") == payload["text"] and items[-1].get("turn_id") == payload["turn_id"]:
+                items[-1]["ts"] = payload["ts"]
+            else:
+                items.append(payload)
+            if len(items) > 80:
+                items = items[-80:]
+            self._turn_events_by_thread[tid] = items
+            self._turn_last_event_at_by_thread[tid] = time.time()
+
+    def _event_from_status_change(self, thread_id: str, status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        stype = str((status or {}).get("type") or "").strip().lower()
+        if not stype:
+            return None
+        with self._thread_status_lock:
+            prev = str(self._last_status_type_by_thread.get(thread_id) or "").strip().lower()
+            self._last_status_type_by_thread[thread_id] = stype
+            turn_id = str(self._active_turn_by_thread.get(thread_id) or "")
+        if prev == stype:
+            return None
+        text_map = {
+            "idle": "当前步骤已结束，正在等待下一步",
+            "running": "正在继续处理",
+            "busy": "正在处理",
+            "systemerror": "处理中遇到了系统错误",
+        }
+        return {
+            "ts": int(time.time()),
+            "turn_id": turn_id,
+            "kind": "status",
+            "text": text_map.get(stype, f"状态已更新：{stype}"),
+        }
+
+    def _event_from_item_completed(self, turn_id: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        item_type = str(item.get("type") or "").strip()
+        if not item_type or item_type == "agentMessage":
+            return None
+        text = self._summarize_item(item_type, item)
+        if not text:
+            return None
+        return {
+            "ts": int(time.time()),
+            "turn_id": str(turn_id or ""),
+            "kind": "step",
+            "text": text,
+        }
+
+    @staticmethod
+    def _summarize_item(item_type: str, item: Dict[str, Any]) -> str:
+        kind = str(item_type or "").strip()
+        if kind == "userMessage":
+            return ""
+        label_map = {
+            "toolCall": "已完成一个处理步骤",
+            "toolResult": "已拿到一个处理结果",
+            "commandExecution": "已执行一个命令",
+            "applyPatch": "已完成一次文件修改",
+            "fileChange": "已处理文件变更",
+            "userMessage": "",
+        }
+        snippets: List[str] = []
+        for key in ("title", "name", "label", "command", "cmd", "path", "summary", "text"):
+            raw = item.get(key)
+            if raw is None:
+                continue
+            txt = str(raw).strip()
+            if txt:
+                snippets.append(txt)
+        if not snippets:
+            for subkey in ("input", "output", "result", "metadata"):
+                node = item.get(subkey)
+                if isinstance(node, dict):
+                    for key in ("command", "cmd", "path", "title", "name", "summary", "text"):
+                        raw = node.get(key)
+                        if raw is None:
+                            continue
+                        txt = str(raw).strip()
+                        if txt:
+                            snippets.append(txt)
+                            break
+                if snippets:
+                    break
+        desc = snippets[0] if snippets else ""
+        desc = re.sub(r"\s+", " ", desc).strip()
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
+        head = label_map.get(kind, f"已完成步骤：{kind}")
+        if desc:
+            return f"{head}，{desc}"
+        return head
 
     def _notify_disconnect(self) -> None:
         with self._pending_lock:

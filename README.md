@@ -8,6 +8,8 @@
 - 附件消息自动下载并暂存，供下一轮对话使用。
 - 菜单点击可打开项目/会话管理卡片。
 - 卡片交互支持项目切换、会话管理、模型切换、账号切换等流程。
+- 长回复使用 Feishu `schema 2.0` markdown 卡片渲染。
+- 支持 OpenClaw 风格的 CardKit streaming card 和消息 reaction typing 状态。
 - 会话在无任务执行且 10 分钟无新消息时自动回收，后续可通过 Codex `resume` 恢复。
 
 ## 前置条件
@@ -53,21 +55,44 @@
 
 菜单键映射通过 `.env` 里的 `BRIDGE_MENU_ACTIONS_JSON` 配置。
 
+建议开通的应用身份权限：
+
+- `im:message`
+- `im:message:send_as_bot`
+- `im:message:readonly`
+- `im:message.p2p_msg:readonly`
+- `im:message.group_at_msg:readonly`
+- `im:message:update`
+- `im:chat.members:bot_access`
+- `im:chat.access_event.bot_p2p_chat:read`
+- `im:resource`
+- `im:resource:upload`
+- `cardkit:card:read`
+- `cardkit:card:write`
+
+如果后台有单独的消息表情回应权限，也建议一并开通；typing 状态使用的是消息 reaction API。
+
 ## 环境变量
 
 请参考 [.env.example](./.env.example)。默认值均为仓库内相对路径：
 
 - 状态文件：`./data/state.json`
+- 历史文件：`./data/history.json`
+- 历史数据库：`./data/history.db`
 - 上传目录：`./data/uploads`
 - 账号源文件目录：`./data/auth_profiles`
 - 账号运行目录：`./data/auth_homes`
 - 默认工作目录：`.`
 - 单轮超时：`BRIDGE_TURN_TIMEOUT_SEC=21600`（默认 6 小时）
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
+- streaming card 刷新间隔：`BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC=5`（默认每 5 秒）
+- 历史最多保留：`BRIDGE_HISTORY_MAX_TURNS=2000`
 - 空闲会话回收：`BRIDGE_IDLE_EVICT_SEC=600`（默认 10 分钟）
 - 回收扫描间隔：`BRIDGE_IDLE_SWEEP_INTERVAL_SEC=60`（默认 60 秒）
 - 自动切号：`BRIDGE_AUTO_AUTH_SWITCH_ENABLED=true`
 - 自动切号阈值：`BRIDGE_AUTO_AUTH_SWITCH_THRESHOLD_PCT=100`
+- streaming card：`BRIDGE_STREAMING_CARD_ENABLED=true`
+- typing reaction：`BRIDGE_TYPING_REACTION_ENABLED=true`
 
 `app.py` 和 `long_conn.py` 都会自动加载 `.env`。
 
@@ -76,6 +101,7 @@
 默认前缀：`/appbridge/api`（可通过 `BRIDGE_API_PREFIX` 修改）
 
 - `GET /chat/{chat_id}/status`
+- `GET /history`
 - `GET /auth/profiles`
 - `POST /chat/{chat_id}/auth-profile`
 - `POST /chat/{chat_id}/thread/reset`
@@ -85,6 +111,52 @@
 鉴权头：
 
 - `Authorization: Bearer <BRIDGE_API_TOKEN>`
+
+## 历史回溯页
+
+- 固定入口：`GET /history/entry`
+- 页面地址：`GET /history`
+- 登出：`GET /history/logout`
+
+网页授权相关环境变量：
+
+- `HISTORY_ALLOWED_OPEN_IDS=ou_xxx`
+- `HISTORY_SESSION_SECRET=...`
+- `HISTORY_SESSION_TTL_SEC=604800`
+
+页面会按：
+
+- 项目
+- 会话（chat）
+- turn 记录
+
+展示最近历史，并包含：
+
+- 用户输入
+- 最终回复
+- 中间过程事件
+- 失败错误（如果有）
+
+## 历史 API
+
+对机器侧保留：
+
+- `GET /appbridge/api/history`
+
+对网页侧新增分层接口：
+
+- `GET /history/api/projects`
+- `GET /history/api/sessions?project=<name>`
+- `GET /history/api/turns?project=<name>&chat_id=<id>&offset=0&limit=50`
+- `GET /history/api/turn?turn_id=<id>`
+
+说明：
+
+- 结构按 `项目 -> 会话 -> 轮次` 拆开
+- 支持 `offset + limit` 分页
+- `turns` 默认不返回过程事件；加 `include_events=true` 才返回
+- 过程记录改为前端按需懒加载，展开某一轮时再请求单轮明细
+- 底层历史已切到 SQLite，旧的 `history.json` 只作为迁移来源/备份
 
 ## 冒烟测试
 

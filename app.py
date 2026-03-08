@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import atexit
 import base64
+import html
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -11,15 +14,19 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from appserver_client import AppServerError, AppServerTimeout, CodexAppServerClient
+from history_store import BridgeHistoryStore
 from state_store import BridgeStateStore
 
 LOG = logging.getLogger("feicodex_rocket_bridge")
@@ -64,6 +71,28 @@ AUTH_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_HOMES_DIR", str(D
 AUTH_REGISTRY_PATH = _resolve_env_path(
     os.environ.get("BRIDGE_AUTH_REGISTRY_PATH", str(DATA_DIR / "auth_profiles_registry.json"))
 )
+PROJECTS_STORE_PATH = _resolve_env_path(os.environ.get("BRIDGE_PROJECTS_STORE_PATH", str(DATA_DIR / "projects.json")))
+HISTORY_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_PATH", str(DATA_DIR / "history.json")))
+HISTORY_DB_PATH = _resolve_env_path(os.environ.get("BRIDGE_HISTORY_DB_PATH", str(DATA_DIR / "history.db")))
+HISTORY_MAX_TURNS = max(100, int(os.environ.get("BRIDGE_HISTORY_MAX_TURNS", "2000")))
+HISTORY_STORE = BridgeHistoryStore(str(HISTORY_DB_PATH), max_turns=HISTORY_MAX_TURNS, legacy_json_path=str(HISTORY_PATH))
+USER_CHAT_MAP_PATH = _resolve_env_path(os.environ.get("BRIDGE_USER_CHAT_MAP_PATH", str(DATA_DIR / "user_chat_map.json")))
+FEISHU_APP_ID = str(os.environ.get("FEISHU_APP_ID", "")).strip()
+FEISHU_APP_SECRET = str(os.environ.get("FEISHU_APP_SECRET", "")).strip()
+HISTORY_ALLOWED_OPEN_IDS_RAW = str(os.environ.get("HISTORY_ALLOWED_OPEN_IDS", "")).strip()
+HISTORY_SESSION_SECRET = str(os.environ.get("HISTORY_SESSION_SECRET", API_TOKEN or "history-session-secret")).strip()
+HISTORY_SESSION_TTL_SEC = max(300, int(os.environ.get("HISTORY_SESSION_TTL_SEC", "604800")))
+HISTORY_COOKIE_NAME = str(os.environ.get("HISTORY_COOKIE_NAME", "feicodex_history_session")).strip() or "feicodex_history_session"
+FEISHU_OAUTH_AUTHORIZE_URL = str(
+    os.environ.get("FEISHU_OAUTH_AUTHORIZE_URL", "https://accounts.feishu.cn/open-apis/authen/v1/authorize")
+).strip()
+FEISHU_OAUTH_TOKEN_URLS = [
+    str(os.environ.get("FEISHU_OAUTH_TOKEN_URL", "https://open.feishu.cn/open-apis/authen/v1/access_token")).strip(),
+    "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+]
+FEISHU_OAUTH_USERINFO_URL = str(
+    os.environ.get("FEISHU_OAUTH_USERINFO_URL", "https://open.feishu.cn/open-apis/authen/v1/user_info")
+).strip()
 
 
 class TurnRequest(BaseModel):
@@ -252,6 +281,240 @@ def require_api_token(authorization: Optional[str] = Header(default=None)) -> No
     token = _extract_bearer_token(auth)
     if not token or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _check_api_token(token: str = "", authorization: Optional[str] = None) -> None:
+    supplied = str(token or "").strip()
+    if not supplied and authorization:
+        supplied = _extract_bearer_token(str(authorization or ""))
+    if not API_TOKEN:
+        raise HTTPException(status_code=503, detail="bridge api disabled: BRIDGE_API_TOKEN not set")
+    if not supplied or supplied != API_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _urlsafe_b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _urlsafe_b64decode(raw: str) -> bytes:
+    text = str(raw or "").strip()
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+
+def _sign_history_payload(payload: Dict[str, Any]) -> str:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = _urlsafe_b64encode(body)
+    sig = hmac.new(HISTORY_SESSION_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).digest()
+    return f"{encoded}.{_urlsafe_b64encode(sig)}"
+
+
+def _decode_history_payload(token: str) -> Dict[str, Any]:
+    raw = str(token or "").strip()
+    encoded, sep, sig = raw.partition(".")
+    if not encoded or not sep or not sig:
+        raise ValueError("invalid token")
+    expected = hmac.new(HISTORY_SESSION_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).digest()
+    actual = _urlsafe_b64decode(sig)
+    if not hmac.compare_digest(expected, actual):
+        raise ValueError("invalid signature")
+    payload = json.loads(_urlsafe_b64decode(encoded).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("invalid payload")
+    exp = int(payload.get("exp") or 0)
+    if exp > 0 and exp < int(time.time()):
+        raise ValueError("expired token")
+    return payload
+
+
+def _history_allowed_open_ids() -> List[str]:
+    values = [item.strip() for item in HISTORY_ALLOWED_OPEN_IDS_RAW.split(",") if item.strip()]
+    if values:
+        return values
+    if USER_CHAT_MAP_PATH.exists():
+        try:
+            data = json.loads(USER_CHAT_MAP_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                discovered = sorted(
+                    {
+                        key.strip()
+                        for key in data.keys()
+                        if isinstance(key, str) and key.startswith("ou_") and ":" not in key
+                    }
+                )
+                if len(discovered) == 1:
+                    return discovered
+        except Exception:
+            pass
+    return []
+
+
+def _history_public_base(request: Request) -> str:
+    proto = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "https").strip()
+    host = str(request.headers.get("host") or request.url.netloc or "").strip()
+    return f"{proto}://{host}".rstrip("/")
+
+
+def _history_redirect_uri(request: Request) -> str:
+    return f"{_history_public_base(request)}/history/auth/callback"
+
+
+def _history_cookie_payload(request: Request) -> Optional[Dict[str, Any]]:
+    raw = str(request.cookies.get(HISTORY_COOKIE_NAME) or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = _decode_history_payload(raw)
+    except Exception:
+        return None
+    open_id = str(payload.get("open_id") or "").strip()
+    if not open_id:
+        return None
+    allowed = _history_allowed_open_ids()
+    if allowed and open_id not in allowed:
+        return None
+    return payload
+
+
+def _history_access_guard(
+    request: Request,
+    token: str = "",
+    authorization: Optional[str] = None,
+    require_session: bool = False,
+) -> Dict[str, Any]:
+    payload = _history_cookie_payload(request)
+    if payload:
+        return payload
+    if not require_session:
+        _check_api_token(token=token, authorization=authorization)
+        return {"mode": "api_token"}
+    raise HTTPException(status_code=401, detail="history login required")
+
+
+def _history_feishu_user_info(code: str, redirect_uri: str) -> Dict[str, Any]:
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        raise RuntimeError("FEISHU_APP_ID / FEISHU_APP_SECRET not set")
+    payload = {
+        "grant_type": "authorization_code",
+        "code": str(code or "").strip(),
+        "app_id": FEISHU_APP_ID,
+        "app_secret": FEISHU_APP_SECRET,
+        "redirect_uri": redirect_uri,
+    }
+    last_error = "oauth token exchange failed"
+    for token_url in FEISHU_OAUTH_TOKEN_URLS:
+        if not token_url:
+            continue
+        try:
+            resp = requests.post(token_url, json=payload, timeout=20)
+            data = resp.json()
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        if resp.status_code >= 400:
+            last_error = json.dumps(data, ensure_ascii=False)
+            continue
+        access_token = (
+            str(data.get("access_token") or "")
+            or str((data.get("data") or {}).get("access_token") or "")
+            or str((data.get("data") or {}).get("user_access_token") or "")
+        ).strip()
+        if not access_token:
+            last_error = json.dumps(data, ensure_ascii=False)
+            continue
+        info_resp = requests.get(
+            FEISHU_OAUTH_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+        info = info_resp.json()
+        if info_resp.status_code >= 400:
+            last_error = json.dumps(info, ensure_ascii=False)
+            continue
+        user = info.get("data") if isinstance(info.get("data"), dict) else info
+        if not isinstance(user, dict):
+            last_error = json.dumps(info, ensure_ascii=False)
+            continue
+        return user
+    raise RuntimeError(last_error)
+
+
+def _load_projects_map() -> Dict[str, str]:
+    if not PROJECTS_STORE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(PROJECTS_STORE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for name, raw_path in data.items():
+        if not isinstance(name, str) or not isinstance(raw_path, str):
+            continue
+        try:
+            out[name] = str(Path(raw_path).expanduser().resolve())
+        except Exception:
+            continue
+    return out
+
+
+def _project_label_for_cwd(cwd: str) -> str:
+    try:
+        resolved = str(Path(str(cwd or "")).expanduser().resolve())
+    except Exception:
+        resolved = str(cwd or "").strip()
+    for name, proj_path in _load_projects_map().items():
+        if resolved == proj_path:
+            return name
+    if resolved:
+        return Path(resolved).name or resolved
+    return "未命名项目"
+
+
+def _build_turn_record(
+    runtime: ChatRuntime,
+    turn_id: str,
+    status: str,
+    started_at: int = 0,
+    ended_at: int = 0,
+    user_text: str = "",
+    assistant_text: str = "",
+    error_text: str = "",
+    thread_id: str = "",
+    cwd: str = "",
+    model: str = "",
+    auth_profile: Optional[str] = None,
+    token_usage: Optional[Dict[str, Any]] = None,
+    rate_limits: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    events = runtime.client.get_turn_events(thread_id=thread_id or runtime.thread_id, turn_id=turn_id, limit=80)
+    current_cwd = str(cwd or runtime.cwd or DEFAULT_CWD)
+    project = _project_label_for_cwd(current_cwd)
+    start_ts = int(started_at or 0)
+    end_ts = int(ended_at or time.time())
+    duration_sec = max(0, end_ts - start_ts) if start_ts > 0 else 0
+    return {
+        "id": f"{end_ts}_{runtime.chat_id}_{turn_id or 'no_turn'}",
+        "project": project,
+        "chat_id": runtime.chat_id,
+        "thread_id": str(thread_id or runtime.thread_id or ""),
+        "turn_id": str(turn_id or ""),
+        "cwd": current_cwd,
+        "model": str(model or runtime.model or DEFAULT_MODEL),
+        "auth_profile": str(runtime.auth_profile or "") if auth_profile is None else str(auth_profile or ""),
+        "status": str(status or ""),
+        "started_at": start_ts,
+        "ended_at": end_ts,
+        "duration_sec": duration_sec,
+        "user_text": str(user_text or ""),
+        "assistant_text": str(assistant_text or ""),
+        "error_text": str(error_text or ""),
+        "events": events,
+        "token_usage": dict(token_usage or {}),
+        "rate_limits": dict(rate_limits or {}),
+    }
 
 
 def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
@@ -584,6 +847,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
     token_usage: Dict[str, Any] = {}
     rate_limits: Dict[str, Any] = {}
     turn_progress: Dict[str, Any] = {}
+    turn_events: List[Dict[str, Any]] = []
     active_turn_id = str(runtime.active_turn_id or persisted.get("active_turn_id") or "")
     auth_profile = str(runtime.auth_profile or persisted.get("auth_profile") or "")
     auth_meta = _get_auth_profile(auth_profile) if auth_profile else None
@@ -599,6 +863,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
         elif str(thread_status.get("type") or "").lower() == "idle":
             # app-server reports idle, so persisted active turn id is stale.
             active_turn_id = ""
+        turn_events = runtime.client.get_turn_events(thread_id=thread_id, turn_id=active_turn_id, limit=8)
     if not rate_limits:
         rate_limits = _read_rate_limits(runtime, allow_request=False)
     if not token_usage and isinstance(persisted.get("last_token_usage"), dict):
@@ -622,6 +887,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
             "token_usage": token_usage,
             "rate_limits": rate_limits,
             "turn_progress": turn_progress,
+            "turn_events": turn_events,
             "cwd": str(runtime.cwd or persisted.get("cwd") or DEFAULT_CWD),
             "model": str(runtime.model or persisted.get("model") or DEFAULT_MODEL),
             "sandbox": str(runtime.sandbox or persisted.get("sandbox") or DEFAULT_SANDBOX),
@@ -732,10 +998,19 @@ def chat_thread_reset(chat_id: str, body: ResetThreadRequest) -> Dict[str, Any]:
 def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
     auto_auth_switch: Optional[Dict[str, Any]] = None
+    turn_started_at = 0
+    thread_id = ""
+    turn_id = ""
+    turn_cwd = ""
+    turn_model = ""
+    turn_auth_profile = ""
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
         _apply_runtime_auth_profile(runtime)
+        turn_cwd = str(runtime.cwd or DEFAULT_CWD)
+        turn_model = str(runtime.model or DEFAULT_MODEL)
+        turn_auth_profile = str(runtime.auth_profile or "")
         preflight_limits = _read_rate_limits(runtime, allow_request=runtime.is_client_running())
         if not preflight_limits:
             persisted = STORE.get_chat(chat_id)
@@ -813,6 +1088,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             )
 
         runtime.active_turn_id = turn_id
+        turn_started_at = int(time.time())
         _persist_runtime(runtime, {"last_user_text": str(body.text), "last_error": ""})
 
     try:
@@ -842,6 +1118,24 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             )
             if _rate_limit_exhausted(rate_limits) and not auto_auth_switch:
                 auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="post-turn rate limit exhausted")
+        HISTORY_STORE.append_turn(
+            _build_turn_record(
+                runtime=runtime,
+                turn_id=done.turn_id,
+                status=done.turn_status,
+                started_at=turn_started_at,
+                ended_at=int(time.time()),
+                user_text=str(body.text),
+                assistant_text=done.text,
+                error_text=json.dumps(done.error, ensure_ascii=False) if done.error else "",
+                thread_id=thread_id,
+                cwd=turn_cwd,
+                model=turn_model,
+                auth_profile=turn_auth_profile,
+                token_usage=token_usage,
+                rate_limits=rate_limits,
+            )
+        )
         return {
             "ok": True,
             "data": {
@@ -862,6 +1156,22 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             active_now = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
             runtime.active_turn_id = active_now
             state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "timeout"})
+        HISTORY_STORE.append_turn(
+            _build_turn_record(
+                runtime=runtime,
+                turn_id=turn_id or active_now,
+                status="timeout",
+                started_at=turn_started_at,
+                ended_at=int(time.time()),
+                user_text=str(body.text),
+                assistant_text="",
+                error_text=str(exc),
+                thread_id=thread_id,
+                cwd=turn_cwd,
+                model=turn_model,
+                auth_profile=turn_auth_profile,
+            )
+        )
         raise HTTPException(
             status_code=504,
             detail={
@@ -876,6 +1186,22 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         with runtime.lock:
             runtime.active_turn_id = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
             state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
+        HISTORY_STORE.append_turn(
+            _build_turn_record(
+                runtime=runtime,
+                turn_id=turn_id or str(runtime.active_turn_id or ""),
+                status="failed",
+                started_at=turn_started_at,
+                ended_at=int(time.time()),
+                user_text=str(body.text),
+                assistant_text="",
+                error_text=str(exc),
+                thread_id=thread_id,
+                cwd=turn_cwd,
+                model=turn_model,
+                auth_profile=turn_auth_profile,
+            )
+        )
         raise HTTPException(
             status_code=502,
             detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
@@ -973,6 +1299,577 @@ def chat_interrupt(chat_id: str, body: InterruptTurnRequest) -> Dict[str, Any]:
                     "state": state,
                 },
             ) from exc
+
+
+@ROUTER.get("/history", dependencies=[Depends(require_api_token)])
+def history_json(offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+    page = HISTORY_STORE.project_summaries(offset=offset, limit=limit)
+    return {"ok": True, "data": {"projects": page["items"], "pagination": page["pagination"]}}
+
+
+@APP.get("/history/entry")
+def history_entry(request: Request, next: str = Query(default="/history")) -> RedirectResponse:
+    payload = _history_cookie_payload(request)
+    safe_next = next if str(next or "").startswith("/") else "/history"
+    if payload:
+        return RedirectResponse(url=safe_next, status_code=302)
+    state = _sign_history_payload(
+        {
+            "exp": int(time.time()) + 600,
+            "next": safe_next,
+        }
+    )
+    query = urllib.parse.urlencode(
+        {
+            "app_id": FEISHU_APP_ID,
+            "redirect_uri": _history_redirect_uri(request),
+            "response_type": "code",
+            "state": state,
+        }
+    )
+    return RedirectResponse(url=f"{FEISHU_OAUTH_AUTHORIZE_URL}?{query}", status_code=302)
+
+
+@APP.get("/history/auth/callback")
+def history_auth_callback(request: Request, code: str = Query(default=""), state: str = Query(default="")) -> RedirectResponse:
+    try:
+        state_payload = _decode_history_payload(state)
+    except Exception as exc:
+        return RedirectResponse(url=f"/history/auth/failed?reason={urllib.parse.quote(str(exc))}", status_code=302)
+    try:
+        user = _history_feishu_user_info(code=code, redirect_uri=_history_redirect_uri(request))
+    except Exception as exc:
+        return RedirectResponse(url=f"/history/auth/failed?reason={urllib.parse.quote(str(exc))}", status_code=302)
+    open_id = str(user.get("open_id") or "").strip()
+    allowed = _history_allowed_open_ids()
+    if not open_id or (allowed and open_id not in allowed):
+        return RedirectResponse(url="/history/auth/failed?reason=forbidden", status_code=302)
+    resp = RedirectResponse(
+        url=str(state_payload.get("next") or "/history"),
+        status_code=302,
+    )
+    resp.set_cookie(
+        key=HISTORY_COOKIE_NAME,
+        value=_sign_history_payload({"open_id": open_id, "exp": int(time.time()) + HISTORY_SESSION_TTL_SEC}),
+        max_age=HISTORY_SESSION_TTL_SEC,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@APP.get("/history/auth/failed", response_class=HTMLResponse)
+def history_auth_failed(reason: str = Query(default="")) -> HTMLResponse:
+    message = html.escape(str(reason or "登录失败"))
+    return HTMLResponse(
+        f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>访问失败</title>
+<style>body{{font-family:"Noto Serif SC","Source Han Serif SC","Songti SC",serif;background:#f7f2e8;color:#1d1b18;padding:32px;}}main{{max-width:720px;margin:0 auto;background:#fffdf8;border:1px solid #d9d0c2;border-radius:18px;padding:24px;}}a{{color:#146356;}}</style>
+</head><body><main><h1>无法访问历史页</h1><p>{message}</p><p>如果你是应用拥有者，请检查网页应用授权、回调地址和允许访问的 open_id 配置。</p><p><a href="/history/entry">重新尝试登录</a></p></main></body></html>"""
+    )
+
+
+@APP.get("/history/logout")
+def history_logout() -> RedirectResponse:
+    resp = RedirectResponse(url="/history/entry", status_code=302)
+    resp.delete_cookie(HISTORY_COOKIE_NAME, path="/")
+    return resp
+
+
+@APP.get("/history/api/projects")
+def history_projects_api(
+    request: Request,
+    offset: int = 0,
+    limit: int = 50,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    page = HISTORY_STORE.project_summaries(offset=offset, limit=limit)
+    return JSONResponse({"ok": True, "data": {"projects": page["items"], "pagination": page["pagination"]}})
+
+
+@APP.get("/history/api/sessions")
+def history_sessions_api(
+    request: Request,
+    project: str = Query(default=""),
+    offset: int = 0,
+    limit: int = 50,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    page = HISTORY_STORE.session_summaries(project=project, offset=offset, limit=limit)
+    return JSONResponse({"ok": True, "data": {"project": project, "sessions": page["items"], "pagination": page["pagination"]}})
+
+
+@APP.get("/history/api/turns")
+def history_turns_api(
+    request: Request,
+    project: str = Query(default=""),
+    chat_id: str = Query(default=""),
+    offset: int = 0,
+    limit: int = 50,
+    include_events: bool = Query(default=False),
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    page = HISTORY_STORE.turn_items(
+        project=project,
+        chat_id=chat_id,
+        offset=offset,
+        limit=limit,
+        include_events=include_events,
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "data": {
+                "project": project,
+                "chat_id": chat_id,
+                "turns": page["items"],
+                "pagination": page["pagination"],
+            },
+        }
+    )
+
+
+@APP.get("/history/api/turn")
+def history_turn_api(
+    request: Request,
+    turn_id: str = Query(default=""),
+    include_events: bool = Query(default=True),
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    item = HISTORY_STORE.turn_detail(turn_id=turn_id, include_events=include_events)
+    if not item:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "turn not found"})
+    return JSONResponse({"ok": True, "data": {"turn": item}})
+
+
+@APP.get("/history", response_class=HTMLResponse)
+def history_page(
+    request: Request,
+    token: str = Query(default=""),
+    limit: int = 300,
+    authorization: Optional[str] = Header(default=None),
+) -> HTMLResponse:
+    session_payload = _history_cookie_payload(request)
+    if not session_payload:
+        has_api_token = bool(str(token or "").strip() or str(authorization or "").strip())
+        if has_api_token:
+            _check_api_token(token=token, authorization=authorization)
+        else:
+            return RedirectResponse(url="/history/entry?next=/history", status_code=302)
+    page_config = json.dumps(
+        {
+            "authToken": str(token or "").strip(),
+            "initialTurnLimit": max(20, min(100, int(limit or 50))),
+        },
+        ensure_ascii=False,
+    )
+    page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FeiCodex 历史回溯</title>
+  <style>
+    :root {{ --bg:#f5f1e8; --ink:#1d1b18; --muted:#6a6258; --card:#fffdf8; --line:#d9d0c2; --accent:#146356; --soft:#f1eadf; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:"Noto Serif SC","Source Han Serif SC","Songti SC",serif; background:linear-gradient(180deg,#f7f2e8 0%,#efe7da 100%); color:var(--ink); }}
+    main {{ max-width:1400px; margin:0 auto; padding:28px 16px 40px; }}
+    h1 {{ margin:0 0 8px; font-size:32px; }}
+    .lead {{ color:var(--muted); margin:0 0 18px; }}
+    .layout {{ display:grid; grid-template-columns:280px 320px 1fr; gap:16px; align-items:start; }}
+    .panel {{ background:rgba(255,253,248,.88); border:1px solid var(--line); border-radius:22px; box-shadow:0 10px 30px rgba(69,51,29,.06); min-height:72vh; overflow:hidden; }}
+    .panel-head {{ padding:18px 18px 10px; border-bottom:1px solid rgba(217,208,194,.7); }}
+    .panel-head h2 {{ margin:0; font-size:18px; }}
+    .panel-head p {{ margin:6px 0 0; color:var(--muted); font-size:13px; line-height:1.5; }}
+    .panel-body {{ padding:10px; }}
+    .project-item, .session-item {{ width:100%; text-align:left; border:1px solid var(--line); border-radius:16px; background:var(--card); padding:14px; margin:10px 0; cursor:pointer; color:var(--ink); }}
+    .project-item.active, .session-item.active {{ border-color:#b7d5cf; background:#f4fbf8; box-shadow:inset 0 0 0 1px #d5ebe6; }}
+    .title-row {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }}
+    .title {{ font-size:16px; font-weight:600; line-height:1.4; }}
+    .meta, .tiny {{ color:var(--muted); font-size:13px; line-height:1.5; }}
+    .tiny {{ margin-top:6px; }}
+    .badge {{ font-size:12px; border-radius:999px; padding:3px 8px; background:#e6f2ef; color:var(--accent); border:1px solid #cde5e0; white-space:nowrap; }}
+    .toolbar {{ display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }}
+    .ghost-btn, .load-btn {{ appearance:none; border:1px solid var(--line); background:var(--soft); color:var(--ink); border-radius:999px; padding:9px 14px; cursor:pointer; }}
+    .load-btn {{ width:100%; margin-top:10px; }}
+    .turns-wrap {{ padding:16px; }}
+    .turn {{ border:1px solid var(--line); border-radius:18px; background:var(--card); padding:16px; margin:14px 0; }}
+    .turn-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px; }}
+    .turn-title {{ font-size:17px; line-height:1.55; font-weight:600; }}
+    .turn-meta {{ display:flex; flex-wrap:wrap; gap:14px; color:var(--muted); font-size:13px; margin-bottom:14px; }}
+    .section {{ margin-top:12px; }}
+    .label {{ font-size:12px; color:var(--muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:.08em; }}
+    pre {{ margin:0; white-space:pre-wrap; word-break:break-word; background:#f6f2ea; border-radius:12px; padding:12px; border:1px solid #e7decf; font-family:"SFMono-Regular","Menlo",monospace; font-size:13px; line-height:1.6; }}
+    details.process {{ margin-top:12px; border:1px solid var(--line); border-radius:14px; background:#fcfaf5; }}
+    details.process summary {{ list-style:none; cursor:pointer; padding:12px 14px; color:var(--accent); }}
+    details.process summary::-webkit-details-marker {{ display:none; }}
+    .events {{ margin:0; padding:0 18px 14px 32px; }}
+    .events li {{ margin:8px 0; line-height:1.5; }}
+    .ts {{ color:var(--muted); display:inline-block; min-width:156px; }}
+    .empty, .error-box {{ margin:12px 0; border:1px dashed var(--line); border-radius:16px; padding:18px; color:var(--muted); background:#fcfaf5; }}
+    .counts {{ color:var(--muted); font-size:13px; }}
+    .hidden {{ display:none; }}
+    @media (max-width: 1080px) {{ .layout {{ grid-template-columns:1fr; }} .panel {{ min-height:auto; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>FeiCodex 历史回溯</h1>
+    <div class="lead">按项目 → 会话 → 轮次分层查看。轮次按自然时间顺序排列，默认定位到最新一段。</div>
+    <div class="layout">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>项目</h2>
+          <p>按项目聚合，适合长期多项目查看。</p>
+        </div>
+        <div class="panel-body">
+          <div id="project-list"></div>
+          <button id="more-projects" class="load-btn hidden">加载更多项目</button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>会话</h2>
+          <p id="session-lead">先选择一个项目。</p>
+        </div>
+        <div class="panel-body">
+          <div id="session-list"></div>
+          <button id="more-sessions" class="load-btn hidden">加载更多会话</button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div class="toolbar">
+            <div>
+              <h2 id="turn-title">轮次</h2>
+              <p id="turn-lead">默认会定位到最新内容。</p>
+            </div>
+            <a class="ghost-btn" href="/history/logout">退出</a>
+          </div>
+          <div id="turn-counts" class="counts"></div>
+        </div>
+        <div class="turns-wrap">
+          <button id="older-turns" class="load-btn hidden">加载更早轮次</button>
+          <div id="turn-list"></div>
+          <div id="turn-empty" class="empty">选择一个会话后，这里会显示轮次内容。</div>
+          <div id="turn-error" class="error-box hidden"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const CONFIG = {page_config};
+    const state = {{
+      projectsItems: [],
+      projectsOffset: 0,
+      projectsPagination: null,
+      sessionsByProject: new Map(),
+      activeProject: "",
+      activeSession: null,
+      activeTurnsOffset: 0,
+      activeTurnsLimit: CONFIG.initialTurnLimit || 50,
+      activeTurnsTotal: 0
+    }};
+
+    function formatTime(ts) {{
+      if (!ts) return "未知";
+      const d = new Date(ts * 1000);
+      return d.toLocaleString("zh-CN", {{ hour12: false }});
+    }}
+
+    function formatDuration(sec) {{
+      const total = Math.max(0, Number(sec || 0));
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) return `${{h}}小时${{m}}分${{s}}秒`;
+      if (m > 0) return `${{m}}分${{s}}秒`;
+      return `${{s}}秒`;
+    }}
+
+    function buildUrl(path, params = {{}}) {{
+      const url = new URL(path, window.location.origin);
+      Object.entries(params).forEach(([key, value]) => {{
+        if (value !== undefined && value !== null && value !== "") {{
+          url.searchParams.set(key, String(value));
+        }}
+      }});
+      if (CONFIG.authToken) {{
+        url.searchParams.set("token", CONFIG.authToken);
+      }}
+      return url.toString();
+    }}
+
+    async function fetchJson(path, params = {{}}) {{
+      const res = await fetch(buildUrl(path, params), {{ credentials: "include" }});
+      if (res.status === 401) {{
+        window.location.href = "/history/entry?next=/history";
+        throw new Error("unauthorized");
+      }}
+      if (!res.ok) {{
+        const text = await res.text();
+        throw new Error(text || `request failed: ${{res.status}}`);
+      }}
+      return await res.json();
+    }}
+
+    function escapeHtml(raw) {{
+      return String(raw ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }}
+
+    function renderProjects(items) {{
+      const el = document.getElementById("project-list");
+      el.innerHTML = "";
+      for (const item of items) {{
+        const btn = document.createElement("button");
+        btn.className = "project-item" + (state.activeProject === item.name ? " active" : "");
+        btn.innerHTML = `
+          <div class="title-row">
+            <div class="title">${{escapeHtml(item.name)}}</div>
+            <span class="badge">${{item.session_count}} 会话</span>
+          </div>
+          <div class="tiny">${{formatTime(item.started_at)}} - ${{formatTime(item.updated_at)}}</div>
+          <div class="tiny">共 ${{item.turn_count}} 轮</div>
+        `;
+        btn.onclick = () => selectProject(item.name);
+        el.appendChild(btn);
+      }}
+      document.getElementById("more-projects").classList.toggle(
+        "hidden",
+        !(state.projectsPagination && state.projectsPagination.has_more)
+      );
+    }}
+
+    function renderSessions(project, items, append = false) {{
+      const lead = document.getElementById("session-lead");
+      lead.textContent = project ? `当前项目：${{project}}` : "先选择一个项目。";
+      const el = document.getElementById("session-list");
+      if (!append) el.innerHTML = "";
+      for (const item of items) {{
+        const btn = document.createElement("button");
+        const active = state.activeSession && state.activeSession.chat_id === item.chat_id;
+        btn.className = "session-item" + (active ? " active" : "");
+        btn.innerHTML = `
+          <div class="title-row">
+            <div class="title">${{escapeHtml(item.chat_id)}}</div>
+            <span class="badge">${{item.turn_count}} 轮</span>
+          </div>
+          <div class="tiny">${{formatTime(item.started_at)}} - ${{formatTime(item.updated_at)}}</div>
+          <div class="tiny">模型：${{escapeHtml(item.model || "default")}} | 账号：${{escapeHtml(item.auth_profile || "default")}}</div>
+        `;
+        btn.onclick = () => selectSession(item);
+        el.appendChild(btn);
+      }}
+      const bag = state.sessionsByProject.get(project);
+      document.getElementById("more-sessions").classList.toggle("hidden", !(bag && bag.pagination && bag.pagination.has_more));
+    }}
+
+    function renderTurns(items, appendOlder = false) {{
+      const list = document.getElementById("turn-list");
+      const empty = document.getElementById("turn-empty");
+      if (!appendOlder) {{
+        list.innerHTML = "";
+      }}
+      if (!items.length && !appendOlder) {{
+        empty.classList.remove("hidden");
+        return;
+      }}
+      empty.classList.add("hidden");
+      const frag = document.createDocumentFragment();
+      for (const item of items) {{
+        const article = document.createElement("article");
+        article.className = "turn";
+        article.innerHTML = `
+          <div class="turn-head">
+            <div class="turn-title">${{escapeHtml(item.user_text || "无输入")}}</div>
+            <span class="badge">${{escapeHtml(item.status || "")}}</span>
+          </div>
+          <div class="turn-meta">
+            <span>提问：${{formatTime(item.started_at)}}</span>
+            <span>完成：${{formatTime(item.ended_at)}}</span>
+            <span>耗时：${{formatDuration(item.duration_sec)}}</span>
+          </div>
+          <div class="section">
+            <div class="label">用户输入</div>
+            <pre>${{escapeHtml(item.user_text || "")}}</pre>
+          </div>
+          <div class="section">
+            <div class="label">最终回复</div>
+            <pre>${{escapeHtml(item.assistant_text || "")}}</pre>
+          </div>
+          <details class="process">
+            <summary>查看过程记录（${{item.events_count || 0}} 条）</summary>
+            <div class="process-slot" data-turn-id="${{escapeHtml(item.turn_id || item.id || "")}}" data-events-count="${{Number(item.events_count || 0)}}" data-loaded="0" data-error="${{escapeHtml(item.error_text || "")}}">
+              <div class="empty">展开后再加载过程记录。</div>
+            </div>
+          </details>
+        `;
+        frag.appendChild(article);
+      }}
+      if (appendOlder && list.firstChild) {{
+        list.prepend(frag);
+      }} else {{
+        list.appendChild(frag);
+      }}
+    }}
+
+    async function hydrateProcess(detailsEl) {{
+      const slot = detailsEl.querySelector(".process-slot");
+      if (!slot || slot.dataset.loaded === "1") return;
+      const turnId = slot.dataset.turnId || "";
+      const eventsCount = Number(slot.dataset.eventsCount || 0);
+      const rawError = slot.dataset.error || "";
+      if (!turnId) return;
+      if (eventsCount <= 0 && !rawError) {{
+        slot.innerHTML = "<div class='empty'>暂无过程记录。</div>";
+        slot.dataset.loaded = "1";
+        return;
+      }}
+      slot.innerHTML = "<div class='empty'>正在加载过程记录...</div>";
+      try {{
+        const data = await fetchJson("/history/api/turn", {{
+          turn_id: turnId,
+          include_events: true
+        }});
+        const turn = (data.data || {{}}).turn || {{}};
+        const events = Array.isArray(turn.events) ? turn.events : [];
+        const eventHtml = events.length
+          ? `<ul class="events">${{events.map((evt) => `<li><span class="ts">${{escapeHtml(formatTime(evt.ts))}}</span><span>${{escapeHtml(evt.text || "")}}</span></li>`).join("")}}</ul>`
+          : "<div class='empty'>暂无过程记录。</div>";
+        const errorHtml = turn.error_text
+          ? `<div class="section"><div class="label">错误</div><pre>${{escapeHtml(turn.error_text)}}</pre></div>`
+          : "";
+        slot.innerHTML = eventHtml + errorHtml;
+        slot.dataset.loaded = "1";
+      }} catch (err) {{
+        slot.innerHTML = `<div class="error-box">${{escapeHtml(String(err.message || err))}}</div>`;
+      }}
+    }}
+
+    async function loadProjects(append = false) {{
+      const data = await fetchJson("/history/api/projects", {{
+        offset: append ? state.projectsOffset : 0,
+        limit: 50
+      }});
+      const payload = data.data || {{}};
+      state.projectsPagination = payload.pagination || null;
+      if (!append) state.projectsOffset = 0;
+      const prevItems = append ? state.projectsItems : [];
+      state.projectsItems = prevItems.concat(payload.projects || []);
+      state.projectsOffset = (payload.pagination?.offset || 0) + (payload.pagination?.limit || 0);
+      renderProjects(state.projectsItems);
+      if (!state.activeProject && payload.projects && payload.projects.length) {{
+        await selectProject(payload.projects[payload.projects.length - 1].name);
+      }}
+    }}
+
+    async function selectProject(projectName) {{
+      state.activeProject = projectName;
+      renderProjects(state.projectsItems);
+      await loadSessions(projectName, false);
+    }}
+
+    async function loadSessions(projectName, append = false) {{
+      const existing = state.sessionsByProject.get(projectName);
+      const offset = append && existing ? existing.nextOffset : 0;
+      const data = await fetchJson("/history/api/sessions", {{
+        project: projectName,
+        offset,
+        limit: 50
+      }});
+      const payload = data.data || {{}};
+      const prevItems = append && existing ? existing.items : [];
+      const items = prevItems.concat(payload.sessions || []);
+      state.sessionsByProject.set(projectName, {{
+        items,
+        pagination: payload.pagination || null,
+        nextOffset: (payload.pagination?.offset || 0) + (payload.pagination?.limit || 0)
+      }});
+      renderProjects(state.projectsItems);
+      renderSessions(projectName, items, false);
+      if ((!state.activeSession || state.activeSession.project !== projectName) && items.length) {{
+        await selectSession(items[items.length - 1]);
+      }}
+    }}
+
+    async function selectSession(session) {{
+      state.activeSession = session;
+      renderSessions(state.activeProject, state.sessionsByProject.get(state.activeProject)?.items || [], false);
+      document.getElementById("turn-title").textContent = session.chat_id;
+      document.getElementById("turn-lead").textContent = `${{session.project}} · ${{
+        formatTime(session.started_at)
+      }} - ${{formatTime(session.updated_at)}}`;
+      document.getElementById("turn-counts").textContent = `共 ${{session.turn_count}} 轮，默认显示最后 ${{Math.min(session.turn_count, state.activeTurnsLimit)}} 轮`;
+      const initialOffset = Math.max(0, Number(session.turn_count || 0) - state.activeTurnsLimit);
+      state.activeTurnsOffset = initialOffset;
+      await loadTurns(false);
+    }}
+
+    async function loadTurns(appendOlder) {{
+      if (!state.activeSession) return;
+      const turnError = document.getElementById("turn-error");
+      turnError.classList.add("hidden");
+      let offset = state.activeTurnsOffset;
+      if (appendOlder) {{
+        offset = Math.max(0, state.activeTurnsOffset - state.activeTurnsLimit);
+      }}
+      try {{
+        const data = await fetchJson("/history/api/turns", {{
+          project: state.activeSession.project,
+          chat_id: state.activeSession.chat_id,
+          offset,
+          limit: state.activeTurnsLimit,
+          include_events: false
+        }});
+        const payload = data.data || {{}};
+        state.activeTurnsOffset = payload.pagination?.offset || 0;
+        state.activeTurnsTotal = payload.pagination?.total || 0;
+        renderTurns(payload.turns || [], appendOlder);
+        document.querySelectorAll("details.process").forEach((detailsEl) => {{
+          if (detailsEl.dataset.bound === "1") return;
+          detailsEl.dataset.bound = "1";
+          detailsEl.addEventListener("toggle", () => {{
+            if (detailsEl.open) {{
+              hydrateProcess(detailsEl);
+            }}
+          }});
+        }});
+        document.getElementById("older-turns").classList.toggle("hidden", state.activeTurnsOffset <= 0);
+        if (!appendOlder) {{
+          window.requestAnimationFrame(() => window.scrollTo({{ top: document.body.scrollHeight, behavior: "smooth" }}));
+        }}
+      }} catch (err) {{
+        turnError.textContent = String(err.message || err);
+        turnError.classList.remove("hidden");
+      }}
+    }}
+
+    document.getElementById("more-projects").onclick = () => loadProjects(true);
+    document.getElementById("more-sessions").onclick = () => loadSessions(state.activeProject, true);
+    document.getElementById("older-turns").onclick = () => loadTurns(true);
+
+    loadProjects(false).catch((err) => {{
+      const el = document.getElementById("turn-error");
+      el.textContent = String(err.message || err);
+      el.classList.remove("hidden");
+    }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(page)
 
 
 APP.include_router(ROUTER)
