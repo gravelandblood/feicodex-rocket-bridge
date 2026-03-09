@@ -50,26 +50,26 @@ async function fetchJson<T>(path: string, params: Record<string, string | number
   return (await response.json()) as HistoryEnvelope<T>;
 }
 
-export const historyApi = {
+export const api = {
   getProjects(offset = 0, limit = 50) {
     return fetchJson<ProjectsPayload>("/history/api/projects", { offset, limit });
   },
   getSessions(project: string, offset = 0, limit = 50) {
     return fetchJson<SessionsPayload>("/history/api/sessions", { project, offset, limit });
   },
-  getTurns(project: string, chatId: string, offset: number, limit: number, includeEvents = false) {
+  getTurns(project: string, chatId: string, offset: number, limit: number) {
     return fetchJson<TurnsPayload>("/history/api/turns", {
       project,
       chat_id: chatId,
       offset,
       limit,
-      include_events: includeEvents
+      include_events: false
     });
   },
-  getTurn(turnId: string, includeEvents = true) {
+  getTurn(turnId: string) {
     return fetchJson<TurnPayload>("/history/api/turn", {
       turn_id: turnId,
-      include_events: includeEvents
+      include_events: true
     });
   }
 };
