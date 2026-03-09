@@ -709,10 +709,13 @@ def _list_switchable_auth_profiles() -> List[Dict[str, Any]]:
 
 def _pick_next_auth_profile(current_profile: str) -> Optional[Dict[str, Any]]:
     items = _list_switchable_auth_profiles()
-    keys = [str(item.get("profile") or "").strip() for item in items]
     current = str(current_profile or "").strip()
-    if not keys:
+    named_items = [item for item in items if str(item.get("profile") or "").strip()]
+    if current:
+        items = named_items
+    if not items:
         return None
+    keys = [str(item.get("profile") or "").strip() for item in items]
     try:
         start = keys.index(current)
     except ValueError:
