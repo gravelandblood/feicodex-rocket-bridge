@@ -1622,8 +1622,27 @@ class AppServerBotBridge:
         project = str(project_name or "").strip()
         cwd = str(self.projects.get(project) or "").strip()
         runtime_key = self._runtime_key(chat_id, project)
+        try:
+            current = self.control.status(runtime_key).get("data")
+        except Exception:
+            current = {}
+        try:
+            source = self.control.status(str(chat_id or "")).get("data")
+        except Exception:
+            source = {}
         if cwd:
-            self.control.update_config(runtime_key, cwd=cwd)
+            self.control.update_config(
+                runtime_key,
+                cwd=cwd,
+                model=str((current or {}).get("model") or (source or {}).get("model") or ""),
+                sandbox=str((current or {}).get("sandbox") or (source or {}).get("sandbox") or ""),
+                approval_policy=str((current or {}).get("approval_policy") or (source or {}).get("approval_policy") or ""),
+                personality=str((current or {}).get("personality") or (source or {}).get("personality") or ""),
+            )
+        inherited_profile = str((source or {}).get("auth_profile") or "").strip()
+        current_profile = str((current or {}).get("auth_profile") or "").strip()
+        if inherited_profile and current_profile != inherited_profile:
+            self.control.update_auth_profile(runtime_key, inherited_profile)
         return runtime_key
 
     def _status_data(self, chat_id: str) -> Dict[str, Any]:
