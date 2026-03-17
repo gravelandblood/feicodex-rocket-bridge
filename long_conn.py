@@ -1,0 +1,3533 @@
+#!/usr/bin/env python3
+"""Feishu long-connection receiver for app-server bridge.
+
+This process handles Feishu events and forwards actions to local control API.
+Interaction model:
+- Natural language text messages -> direct Codex turn.
+- Menu events -> interactive cards.
+- Card actions -> multi-step state-machine actions.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import lark_oapi as lark
+import requests
+from dotenv import load_dotenv
+from lark_oapi.api.application.v6 import P2ApplicationBotMenuV6
+from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    CallBackToast,
+    P2CardActionTrigger,
+    P2CardActionTriggerResponse,
+)
+
+APP_DIR = Path(__file__).resolve().parent
+load_dotenv(APP_DIR / ".env", override=False)
+
+LOG = logging.getLogger("feicodex_rocket_long_conn")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+
+FEISHU_API = "https://open.feishu.cn/open-apis"
+APP_ID = os.getenv("FEISHU_APP_ID", "").strip()
+APP_SECRET = os.getenv("FEISHU_APP_SECRET", "").strip()
+SINGLE_CHAT_ONLY = str(os.getenv("BRIDGE_SINGLE_CHAT_ONLY", "true")).strip().lower() in {"1", "true", "yes", "on"}
+USER_SESSION_ISOLATION = str(os.getenv("BRIDGE_USER_SESSION_ISOLATION", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+CONTROL_BASE = str(os.getenv("BRIDGE_CONTROL_BASE", "http://127.0.0.1:18788")).strip().rstrip("/")
+API_PREFIX = str(os.getenv("BRIDGE_API_PREFIX", "/appbridge/api")).strip()
+API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
+TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
+PROGRESS_PING_INTERVAL_SEC = max(30, int(os.getenv("BRIDGE_PROGRESS_PING_INTERVAL_SEC", "180")))
+STREAMING_CARD_UPDATE_INTERVAL_SEC = max(2, int(os.getenv("BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC", "5")))
+STREAMING_CARD_PRINT_FREQUENCY_MS = max(1, int(os.getenv("BRIDGE_STREAMING_CARD_PRINT_FREQUENCY_MS", "1")))
+STREAMING_CARD_PRINT_STEP = max(1, int(os.getenv("BRIDGE_STREAMING_CARD_PRINT_STEP", "4096")))
+UPLOAD_ROOT = Path(os.getenv("BRIDGE_UPLOAD_ROOT", str(APP_DIR / "data" / "uploads"))).expanduser()
+if not UPLOAD_ROOT.is_absolute():
+    UPLOAD_ROOT = APP_DIR / UPLOAD_ROOT
+UPLOAD_ROOT = UPLOAD_ROOT.resolve()
+PROJECT_ROOT = Path(os.getenv("BRIDGE_PROJECT_ROOT", str(APP_DIR.parent / "projects"))).expanduser()
+if not PROJECT_ROOT.is_absolute():
+    PROJECT_ROOT = APP_DIR / PROJECT_ROOT
+PROJECT_ROOT = PROJECT_ROOT.resolve()
+PROJECTS_STORE_PATH = Path(os.getenv("BRIDGE_PROJECTS_STORE_PATH", str(APP_DIR / "data" / "projects.json"))).expanduser()
+if not PROJECTS_STORE_PATH.is_absolute():
+    PROJECTS_STORE_PATH = APP_DIR / PROJECTS_STORE_PATH
+PROJECTS_STORE_PATH = PROJECTS_STORE_PATH.resolve()
+USER_CHAT_MAP_PATH = Path(os.getenv("BRIDGE_USER_CHAT_MAP_PATH", str(APP_DIR / "data" / "user_chat_map.json"))).expanduser()
+if not USER_CHAT_MAP_PATH.is_absolute():
+    USER_CHAT_MAP_PATH = APP_DIR / USER_CHAT_MAP_PATH
+USER_CHAT_MAP_PATH = USER_CHAT_MAP_PATH.resolve()
+STATE_PATH = Path(os.getenv("BRIDGE_STATE_PATH", str(APP_DIR / "data" / "state.json"))).expanduser()
+if not STATE_PATH.is_absolute():
+    STATE_PATH = APP_DIR / STATE_PATH
+STATE_PATH = STATE_PATH.resolve()
+ACTIVE_PROJECTS_STORE_PATH = Path(
+    os.getenv("BRIDGE_ACTIVE_PROJECTS_STORE_PATH", str(APP_DIR / "data" / "active_projects.json"))
+).expanduser()
+if not ACTIVE_PROJECTS_STORE_PATH.is_absolute():
+    ACTIVE_PROJECTS_STORE_PATH = APP_DIR / ACTIVE_PROJECTS_STORE_PATH
+ACTIVE_PROJECTS_STORE_PATH = ACTIVE_PROJECTS_STORE_PATH.resolve()
+REPLY_CONTEXT_PATH = Path(os.getenv("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(APP_DIR / "data" / "reply_context.json"))).expanduser()
+if not REPLY_CONTEXT_PATH.is_absolute():
+    REPLY_CONTEXT_PATH = APP_DIR / REPLY_CONTEXT_PATH
+REPLY_CONTEXT_PATH = REPLY_CONTEXT_PATH.resolve()
+CARD_AUTO_DELETE_ON_ACTION = str(os.getenv("BRIDGE_CARD_AUTO_DELETE_ON_ACTION", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+STREAMING_CARD_ENABLED = str(os.getenv("BRIDGE_STREAMING_CARD_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+TYPING_REACTION_ENABLED = str(os.getenv("BRIDGE_TYPING_REACTION_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+OUTPUT_FILE_AUTO_SEND = str(os.getenv("BRIDGE_OUTPUT_FILE_AUTO_SEND", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FEISHU_FILE_UPLOAD_MAX_SIZE_MB = 30
+OUTPUT_FILE_MAX_COUNT = int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_COUNT", "0"))
+OUTPUT_FILE_MAX_SIZE_MB = min(
+    FEISHU_FILE_UPLOAD_MAX_SIZE_MB,
+    max(1, int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_SIZE_MB", str(FEISHU_FILE_UPLOAD_MAX_SIZE_MB)))),
+)
+OUTPUT_FILE_MAX_AGE_SEC = max(60, int(os.getenv("BRIDGE_OUTPUT_FILE_MAX_AGE_SEC", "3600")))
+OUTPUT_FILE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".txt"}
+SOUL_ENABLED = str(os.getenv("BRIDGE_SOUL_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+SOUL_PATH = Path(os.getenv("BRIDGE_SOUL_PATH", str(APP_DIR / "soul.md"))).expanduser()
+if not SOUL_PATH.is_absolute():
+    SOUL_PATH = APP_DIR / SOUL_PATH
+SOUL_PATH = SOUL_PATH.resolve()
+SOUL_MAX_PROMPT_CHARS = max(800, int(os.getenv("BRIDGE_SOUL_MAX_PROMPT_CHARS", "6000")))
+SOUL_MAX_BULLETS = max(10, int(os.getenv("BRIDGE_SOUL_MAX_BULLETS", "200")))
+DISPLAY_NAME_CACHE_TTL_SEC = max(300, int(os.getenv("BRIDGE_DISPLAY_NAME_CACHE_TTL_SEC", "21600")))
+
+DEFAULT_MENU_ACTIONS = {
+    "menu_project_manage": "open_project_manage",
+    "menu_session_manage": "open_session_manage",
+}
+
+DEFAULT_PROJECTS = {
+    APP_DIR.name: str(APP_DIR),
+    "workspace": str(APP_DIR.parent),
+}
+
+SUPPORTED_ATTACHMENT_TYPES = {"image", "file", "media", "audio", "video", "sticker"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+SUPPORTED_EFFORTS = ["medium", "high", "xhigh"]
+FINAL_STREAM_CARD_PREVIEW_LEN = 900
+FINAL_STREAM_CARD_PAGE_LEN = 2200
+FINAL_STREAM_CARD_ACTIONS = {
+    "stream_final_expand",
+    "stream_final_collapse",
+    "stream_final_prev",
+    "stream_final_next",
+}
+
+_FINAL_STREAM_CARD_STATE_LOCK = threading.Lock()
+_FINAL_STREAM_CARD_STATE: Dict[str, Dict[str, Any]] = {}
+_REPLY_CONTEXT_FILE_LOCK = threading.Lock()
+_SOUL_FILE_LOCK = threading.Lock()
+
+_SOUL_DECLARATION_PATTERNS = (
+    re.compile(r"^\s*/soul\s+([\s\S]+)$", re.I),
+    re.compile(r"^\s*(?:偏好|原则|记住|长期偏好|全局偏好|全局要求|长期要求)\s*[:：]\s*([\s\S]+)$", re.I),
+)
+
+
+def _safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _default_soul_markdown() -> str:
+    lines = [
+        "# Soul Memory",
+        "",
+        "全局用户偏好与原则（与具体项目无关）。",
+        f"Updated at: {_now_text()}",
+        "",
+        "## Stable Preferences",
+        "- 回复风格要有温度：先理解用户处境，再给出清晰可执行建议。",
+        "- 回复时优先结合用户上下文，避免模板化空话。",
+        "",
+        "## Notes",
+        "- 只记录长期有效、跨项目的偏好和原则。",
+        "- 不记录临时任务细节和敏感凭据。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _ensure_soul_file() -> None:
+    if not SOUL_ENABLED:
+        return
+    if SOUL_PATH.exists():
+        return
+    SOUL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SOUL_PATH.write_text(_default_soul_markdown(), encoding="utf-8")
+
+
+def _read_soul_markdown(limit_chars: int = SOUL_MAX_PROMPT_CHARS) -> str:
+    if not SOUL_ENABLED:
+        return ""
+    _ensure_soul_file()
+    try:
+        raw = SOUL_PATH.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    txt = str(raw or "").strip()
+    if len(txt) > limit_chars:
+        txt = txt[: max(200, limit_chars - 32)] + "\n...<truncated>"
+    return txt
+
+
+def _extract_soul_items(markdown_text: str) -> List[str]:
+    lines = str(markdown_text or "").splitlines()
+    in_section = False
+    items: List[str] = []
+    for line in lines:
+        stripped = str(line or "").strip()
+        if stripped.startswith("## "):
+            in_section = stripped.lower() == "## stable preferences"
+            continue
+        if (not in_section) or (not stripped.startswith("- ")):
+            continue
+        item = stripped[2:].strip()
+        if not item or item in {"（暂未记录）", "(empty)"}:
+            continue
+        items.append(item)
+    return items
+
+
+def _normalize_soul_items(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        txt = re.sub(r"\s+", " ", str(raw or "").strip()).strip(" -")
+        if not txt:
+            continue
+        key = txt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(txt[:280])
+        if len(out) >= SOUL_MAX_BULLETS:
+            break
+    return out
+
+
+def _write_soul_items(items: List[str]) -> None:
+    merged = _normalize_soul_items(items)
+    lines = [
+        "# Soul Memory",
+        "",
+        "全局用户偏好与原则（与具体项目无关）。",
+        f"Updated at: {_now_text()}",
+        "",
+        "## Stable Preferences",
+    ]
+    if merged:
+        lines.extend([f"- {item}" for item in merged])
+    else:
+        lines.append("- （暂未记录）")
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "- 只记录长期有效、跨项目的偏好和原则。",
+            "- 不记录临时任务细节和敏感凭据。",
+            "",
+        ]
+    )
+    SOUL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SOUL_PATH.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _upsert_soul_items(new_items: List[str]) -> int:
+    if not SOUL_ENABLED:
+        return 0
+    with _SOUL_FILE_LOCK:
+        _ensure_soul_file()
+        existing_md = _read_soul_markdown(limit_chars=200000)
+        existing = _extract_soul_items(existing_md)
+        before = _normalize_soul_items(existing)
+        merged = _normalize_soul_items(before + list(new_items or []))
+        _write_soul_items(merged)
+        return max(0, len(merged) - len(before))
+
+
+def _extract_json_object(raw_text: str) -> Dict[str, Any]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return {}
+    candidates: List[str] = [text]
+    fence = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text, re.I)
+    if fence:
+        candidates.append(str(fence.group(1) or "").strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return {}
+
+
+def _split_text(text: str, max_len: int = 1500) -> List[str]:
+    raw = str(text or "")
+    if len(raw) <= max_len:
+        return [raw]
+    out: List[str] = []
+    start = 0
+    while start < len(raw):
+        out.append(raw[start : start + max_len])
+        start += max_len
+    return out
+
+
+def _split_text_by_boundary(text: str, max_len: int = 1500) -> List[str]:
+    raw = str(text or "")
+    if len(raw) <= max_len:
+        return [raw]
+    out: List[str] = []
+    remaining = raw
+    while len(remaining) > max_len:
+        window = remaining[:max_len]
+        cut = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind("。"), window.rfind("！"), window.rfind("？"))
+        if cut < max_len // 3:
+            cut = max(window.rfind(" "), window.rfind("，"), window.rfind(","), window.rfind("；"), window.rfind(";"))
+        if cut < max_len // 3:
+            cut = max_len
+        else:
+            cut += 1
+        out.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        out.append(remaining)
+    return [item for item in out if item]
+
+
+def _trim(text: str, max_len: int = 1200) -> str:
+    txt = str(text or "")
+    if len(txt) <= max_len:
+        return txt
+    return txt[: max_len - 16] + "\n...<truncated>"
+
+
+def _parse_content_json(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    txt = str(raw or "")
+    if not txt:
+        return {}
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {}
+
+
+def _parse_json_map(raw: str, default_map: Dict[str, str]) -> Dict[str, str]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return dict(default_map)
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        LOG.warning("invalid json map, fallback to default: %s", txt[:200])
+        return dict(default_map)
+    if not isinstance(obj, dict):
+        return dict(default_map)
+    out = dict(default_map)
+    for k, v in obj.items():
+        kk = str(k or "").strip()
+        vv = str(v or "").strip()
+        if kk and vv:
+            out[kk] = vv
+    return out
+
+
+def _load_reply_context_map() -> Dict[str, Dict[str, Any]]:
+    if not REPLY_CONTEXT_PATH.exists():
+        return {}
+    try:
+        data = json.loads(REPLY_CONTEXT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    runtimes = data.get("runtimes") if isinstance(data, dict) else {}
+    if not isinstance(runtimes, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for runtime_id, item in runtimes.items():
+        key = str(runtime_id or "").strip()
+        if key and isinstance(item, dict):
+            out[key] = dict(item)
+    return out
+
+
+def _write_reply_context_map(runtimes: Dict[str, Dict[str, Any]]) -> None:
+    REPLY_CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"runtimes": runtimes, "updated_at": int(time.time())}
+    REPLY_CONTEXT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _set_runtime_reply_context(runtime_id: str, chat_id: str, message_id: str, project_name: str = "") -> None:
+    rid = str(runtime_id or "").strip()
+    mid = str(message_id or "").strip()
+    if not rid or not mid:
+        return
+    with _REPLY_CONTEXT_FILE_LOCK:
+        runtimes = _load_reply_context_map()
+        runtimes[rid] = {
+            "runtime_id": rid,
+            "chat_id": str(chat_id or "").strip(),
+            "message_id": mid,
+            "project": str(project_name or "").strip(),
+            "updated_at": int(time.time()),
+        }
+        _write_reply_context_map(runtimes)
+
+
+def _clear_runtime_reply_context(runtime_id: str, message_id: str = "") -> None:
+    rid = str(runtime_id or "").strip()
+    expected_mid = str(message_id or "").strip()
+    if not rid:
+        return
+    with _REPLY_CONTEXT_FILE_LOCK:
+        runtimes = _load_reply_context_map()
+        current = runtimes.get(rid) if isinstance(runtimes.get(rid), dict) else None
+        if not current:
+            return
+        current_mid = str(current.get("message_id") or "").strip()
+        if expected_mid and current_mid and current_mid != expected_mid:
+            return
+        runtimes.pop(rid, None)
+        _write_reply_context_map(runtimes)
+
+
+def _sanitize_filename(raw: str, fallback: str) -> str:
+    name = str(raw or "").strip() or fallback
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    safe = safe.strip("._")
+    if not safe:
+        safe = fallback
+    return safe[:120]
+
+
+def _normalize_display_line(line: str, in_code_block: bool = False) -> str:
+    txt = str(line or "").rstrip()
+    if not txt.strip():
+        return ""
+    if in_code_block:
+        return "    " + txt.strip("\n")
+    stripped = txt.strip()
+    heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
+    if heading:
+        stripped = heading.group(1)
+    quote = re.match(r"^>\s*(.+)$", stripped)
+    if quote:
+        stripped = f"引用：{quote.group(1)}"
+    bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
+    if bullet:
+        stripped = f"• {bullet.group(1)}"
+    numbered = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+    if numbered:
+        stripped = f"{numbered.group(1)}. {numbered.group(2)}"
+    stripped = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1", stripped)
+    stripped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", stripped)
+    stripped = stripped.replace("**", "").replace("__", "").replace("`", "")
+    return stripped.strip()
+
+
+def _text_to_post_chunks(text: str, title: str = "Codex 回复", max_chars: int = 4500, max_rows: int = 35) -> List[Dict[str, Any]]:
+    rows: List[List[Dict[str, str]]] = []
+    in_code_block = False
+    for raw_line in str(text or "").splitlines():
+        marker = raw_line.strip()
+        if marker.startswith("```"):
+            in_code_block = not in_code_block
+            if in_code_block:
+                rows.append([{"tag": "text", "text": "代码："}])
+            continue
+        normalized = _normalize_display_line(raw_line, in_code_block=in_code_block)
+        if not normalized:
+            continue
+        for part in _split_text_by_boundary(normalized, 450):
+            rows.append([{"tag": "text", "text": part}])
+    if not rows:
+        rows = [[{"tag": "text", "text": "(empty)"}]]
+
+    chunks: List[Dict[str, Any]] = []
+    current_rows: List[List[Dict[str, str]]] = []
+    current_chars = 0
+    for row in rows:
+        row_chars = sum(len(str(cell.get("text") or "")) for cell in row)
+        if current_rows and (len(current_rows) >= max_rows or current_chars + row_chars > max_chars):
+            chunks.append({"title": title, "rows": current_rows})
+            current_rows = []
+            current_chars = 0
+        current_rows.append(row)
+        current_chars += row_chars
+    if current_rows:
+        chunks.append({"title": title, "rows": current_rows})
+
+    if len(chunks) > 1:
+        total = len(chunks)
+        for idx, item in enumerate(chunks, start=1):
+            item["title"] = f"{title} ({idx}/{total})"
+    return chunks
+
+
+def _text_to_card_chunks(text: str, max_len: int = 8000) -> List[str]:
+    normalized = str(text or "").strip()
+    chunks = [part for part in _split_text_by_boundary(normalized, max_len=max_len) if part.strip()]
+    if not chunks:
+        chunks = ["(empty)"]
+    return chunks
+
+
+def _merge_streaming_text(previous_text: str, next_text: str) -> str:
+    previous = str(previous_text or "")
+    nxt = str(next_text or "")
+    if not nxt:
+        return previous
+    if not previous or nxt == previous:
+        return nxt
+    if nxt.startswith(previous) or nxt.endswith(previous):
+        return nxt
+    if previous.startswith(nxt) or previous.endswith(nxt):
+        return previous
+    if nxt in previous:
+        return previous
+    if previous in nxt:
+        return nxt
+    max_overlap = min(len(previous), len(nxt))
+    for overlap in range(max_overlap, 0, -1):
+        if previous[-overlap:] == nxt[:overlap]:
+            return previous + nxt[overlap:]
+    return nxt
+
+
+def _final_stream_card_text(text: str, max_chunk_len: int = FINAL_STREAM_CARD_PREVIEW_LEN) -> str:
+    return str(text or "").strip()
+
+
+def _with_project_prefix(text: str, project_name: str) -> str:
+    raw = str(text or "").strip()
+    project = str(project_name or "").strip()
+    if not project:
+        return raw
+    prefix = f"[{project}]"
+    if raw.startswith(prefix):
+        return raw
+    if raw:
+        return f"{prefix}\n\n{raw}"
+    return prefix
+
+
+def _build_final_stream_card(text: str, expanded: bool = False, page_index: int = 0) -> Tuple[Dict[str, Any], bool]:
+    raw = str(text or "").strip()
+    if not raw:
+        raw = "(empty)"
+    pages = _text_to_card_chunks(raw, max_len=FINAL_STREAM_CARD_PAGE_LEN)
+    is_long = len(raw) > FINAL_STREAM_CARD_PREVIEW_LEN or len(pages) > 1
+    elements: List[Dict[str, Any]] = []
+    if not is_long:
+        elements.append({"tag": "markdown", "content": raw})
+        return (
+            {
+                "schema": "2.0",
+                "config": {"wide_screen_mode": True},
+                "body": {"elements": elements},
+            },
+            False,
+        )
+
+    if not expanded:
+        elements.append({"tag": "markdown", "content": _final_stream_card_text(raw, FINAL_STREAM_CARD_PREVIEW_LEN)})
+        elements.append(
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "type": "primary",
+                        "text": {"tag": "plain_text", "content": "展开"},
+                        "value": {"op": "stream_final_expand"},
+                    }
+                ],
+            }
+        )
+    else:
+        idx = min(max(0, int(page_index or 0)), len(pages) - 1)
+        content = pages[idx]
+        if len(pages) > 1:
+            content = f"{content}\n\n---\n第 {idx + 1}/{len(pages)} 段"
+        actions: List[Dict[str, Any]] = []
+        if idx > 0:
+            actions.append(
+                {
+                    "tag": "button",
+                    "type": "default",
+                    "text": {"tag": "plain_text", "content": "上一段"},
+                    "value": {"op": "stream_final_prev"},
+                }
+            )
+        if idx < len(pages) - 1:
+            actions.append(
+                {
+                    "tag": "button",
+                    "type": "primary",
+                    "text": {"tag": "plain_text", "content": "下一段"},
+                    "value": {"op": "stream_final_next"},
+                }
+            )
+        actions.append(
+            {
+                "tag": "button",
+                "type": "default",
+                "text": {"tag": "plain_text", "content": "收起"},
+                "value": {"op": "stream_final_collapse"},
+            }
+        )
+        elements.append({"tag": "markdown", "content": content})
+        elements.append({"tag": "action", "actions": actions})
+    return (
+        {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "body": {"elements": elements},
+        },
+        True,
+    )
+
+
+def _set_final_stream_card_state(message_id: str, text: str, expanded: bool = False, page_index: int = 0) -> None:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return
+    with _FINAL_STREAM_CARD_STATE_LOCK:
+        _FINAL_STREAM_CARD_STATE[mid] = {
+            "text": str(text or ""),
+            "expanded": bool(expanded),
+            "page_index": max(0, int(page_index or 0)),
+            "updated_at": time.time(),
+        }
+        if len(_FINAL_STREAM_CARD_STATE) > 500:
+            stale = sorted(_FINAL_STREAM_CARD_STATE.items(), key=lambda item: float(item[1].get("updated_at") or 0.0))
+            for old_mid, _ in stale[:-300]:
+                _FINAL_STREAM_CARD_STATE.pop(old_mid, None)
+
+
+def _get_final_stream_card_state(message_id: str) -> Dict[str, Any]:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return {}
+    with _FINAL_STREAM_CARD_STATE_LOCK:
+        data = dict(_FINAL_STREAM_CARD_STATE.get(mid) or {})
+    return data
+
+
+def _clear_final_stream_card_state(message_id: str) -> None:
+    mid = str(message_id or "").strip()
+    if not mid:
+        return
+    with _FINAL_STREAM_CARD_STATE_LOCK:
+        _FINAL_STREAM_CARD_STATE.pop(mid, None)
+
+
+def _truncate_summary(text: str, max_len: int = 50) -> str:
+    clean = str(text or "").replace("\n", " ").strip()
+    if len(clean) <= max_len:
+        return clean
+    return clean[: max_len - 3] + "..."
+
+
+def _format_elapsed_human(total_sec: int) -> str:
+    total = max(0, int(total_sec or 0))
+    hours, rem = divmod(total, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}小时{mins}分{secs}秒"
+    if mins > 0:
+        return f"{mins}分{secs}秒"
+    return f"{secs}秒"
+
+
+def _clean_progress_preview(text: str, max_len: int = 480) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return _trim(raw, max_len)
+
+
+def _guess_suffix(msg_type: str) -> str:
+    t = str(msg_type or "").strip().lower()
+    if t == "image":
+        return ".png"
+    if t == "audio":
+        return ".mp3"
+    if t == "video":
+        return ".mp4"
+    if t == "sticker":
+        return ".webp"
+    return ".bin"
+
+
+def _is_image_path(path: str) -> bool:
+    return Path(path).suffix.lower() in IMAGE_SUFFIXES
+
+
+def _parse_model_candidates(text: str) -> List[str]:
+    out: List[str] = []
+
+    def _add(value: str) -> None:
+        val = str(value or "").strip().strip("`")
+        if not val:
+            return
+        if val not in out:
+            out.append(val)
+
+    section_visibility = "list"
+    for raw_line in str(text or "").splitlines():
+        line = str(raw_line or "").strip()
+        lower = line.lower()
+        if "visibility=hide" in lower or line.startswith("隐藏"):
+            section_visibility = "hide"
+            continue
+        if "visibility=list" in lower or line.startswith("可见"):
+            section_visibility = "list"
+            continue
+
+        m = re.match(
+            r"^\s*(?:\d+\.\s*|-\s*)`?([A-Za-z0-9._:-]+)`?(?:\s*\(`?(list|hide)`?\))?\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if not m:
+            continue
+        visibility = str(m.group(2) or section_visibility).strip().lower()
+        if visibility == "hide":
+            continue
+        _add(m.group(1))
+
+    for line in str(text or "").splitlines():
+        if "effective" in line and "=" in line:
+            _add(line.split("=", 1)[1])
+
+    return out
+
+
+def _extract_status_value(text: str, key: str) -> str:
+    pattern = re.compile(rf"(?mi)^\s*{re.escape(str(key or '').strip())}\s*=\s*(.+?)\s*$")
+    m = pattern.search(str(text or ""))
+    if not m:
+        return ""
+    return str(m.group(1) or "").strip().strip("`")
+
+
+def _format_limit_line(label: str, node: Dict[str, Any]) -> str:
+    if not isinstance(node, dict):
+        return f"{label}: unavailable"
+    try:
+        used_percent = float(node.get("usedPercent"))
+    except Exception:
+        used_percent = -1.0
+    left = max(0, min(100, int(round(100.0 - used_percent)))) if used_percent >= 0 else -1
+    resets_at_raw = node.get("resetsAt")
+    try:
+        resets_at = int(resets_at_raw)
+    except Exception:
+        resets_at = 0
+    if resets_at > 0:
+        dt = datetime.fromtimestamp(resets_at)
+        reset_text = f"{dt:%H:%M} on {dt.day} {dt:%b}"
+    else:
+        reset_text = "unknown"
+    if left >= 0:
+        return f"{label}: {left}% left (resets {reset_text})"
+    return f"{label}: unavailable (resets {reset_text})"
+
+
+def _format_rate_limit_lines(rate_limits: Dict[str, Any]) -> List[str]:
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        return []
+    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
+    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
+    lines: List[str] = []
+    if primary:
+        lines.append(_format_limit_line("5h limit", primary))
+    if secondary:
+        lines.append(_format_limit_line("Weekly limit", secondary))
+    return lines
+
+
+class FeishuClient:
+    def __init__(self, app_id: str, app_secret: str):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self._token = ""
+        self._token_expire_at = 0.0
+        self._token_lock = threading.Lock()
+
+    def _tenant_access_token(self) -> str:
+        with self._token_lock:
+            now = time.time()
+            if self._token and now < self._token_expire_at:
+                return self._token
+
+            resp = requests.post(
+                f"{FEISHU_API}/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"Feishu token error: {data}")
+            self._token = str(data.get("tenant_access_token") or "")
+            if not self._token:
+                raise RuntimeError("Feishu token response missing tenant_access_token")
+            self._token_expire_at = now + int(data.get("expire", 7200)) - 60
+            return self._token
+
+    def _api_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}{str(path or '').strip()}"
+        resp = requests.get(url, headers=headers, params=dict(params or {}), timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"feishu get failed path={path} status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"feishu get err path={path} body={data}")
+        body = data.get("data")
+        return dict(body) if isinstance(body, dict) else {}
+
+    def get_application_name(self) -> str:
+        if not self.app_id:
+            return ""
+        try:
+            data = self._api_get(f"/application/v6/applications/{self.app_id}", params={"lang": "zh_cn"})
+            app = data.get("app") if isinstance(data.get("app"), dict) else {}
+            return str(app.get("app_name") or "").strip()
+        except Exception:
+            return ""
+
+    def get_chat_name(self, chat_id: str) -> str:
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return ""
+        try:
+            data = self._api_get(f"/im/v1/chats/{cid}")
+            return str(data.get("name") or "").strip()
+        except Exception:
+            return ""
+
+    def get_user_display_name(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        probes: List[Tuple[str, str]] = []
+        if open_id:
+            probes.append(("open_id", str(open_id).strip()))
+        if user_id:
+            probes.append(("user_id", str(user_id).strip()))
+        if union_id:
+            probes.append(("union_id", str(union_id).strip()))
+        for id_type, uid in probes:
+            if not uid:
+                continue
+            try:
+                data = self._api_get(f"/contact/v3/users/{uid}", params={"user_id_type": id_type})
+            except Exception:
+                continue
+            user = data.get("user") if isinstance(data.get("user"), dict) else {}
+            for key in ("name", "nickname", "en_name"):
+                value = str(user.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    def send_text_by_receive_id(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type={receive_id_type}"
+        for chunk in _split_text(str(text or ""), 1500):
+            payload = {
+                "receive_id": receive_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": chunk}, ensure_ascii=False),
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code >= 300:
+                LOG.error("send_text failed status=%s body=%s", resp.status_code, resp.text)
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if data.get("code") != 0:
+                LOG.error("send_text feishu err: %s", data)
+
+    def send_text(self, chat_id: str, text: str) -> None:
+        self.send_text_by_receive_id(chat_id, text, receive_id_type="chat_id")
+
+    def send_post_by_receive_id(self, receive_id: str, text: str, title: str = "Codex 回复", receive_id_type: str = "chat_id") -> None:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type={receive_id_type}"
+        for chunk in _text_to_post_chunks(text=text, title=title):
+            payload = {
+                "receive_id": receive_id,
+                "msg_type": "post",
+                "content": json.dumps(
+                    {
+                        "zh_cn": {
+                            "title": str(chunk.get("title") or title),
+                            "content": chunk.get("rows") or [[{"tag": "text", "text": "(empty)"}]],
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"send_post failed status={resp.status_code} body={resp.text}")
+            data = resp.json()
+            if data.get("code") != 0:
+                raise RuntimeError(f"send_post feishu err: {data}")
+
+    def send_post(self, chat_id: str, text: str, title: str = "Codex 回复") -> None:
+        self.send_post_by_receive_id(chat_id, text=text, title=title, receive_id_type="chat_id")
+
+    def send_markdown_card(self, chat_id: str, text: str, title: str = "Codex 回复") -> None:
+        for idx, chunk in enumerate(_text_to_card_chunks(text=text), start=1):
+            content = chunk
+            if idx > 1:
+                content = f"（续 {idx}）\n\n{content}"
+            self.send_card(
+                chat_id,
+                {
+                    "schema": "2.0",
+                    "config": {"wide_screen_mode": True},
+                    "body": {
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "content": content,
+                            }
+                        ]
+                    },
+                },
+            )
+
+    def smart_send_by_receive_id(
+        self,
+        receive_id: str,
+        text: str,
+        receive_id_type: str = "chat_id",
+        title: str = "Codex 回复",
+        prefer_rich: bool = True,
+    ) -> None:
+        raw = str(text or "").strip()
+        if not raw:
+            return
+        looks_structured = ("\n" in raw) or bool(re.search(r"(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+\.\s|```|>)", raw))
+        use_post = prefer_rich and (len(raw) > 280 or looks_structured)
+        if not use_post:
+            self.send_text_by_receive_id(receive_id, raw, receive_id_type=receive_id_type)
+            return
+        try:
+            if receive_id_type == "chat_id":
+                self.send_markdown_card(receive_id, raw, title=title)
+                return
+            self.send_post_by_receive_id(receive_id, raw, title=title, receive_id_type=receive_id_type)
+        except Exception as card_exc:
+            LOG.warning("smart_send card fallback receive_id=%s err=%s", receive_id, card_exc)
+            try:
+                self.send_post_by_receive_id(receive_id, raw, title=title, receive_id_type=receive_id_type)
+            except Exception as post_exc:
+                LOG.warning("smart_send post fallback to text receive_id=%s err=%s", receive_id, post_exc)
+                self.send_text_by_receive_id(receive_id, raw, receive_id_type=receive_id_type)
+
+    def smart_send(self, chat_id: str, text: str, title: str = "Codex 回复", prefer_rich: bool = True) -> None:
+        self.smart_send_by_receive_id(
+            chat_id,
+            text=text,
+            receive_id_type="chat_id",
+            title=title,
+                prefer_rich=prefer_rich,
+            )
+
+    def send_card_reference(self, chat_id: str, card_id: str, reply_to_message_id: str = "") -> str:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        content = json.dumps({"type": "card", "data": {"card_id": str(card_id)}}, ensure_ascii=False)
+        if str(reply_to_message_id or "").strip():
+            url = f"{FEISHU_API}/im/v1/messages/{reply_to_message_id}/reply"
+            payload = {"msg_type": "interactive", "content": content}
+        else:
+            url = f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"
+            payload = {"receive_id": chat_id, "msg_type": "interactive", "content": content}
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"send_card_reference failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_card_reference feishu err: {data}")
+        out = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return str(out.get("message_id") or "").strip()
+
+    def add_typing_reaction(self, message_id: str, emoji_type: str = "Typing") -> str:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return ""
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}/reactions"
+        payload = {"reaction_type": {"emoji_type": emoji_type}}
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"add_typing_reaction failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"add_typing_reaction feishu err: {data}")
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        return str(body.get("reaction_id") or "").strip()
+
+    def delete_typing_reaction(self, message_id: str, reaction_id: str) -> None:
+        mid = str(message_id or "").strip()
+        rid = str(reaction_id or "").strip()
+        if not mid or not rid:
+            return
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}/reactions/{rid}"
+        resp = requests.delete(url, headers=headers, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"delete_typing_reaction failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"delete_typing_reaction feishu err: {data}")
+
+    def delete_message(self, message_id: str) -> None:
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}"
+        resp = requests.delete(url, headers=headers, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"delete_message failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"delete_message feishu err: {data}")
+
+    def send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"send_card failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_card feishu err: {data}")
+
+    def update_message_card(self, message_id: str, card: Dict[str, Any]) -> None:
+        mid = str(message_id or "").strip()
+        if not mid:
+            raise RuntimeError("message_id is empty")
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages/{mid}"
+        payload = {
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        }
+        resp = requests.patch(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"update_message_card failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"update_message_card feishu err: {data}")
+
+    def upload_file(self, file_path: str, file_name: str = "") -> str:
+        path = Path(str(file_path or "")).expanduser().resolve()
+        if not path.exists() or (not path.is_file()):
+            raise RuntimeError(f"file not found: {path}")
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        with path.open("rb") as f:
+            files = {"file": (str(file_name or path.name), f)}
+            data = {"file_type": "stream", "file_name": str(file_name or path.name)}
+            resp = requests.post(f"{FEISHU_API}/im/v1/files", headers=headers, data=data, files=files, timeout=60)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"upload_file failed status={resp.status_code} body={resp.text}")
+        payload = resp.json()
+        if payload.get("code") != 0:
+            raise RuntimeError(f"upload_file feishu err: {payload}")
+        file_key = str((payload.get("data") or {}).get("file_key") or "").strip()
+        if not file_key:
+            raise RuntimeError(f"upload_file missing file_key: {payload}")
+        return file_key
+
+    def send_file_by_receive_id(self, receive_id: str, file_key: str, receive_id_type: str = "chat_id") -> str:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type={receive_id_type}"
+        payload = {
+            "receive_id": str(receive_id or ""),
+            "msg_type": "file",
+            "content": json.dumps({"file_key": str(file_key or "")}, ensure_ascii=False),
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"send_file failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"send_file feishu err: {data}")
+        return str((data.get("data") or {}).get("message_id") or "")
+
+    def send_file(self, chat_id: str, file_path: str, file_name: str = "") -> str:
+        file_key = self.upload_file(file_path=file_path, file_name=file_name)
+        return self.send_file_by_receive_id(chat_id, file_key, receive_id_type="chat_id")
+
+    def download_image(self, image_key: str, save_path: Path) -> None:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}/im/v1/images/{image_key}"
+        resp = requests.get(url, headers=headers, timeout=60)
+        resp.raise_for_status()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_bytes(resp.content)
+
+    def download_message_resource(self, message_id: str, file_key: str, resource_type: str, save_path: Path) -> None:
+        token = self._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_API}/im/v1/messages/{message_id}/resources/{file_key}"
+        resp = requests.get(url, headers=headers, params={"type": resource_type}, timeout=60)
+        resp.raise_for_status()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_bytes(resp.content)
+
+
+class FeishuStreamingCardSession:
+    def __init__(self, feishu: FeishuClient, chat_id: str, reply_to_message_id: str = "", project_name: str = "") -> None:
+        self.feishu = feishu
+        self.chat_id = str(chat_id or "").strip()
+        self.reply_to_message_id = str(reply_to_message_id or "").strip()
+        self.project_name = str(project_name or "").strip()
+        self.card_id = ""
+        self.message_id = ""
+        self.sequence = 0
+        self.current_text = ""
+        self.closed = False
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        if self.card_id:
+            return
+        token = self.feishu._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        card_json = {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": "处理中..."},
+                # This card replaces the whole status snapshot on each update.
+                # Render each snapshot almost immediately so long-running tasks do
+                # not build up a slow typewriter queue in the Feishu client.
+                "streaming_config": {
+                    "print_frequency_ms": {"default": STREAMING_CARD_PRINT_FREQUENCY_MS},
+                    "print_step": {"default": STREAMING_CARD_PRINT_STEP},
+                },
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": _with_project_prefix("正在处理你的请求\n\n稍后会把进展显示在这里。", self.project_name),
+                        "element_id": "content",
+                    },
+                ]
+            },
+        }
+        payload = {"type": "card_json", "data": json.dumps(card_json, ensure_ascii=False)}
+        resp = requests.post(f"{FEISHU_API}/cardkit/v1/cards", headers=headers, json=payload, timeout=20)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"stream card create failed status={resp.status_code} body={resp.text}")
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"stream card create feishu err: {data}")
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        self.card_id = str(body.get("card_id") or "").strip()
+        if not self.card_id:
+            raise RuntimeError(f"stream card create missing card_id: {data}")
+        self.message_id = self.feishu.send_card_reference(
+            chat_id=self.chat_id,
+            card_id=self.card_id,
+            reply_to_message_id=self.reply_to_message_id,
+        )
+
+    def _update_content(self, text: str) -> None:
+        if not self.card_id:
+            return
+        self.sequence += 1
+        token = self.feishu._tenant_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {"content": text, "sequence": self.sequence, "uuid": f"s_{self.card_id}_{self.sequence}"}
+        resp = requests.put(
+            f"{FEISHU_API}/cardkit/v1/cards/{self.card_id}/elements/content/content",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"stream card update failed status={resp.status_code} body={resp.text}")
+        data = resp.json() if resp.text else {}
+        if isinstance(data, dict) and data.get("code") not in (None, 0):
+            raise RuntimeError(f"stream card update feishu err: {data}")
+
+    def update(self, text: str) -> None:
+        if self.closed or not self.card_id:
+            return
+        merged = _merge_streaming_text(self.current_text, text)
+        if not merged or merged == self.current_text:
+            return
+        with self._lock:
+            merged = _merge_streaming_text(self.current_text, merged)
+            if not merged or merged == self.current_text:
+                return
+            self._update_content(merged)
+            self.current_text = merged
+
+    def close(self, final_text: str = "") -> None:
+        if self.closed or not self.card_id:
+            return
+        with self._lock:
+            if self.closed:
+                return
+            final_merged = _merge_streaming_text(self.current_text, final_text)
+            update_err: Optional[Exception] = None
+            if final_merged and final_merged != self.current_text:
+                self.current_text = final_merged
+                try:
+                    self._update_content(_with_project_prefix(_final_stream_card_text(final_merged), self.project_name))
+                except Exception as exc:
+                    update_err = exc
+                    LOG.warning("stream card final content update failed card_id=%s err=%s", self.card_id or "<none>", exc)
+            _clear_final_stream_card_state(self.message_id)
+            self.sequence += 1
+            token = self.feishu._tenant_access_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+            payload = {
+                "settings": json.dumps(
+                    {
+                        "config": {
+                            "streaming_mode": False,
+                            "summary": {"content": _truncate_summary(self.current_text)},
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                "sequence": self.sequence,
+                "uuid": f"c_{self.card_id}_{self.sequence}",
+            }
+            resp = requests.patch(
+                f"{FEISHU_API}/cardkit/v1/cards/{self.card_id}/settings",
+                headers=headers,
+                json=payload,
+                timeout=20,
+            )
+            if resp.status_code >= 300:
+                raise RuntimeError(
+                    f"stream card close failed status={resp.status_code} body={resp.text}"
+                    + (f"; final_update_err={update_err}" if update_err else "")
+                )
+            data = resp.json() if resp.text else {}
+            if isinstance(data, dict) and data.get("code") not in (None, 0):
+                raise RuntimeError(
+                    f"stream card close feishu err: {data}"
+                    + (f"; final_update_err={update_err}" if update_err else "")
+                )
+            self.closed = True
+            if update_err:
+                raise RuntimeError(f"stream card final content update failed: {update_err}")
+
+    def is_active(self) -> bool:
+        return bool(self.card_id) and not self.closed
+
+
+class ControlAPI:
+    def __init__(self, base: str, api_prefix: str, api_token: str):
+        self.base = base.rstrip("/")
+        self.api_prefix = api_prefix
+        self.api_token = api_token
+
+    def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None, timeout: int = 30) -> Dict[str, Any]:
+        if not self.api_token:
+            raise RuntimeError("BRIDGE_API_TOKEN is empty")
+        url = f"{self.base}{self.api_prefix}{path}"
+        headers = {"Authorization": f"Bearer {self.api_token}", "Content-Type": "application/json"}
+        resp = requests.request(method=method, url=url, headers=headers, json=(body or {}), timeout=timeout)
+        text = resp.text or ""
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": text}
+        if resp.status_code >= 300:
+            err = data.get("detail") if isinstance(data, dict) else data
+            raise RuntimeError(str(err or f"http {resp.status_code}"))
+        if not isinstance(data, dict):
+            raise RuntimeError(f"invalid api response: {data}")
+        return data
+
+    def status(self, chat_id: str) -> Dict[str, Any]:
+        return self._call("GET", f"/chat/{chat_id}/status", None, timeout=20)
+
+    def auth_profiles(self) -> Dict[str, Any]:
+        return self._call("GET", "/auth/profiles", None, timeout=30)
+
+    def update_config(
+        self,
+        chat_id: str,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
+        body = {
+            "cwd": str(cwd or ""),
+            "model": str(model or ""),
+            "sandbox": str(sandbox or ""),
+            "approval_policy": str(approval_policy or ""),
+            "personality": str(personality or ""),
+        }
+        return self._call("POST", f"/chat/{chat_id}/config", body, timeout=20)
+
+    def update_auth_profile(self, chat_id: str, profile: str = "") -> Dict[str, Any]:
+        return self._call("POST", f"/chat/{chat_id}/auth-profile", {"profile": str(profile or "")}, timeout=30)
+
+    def reset(self, chat_id: str, cwd: str = "") -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        if cwd:
+            body["cwd"] = cwd
+        return self._call("POST", f"/chat/{chat_id}/thread/reset", body, timeout=30)
+
+    def interrupt(self, chat_id: str) -> Dict[str, Any]:
+        return self._call("POST", f"/chat/{chat_id}/interrupt", {}, timeout=20)
+
+    def turn(self, chat_id: str, text: str, timeout_sec: int, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        return self._call(
+            "POST",
+            f"/chat/{chat_id}/turn",
+            {
+                "text": text,
+                "timeout_sec": int(timeout_sec),
+                "image_paths": [str(p) for p in (image_paths or []) if str(p).strip()],
+            },
+            timeout=max(30, int(timeout_sec) + 20),
+        )
+
+    def steer(self, chat_id: str, text: str, image_paths: Optional[List[str]] = None, expected_turn_id: str = "") -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "text": text,
+            "image_paths": [str(p) for p in (image_paths or []) if str(p).strip()],
+        }
+        if expected_turn_id:
+            body["expected_turn_id"] = str(expected_turn_id)
+        return self._call("POST", f"/chat/{chat_id}/turn/steer", body, timeout=30)
+
+
+class AppServerBotBridge:
+    def __init__(
+        self,
+        feishu: FeishuClient,
+        control: ControlAPI,
+        upload_root: Path,
+        menu_actions: Dict[str, str],
+        projects: Dict[str, str],
+        project_root: Path,
+        projects_store_path: Path,
+        user_chat_map_path: Path,
+    ):
+        self.feishu = feishu
+        self.control = control
+        self.upload_root = upload_root
+        self.menu_actions = dict(menu_actions)
+        self.project_root = Path(project_root).expanduser().resolve()
+        self.projects_store_path = Path(projects_store_path).expanduser().resolve()
+        self.user_chat_map_path = Path(user_chat_map_path).expanduser().resolve()
+        self.state_path = STATE_PATH
+        self.active_projects_store_path = ACTIVE_PROJECTS_STORE_PATH
+        self.projects = {str(k): str(v) for k, v in projects.items() if str(k).strip() and str(v).strip()}
+
+        self._event_lock = threading.Lock()
+        self._seen_event_ids: List[str] = []
+
+        self._projects_lock = threading.Lock()
+
+        self._chat_locks_guard = threading.Lock()
+        self._chat_locks: Dict[str, threading.Lock] = {}
+
+        self._pending_files_lock = threading.Lock()
+        self._pending_files: Dict[str, List[str]] = {}
+
+        self._queued_inputs_lock = threading.Lock()
+        self._queued_inputs: Dict[str, List[Dict[str, Any]]] = {}
+
+        self._user_chat_lock = threading.Lock()
+        self._user_chat_map: Dict[str, str] = {}
+        self._await_project_name_lock = threading.Lock()
+        self._await_project_name: Dict[str, bool] = {}
+        self._active_project_lock = threading.Lock()
+        self._active_project: Dict[str, str] = {}
+        self._display_name_cache_lock = threading.Lock()
+        self._display_name_cache: Dict[str, Dict[str, Any]] = {}
+        self._chat_name_cache: Dict[str, Dict[str, Any]] = {}
+        self._bot_name_cache: Dict[str, Any] = {"name": "", "expire_at": 0.0}
+        self._soul_update_lock = threading.Lock()
+
+        self._load_persisted_projects()
+        self._load_persisted_user_chat_map()
+        self._bootstrap_legacy_owner_identities()
+        self._load_persisted_active_projects()
+        _ensure_soul_file()
+
+    def handle_event_async(self, payload: Dict[str, Any]) -> None:
+        threading.Thread(target=self._handle_event_safe, args=(payload,), daemon=True).start()
+
+    def handle_menu_event_async(self, payload: Dict[str, Any]) -> None:
+        threading.Thread(target=self._handle_menu_event_safe, args=(payload,), daemon=True).start()
+
+    def handle_card_action_async(self, payload: P2CardActionTrigger) -> None:
+        threading.Thread(target=self._handle_card_action_safe, args=(payload,), daemon=True).start()
+
+    def _handle_event_safe(self, payload: Dict[str, Any]) -> None:
+        try:
+            self._handle_event(payload)
+        except Exception as exc:
+            LOG.exception("Failed handling message event: %s", exc)
+
+    def _handle_menu_event_safe(self, payload: Dict[str, Any]) -> None:
+        try:
+            self._handle_menu_event(payload)
+        except Exception as exc:
+            LOG.exception("Failed handling menu event: %s", exc)
+
+    def _handle_card_action_safe(self, payload: P2CardActionTrigger) -> None:
+        try:
+            self._handle_card_action(payload)
+        except Exception as exc:
+            LOG.exception("Failed handling card action: %s", exc)
+
+    def _dedupe_event(self, event_id: str) -> bool:
+        eid = str(event_id or "").strip()
+        if not eid:
+            return False
+        with self._event_lock:
+            if eid in self._seen_event_ids:
+                return True
+            self._seen_event_ids.append(eid)
+            if len(self._seen_event_ids) > 2000:
+                self._seen_event_ids = self._seen_event_ids[-1000:]
+            return False
+
+    def _chat_lock(self, chat_id: str) -> threading.Lock:
+        clean_chat = str(chat_id)
+        with self._chat_locks_guard:
+            lock = self._chat_locks.get(clean_chat)
+            if lock:
+                return lock
+            lock = threading.Lock()
+            self._chat_locks[clean_chat] = lock
+            return lock
+
+    def _load_persisted_projects(self) -> None:
+        path = self.projects_store_path
+        if not path.exists():
+            return
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load projects store failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(obj, dict):
+            return
+        loaded: Dict[str, str] = {}
+        for k, v in obj.items():
+            name = str(k or "").strip()
+            p = str(v or "").strip()
+            if not name or not p:
+                continue
+            loaded[name] = str(Path(p).expanduser().resolve())
+        if not loaded:
+            return
+        with self._projects_lock:
+            self.projects.update(loaded)
+
+    def _persist_projects(self) -> None:
+        path = self.projects_store_path
+        payload: Dict[str, str] = {}
+        with self._projects_lock:
+            for k, v in sorted(self.projects.items()):
+                name = str(k or "").strip()
+                p = str(v or "").strip()
+                if name and p:
+                    payload[name] = p
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _load_persisted_user_chat_map(self) -> None:
+        path = self.user_chat_map_path
+        if not path.exists():
+            return
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load user chat map failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(obj, dict):
+            return
+        loaded: Dict[str, str] = {}
+        for k, v in obj.items():
+            key = str(k or "").strip()
+            chat = str(v or "").strip()
+            if not key or not chat:
+                continue
+            loaded[key] = chat
+        if not loaded:
+            return
+        with self._user_chat_lock:
+            self._user_chat_map.update(loaded)
+
+    def _persist_user_chat_map(self) -> None:
+        path = self.user_chat_map_path
+        with self._user_chat_lock:
+            payload = {str(k): str(v) for k, v in self._user_chat_map.items() if str(k).strip() and str(v).strip()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _bootstrap_legacy_owner_identities(self) -> None:
+        if not USER_SESSION_ISOLATION:
+            return
+        changed = False
+        with self._user_chat_lock:
+            for k, v in list(self._user_chat_map.items()):
+                key = str(k or "").strip()
+                chat = str(v or "").strip()
+                if not key or not chat:
+                    continue
+                if key.startswith("legacy_owner_identity:") or key.startswith("legacy_claim:"):
+                    continue
+                identity = ""
+                if key.startswith("open:") or key.startswith("user:") or key.startswith("union:"):
+                    identity = key
+                elif key.startswith("ou_"):
+                    identity = f"open:{key}"
+                if not identity:
+                    continue
+                base = self._base_chat_id(chat)
+                if not base:
+                    continue
+                owner_key = f"legacy_owner_identity:{base}"
+                if not str(self._user_chat_map.get(owner_key) or "").strip():
+                    self._user_chat_map[owner_key] = identity
+                    changed = True
+        if changed:
+            self._persist_user_chat_map()
+
+    def _load_persisted_active_projects(self) -> None:
+        path = self.active_projects_store_path
+        if not path.exists():
+            return
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load active projects failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(obj, dict):
+            return
+        loaded: Dict[str, str] = {}
+        for k, v in obj.items():
+            cid = str(k or "").strip()
+            project = str(v or "").strip()
+            if cid and project:
+                loaded[cid] = project
+        if not loaded:
+            return
+        with self._active_project_lock:
+            self._active_project.update(loaded)
+
+    def _persist_active_projects(self) -> None:
+        path = self.active_projects_store_path
+        with self._active_project_lock:
+            payload = {str(k): str(v) for k, v in self._active_project.items() if str(k).strip() and str(v).strip()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _set_await_project_name(self, chat_id: str, enabled: bool) -> None:
+        cid = str(chat_id or "")
+        with self._await_project_name_lock:
+            if enabled:
+                self._await_project_name[cid] = True
+            else:
+                self._await_project_name.pop(cid, None)
+
+    def _consume_await_project_name(self, chat_id: str) -> bool:
+        cid = str(chat_id or "")
+        with self._await_project_name_lock:
+            if self._await_project_name.get(cid):
+                self._await_project_name.pop(cid, None)
+                return True
+        return False
+
+    def _is_await_project_name(self, chat_id: str) -> bool:
+        cid = str(chat_id or "")
+        with self._await_project_name_lock:
+            return bool(self._await_project_name.get(cid))
+
+    def _create_project_from_name(self, chat_id: str, raw_name: str) -> str:
+        name = _sanitize_filename(raw_name, "")
+        if not name:
+            return "项目名无效，请使用字母/数字/.-_ 组合。"
+        root = self.project_root
+        root.mkdir(parents=True, exist_ok=True)
+        proj_path = (root / name).resolve()
+        created = False
+        if not proj_path.exists():
+            proj_path.mkdir(parents=True, exist_ok=True)
+            created = True
+
+        with self._projects_lock:
+            self.projects[name] = str(proj_path)
+        self._persist_projects()
+
+        try:
+            self._set_active_project(chat_id, name)
+            self.control.update_config(chat_id=self._runtime_key(chat_id, name), cwd=str(proj_path))
+        except Exception as exc:
+            return f"项目已{'创建' if created else '注册'}，但切换失败: {exc}\nname={name}\npath={proj_path}"
+        return f"项目已{'创建' if created else '注册'}并切换成功。\nname={name}\npath={proj_path}"
+
+    def _base_chat_id(self, chat_id: str) -> str:
+        raw = str(chat_id or "").strip()
+        if "::" in raw:
+            raw = raw.split("::", 1)[0].strip()
+        if "@@" in raw:
+            raw = raw.split("@@", 1)[0].strip()
+        return raw
+
+    def _chat_scope_identity(self, chat_id: str) -> str:
+        raw = str(chat_id or "").strip()
+        if "::" in raw:
+            raw = raw.split("::", 1)[0].strip()
+        if "@@" not in raw:
+            return ""
+        return raw.split("@@", 1)[1].strip()
+
+    def _sender_identity(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        if open_id:
+            return f"open:{open_id}"
+        if user_id:
+            return f"user:{user_id}"
+        if union_id:
+            return f"union:{union_id}"
+        return ""
+
+    def _scoped_chat_id(self, chat_id: str, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        base = self._base_chat_id(chat_id)
+        if not USER_SESSION_ISOLATION:
+            return base
+        if open_id:
+            return f"{base}@@open:{open_id}"
+        if user_id:
+            return f"{base}@@user:{user_id}"
+        if union_id:
+            return f"{base}@@union:{union_id}"
+        return base
+
+    def _claim_legacy_chat_owner(self, base_chat_id: str, runtime_chat_id: str) -> bool:
+        base = self._base_chat_id(base_chat_id)
+        runtime = str(runtime_chat_id or "").strip()
+        if not USER_SESSION_ISOLATION or not base or not runtime or runtime == base:
+            return False
+        claim_key = f"legacy_claim:{base}"
+        owner_key = f"legacy_owner_identity:{base}"
+        runtime_identity = self._chat_scope_identity(runtime)
+        changed = False
+        with self._user_chat_lock:
+            owner_identity = str(self._user_chat_map.get(owner_key) or "").strip()
+            if not owner_identity and runtime_identity:
+                owner_identity = runtime_identity
+                self._user_chat_map[owner_key] = owner_identity
+                changed = True
+            if owner_identity and runtime_identity and owner_identity != runtime_identity:
+                denied = True
+            else:
+                denied = False
+            owner = str(self._user_chat_map.get(claim_key) or "").strip()
+            if not denied and not owner:
+                owner = runtime
+                self._user_chat_map[claim_key] = owner
+                changed = True
+        if changed:
+            self._persist_user_chat_map()
+        if denied:
+            return False
+        return owner == runtime
+
+    def _bind_user_chat(self, sender_id: Dict[str, Any], chat_id: str, runtime_chat_id: str = "") -> None:
+        open_id = str(sender_id.get("open_id") or "").strip()
+        user_id = str(sender_id.get("user_id") or "").strip()
+        union_id = str(sender_id.get("union_id") or "").strip()
+        mapped_chat = str(runtime_chat_id or chat_id or "").strip()
+        base_chat = self._base_chat_id(chat_id)
+        identity = self._sender_identity(open_id=open_id, user_id=user_id, union_id=union_id)
+        changed = False
+        with self._user_chat_lock:
+            if open_id:
+                if self._user_chat_map.get(open_id) != mapped_chat:
+                    changed = True
+                self._user_chat_map[open_id] = mapped_chat
+                if self._user_chat_map.get(f"open:{open_id}") != mapped_chat:
+                    changed = True
+                self._user_chat_map[f"open:{open_id}"] = mapped_chat
+            if user_id:
+                if self._user_chat_map.get(f"user:{user_id}") != mapped_chat:
+                    changed = True
+                self._user_chat_map[f"user:{user_id}"] = mapped_chat
+            if union_id:
+                if self._user_chat_map.get(f"union:{union_id}") != mapped_chat:
+                    changed = True
+                self._user_chat_map[f"union:{union_id}"] = mapped_chat
+            if base_chat and identity:
+                owner_key = f"legacy_owner_identity:{base_chat}"
+                if not str(self._user_chat_map.get(owner_key) or "").strip():
+                    self._user_chat_map[owner_key] = identity
+                    changed = True
+        if changed:
+            self._persist_user_chat_map()
+
+    def _resolve_chat_by_user(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        with self._user_chat_lock:
+            candidates: List[str] = []
+            if open_id:
+                candidates += [open_id, f"open:{open_id}"]
+            if user_id:
+                candidates.append(f"user:{user_id}")
+            if union_id:
+                candidates.append(f"union:{union_id}")
+            for key in candidates:
+                val = str(self._user_chat_map.get(key) or "")
+                if val:
+                    return val
+            if SINGLE_CHAT_ONLY:
+                for k, v in self._user_chat_map.items():
+                    if str(k).startswith("legacy_owner_identity:"):
+                        continue
+                    txt = str(v or "")
+                    if txt:
+                        return txt
+        return ""
+
+    def _resolve_bot_display_name(self) -> str:
+        fallback = str(os.getenv("BRIDGE_BOT_DISPLAY_NAME", "")).strip()
+        now = time.time()
+        with self._display_name_cache_lock:
+            cached = self._bot_name_cache
+            if str(cached.get("name") or "").strip() and float(cached.get("expire_at") or 0) > now:
+                return str(cached.get("name") or "").strip()
+        name = str(self.feishu.get_application_name() or "").strip() or fallback
+        with self._display_name_cache_lock:
+            self._bot_name_cache = {"name": name, "expire_at": now + DISPLAY_NAME_CACHE_TTL_SEC}
+        return name
+
+    def _resolve_chat_display_name(self, chat_id: str) -> str:
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return ""
+        now = time.time()
+        with self._display_name_cache_lock:
+            cached = self._chat_name_cache.get(cid) if isinstance(self._chat_name_cache.get(cid), dict) else None
+            if cached and float(cached.get("expire_at") or 0) > now:
+                return str(cached.get("name") or "").strip()
+        name = str(self.feishu.get_chat_name(cid) or "").strip()
+        with self._display_name_cache_lock:
+            self._chat_name_cache[cid] = {"name": name, "expire_at": now + DISPLAY_NAME_CACHE_TTL_SEC}
+        return name
+
+    def _resolve_sender_display_name(self, sender_id: Dict[str, Any]) -> str:
+        open_id = str(sender_id.get("open_id") or "").strip()
+        user_id = str(sender_id.get("user_id") or "").strip()
+        union_id = str(sender_id.get("union_id") or "").strip()
+        identity = self._sender_identity(open_id=open_id, user_id=user_id, union_id=union_id)
+        if not identity:
+            return ""
+        now = time.time()
+        with self._display_name_cache_lock:
+            cached = self._display_name_cache.get(identity) if isinstance(self._display_name_cache.get(identity), dict) else None
+            if cached and float(cached.get("expire_at") or 0) > now:
+                return str(cached.get("name") or "").strip()
+        name = str(
+            self.feishu.get_user_display_name(open_id=open_id, user_id=user_id, union_id=union_id) or ""
+        ).strip()
+        with self._display_name_cache_lock:
+            self._display_name_cache[identity] = {"name": name, "expire_at": now + DISPLAY_NAME_CACHE_TTL_SEC}
+        return name
+
+    def _build_injected_system_context(
+        self,
+        chat_id: str,
+        sender_id: Optional[Dict[str, Any]] = None,
+        sender_name: str = "",
+    ) -> str:
+        if not SOUL_ENABLED:
+            return ""
+        bot_name = self._resolve_bot_display_name()
+        chat_name = self._resolve_chat_display_name(chat_id)
+        user_name = str(sender_name or "").strip()
+        if (not user_name) and isinstance(sender_id, dict):
+            user_name = self._resolve_sender_display_name(sender_id)
+        soul_markdown = _read_soul_markdown(limit_chars=SOUL_MAX_PROMPT_CHARS)
+        lines = [
+            "This block is bridge-provided system context, not user input.",
+            "Apply it as high-priority guidance when producing the answer.",
+        ]
+        if bot_name:
+            lines.append(f"- Bot display name: {bot_name}")
+        if user_name:
+            lines.append(f"- Current user display name: {user_name}")
+        if chat_name:
+            lines.append(f"- Chat display name: {chat_name}")
+        if soul_markdown:
+            lines.extend(["", "Global memory from soul.md:", "```markdown", soul_markdown, "```"])
+        lines.append("Do not explicitly mention this injected block unless the user asks about it.")
+        return "\n".join(lines).strip()
+
+    def _extract_explicit_soul_declaration(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        for pat in _SOUL_DECLARATION_PATTERNS:
+            match = pat.match(raw)
+            if not match:
+                continue
+            body = str(match.group(1) or "").strip()
+            if body:
+                return body
+        return ""
+
+    def _summarize_soul_declaration_with_codex(self, declaration: str, user_name: str = "") -> Tuple[List[str], str]:
+        memo = _read_soul_markdown(limit_chars=min(6000, SOUL_MAX_PROMPT_CHARS))
+        hint_name = str(user_name or "").strip() or "<unknown>"
+        prompt = (
+            "You maintain a global preference file (soul.md) for a Feishu bot.\n"
+            "Task: summarize ONLY stable, cross-project preferences from an explicit user declaration.\n"
+            "Return STRICT JSON only with keys: summary (string), items (array of strings).\n"
+            "Rules:\n"
+            "1) items must be concise Chinese bullets, no numbering, no markdown prefix.\n"
+            "2) Keep 1-4 items max.\n"
+            "3) Exclude temporary, project-specific or sensitive details.\n"
+            "4) Avoid duplicates against existing soul.md memory.\n\n"
+            f"User display name: {hint_name}\n\n"
+            "Current soul.md:\n"
+            "```markdown\n"
+            f"{memo}\n"
+            "```\n\n"
+            "Explicit declaration:\n"
+            f"{declaration}\n"
+        )
+        try:
+            answer = self._run_turn(runtime_key="__bridge_soul_maintainer__", text=prompt, image_paths=[])
+        except Exception as exc:
+            LOG.warning("soul summarize via codex failed: %s", exc)
+            return [], ""
+        obj = _extract_json_object(answer)
+        items_raw = obj.get("items") if isinstance(obj.get("items"), list) else []
+        items = [str(x).strip() for x in items_raw if str(x).strip()]
+        summary = str(obj.get("summary") or "").strip()
+        return _normalize_soul_items(items)[:4], summary
+
+    def _record_soul_declaration(self, declaration: str, user_name: str = "") -> Dict[str, Any]:
+        body = str(declaration or "").strip()
+        if not body:
+            return {"added": 0, "items": [], "summary": ""}
+        with self._soul_update_lock:
+            items, summary = self._summarize_soul_declaration_with_codex(body, user_name=user_name)
+            if not items:
+                fallback = _normalize_soul_items([body[:220]])
+                items = fallback[:1]
+                if not summary:
+                    summary = "已按原文兜底记录。"
+            added = _upsert_soul_items(items)
+            return {"added": int(added), "items": items, "summary": summary}
+
+    def _append_pending_file(self, chat_id: str, file_path: str) -> int:
+        with self._pending_files_lock:
+            items = self._pending_files.setdefault(str(chat_id), [])
+            items.append(str(file_path))
+            return len(items)
+
+    def _list_pending_files(self, chat_id: str) -> List[str]:
+        with self._pending_files_lock:
+            return list(self._pending_files.get(str(chat_id), []))
+
+    def _consume_pending_files(self, chat_id: str) -> List[str]:
+        with self._pending_files_lock:
+            return list(self._pending_files.pop(str(chat_id), []))
+
+    def _enqueue_input(self, chat_id: str, text: str, image_paths: Optional[List[str]] = None) -> int:
+        payload = {
+            "text": str(text or ""),
+            "image_paths": [str(p) for p in (image_paths or []) if str(p).strip()],
+        }
+        with self._queued_inputs_lock:
+            items = self._queued_inputs.setdefault(str(chat_id), [])
+            items.append(payload)
+            return len(items)
+
+    def _pop_next_queued_input(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        with self._queued_inputs_lock:
+            items = self._queued_inputs.get(str(chat_id)) or []
+            if not items:
+                return None
+            nxt = items.pop(0)
+            if not items:
+                self._queued_inputs.pop(str(chat_id), None)
+            return nxt
+
+    def _drain_queued_inputs(self, queue_key: str, reply_chat_id: str) -> None:
+        while True:
+            nxt = self._pop_next_queued_input(queue_key)
+            if not nxt:
+                return
+            text = str(nxt.get("text") or "").strip()
+            image_paths = [str(p) for p in (nxt.get("image_paths") or []) if str(p).strip()]
+            if not text:
+                continue
+            try:
+                answer = self._run_turn(runtime_key=queue_key, text=text, image_paths=image_paths)
+                self.feishu.smart_send(reply_chat_id, answer)
+            except Exception as exc:
+                self.feishu.send_text(reply_chat_id, f"排队任务处理失败:\n{exc}")
+
+    def _format_pending_files_text(self, chat_id: str) -> str:
+        items = self._list_pending_files(self._runtime_key(chat_id))
+        if not items:
+            return "当前没有暂存附件。"
+        lines = [f"当前暂存附件 {len(items)} 个:"]
+        for idx, path in enumerate(items, start=1):
+            lines.append(f"{idx}. {path}")
+        lines.append("发送任意文本后，这些路径会自动带入下一轮对话。")
+        return "\n".join(lines)
+
+    def _build_prompt_with_files(self, user_text: str, files: List[str], system_context: str = "") -> Tuple[str, List[str]]:
+        valid_files = [str(p) for p in files if str(p).strip()]
+        image_paths = [p for p in valid_files if _is_image_path(p) and Path(p).exists()]
+        sections: List[str] = []
+        ctx = str(system_context or "").strip()
+        if ctx:
+            sections.append(
+                "\n".join(
+                    [
+                        "[Bridge Injected System Context]",
+                        ctx,
+                    ]
+                ).strip()
+            )
+        if valid_files:
+            sections.append(
+                "\n".join(
+                    [
+                        "User attached files. Local paths:",
+                        *[f"- {p}" for p in valid_files],
+                        "Use these files as context for this request.",
+                        "If a file is non-text/binary, explain how to inspect it first.",
+                    ]
+                ).strip()
+            )
+        sections.append(
+            "\n".join(
+                [
+                    "User request:",
+                    str(user_text or ""),
+                ]
+            ).strip()
+        )
+        return "\n\n".join([s for s in sections if str(s).strip()]).strip(), image_paths
+
+    def _extract_output_files(self, answer_text: str, exclude_paths: Optional[List[str]] = None) -> List[Path]:
+        if not OUTPUT_FILE_AUTO_SEND:
+            return []
+        raw = str(answer_text or "")
+        if not raw:
+            return []
+        excludes = {str(Path(p).resolve()) for p in (exclude_paths or []) if str(p).strip()}
+        now = time.time()
+        paths: List[Path] = []
+        seen: set[str] = set()
+        for token in re.findall(r"/[A-Za-z0-9._/\- ]+", raw):
+            candidate = token.strip().rstrip("`'\".,;:!?)]")
+            if not candidate:
+                continue
+            p = Path(candidate).expanduser()
+            if not p.is_absolute():
+                continue
+            try:
+                resolved = p.resolve()
+            except Exception:
+                continue
+            if str(resolved) in seen or str(resolved) in excludes:
+                continue
+            if not resolved.exists() or (not resolved.is_file()):
+                continue
+            if resolved.suffix.lower() not in OUTPUT_FILE_SUFFIXES:
+                continue
+            try:
+                st = resolved.stat()
+            except Exception:
+                continue
+            if st.st_size > OUTPUT_FILE_MAX_SIZE_MB * 1024 * 1024:
+                continue
+            if (now - float(st.st_mtime)) > float(OUTPUT_FILE_MAX_AGE_SEC):
+                continue
+            seen.add(str(resolved))
+            paths.append(resolved)
+            if OUTPUT_FILE_MAX_COUNT > 0 and len(paths) >= OUTPUT_FILE_MAX_COUNT:
+                break
+        return paths
+
+    def _send_output_files(self, chat_id: str, files: List[Path]) -> None:
+        if not files:
+            return
+        sent: List[str] = []
+        for p in files:
+            try:
+                self.feishu.send_file(chat_id=chat_id, file_path=str(p), file_name=p.name)
+                sent.append(p.name)
+            except Exception as exc:
+                LOG.warning("send output file failed chat_id=%s path=%s err=%s", chat_id, p, exc)
+        if sent:
+            self.feishu.send_text(chat_id, "已回传结果文件: " + ", ".join(sent))
+
+    def _extract_resource_key(self, msg_type: str, content: Dict[str, Any]) -> str:
+        if str(msg_type) == "image":
+            return str(content.get("image_key") or "").strip()
+        for key in ["file_key", "media_key", "audio_key", "video_key", "sticker_key", "image_key", "file_token"]:
+            val = str(content.get(key) or "").strip()
+            if val:
+                return val
+        return ""
+
+    def _extract_post_text_and_resources(self, content: Dict[str, Any]) -> Tuple[str, List[Tuple[str, Dict[str, Any]]]]:
+        post = content.get("post") if isinstance(content.get("post"), dict) else {}
+        lines: List[str] = []
+        resources: List[Tuple[str, Dict[str, Any]]] = []
+        for lang_payload in post.values():
+            if not isinstance(lang_payload, dict):
+                continue
+            rows = lang_payload.get("content")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, list):
+                    continue
+                segs: List[str] = []
+                for node in row:
+                    if not isinstance(node, dict):
+                        continue
+                    tag = str(node.get("tag") or "").strip().lower()
+                    if tag == "text":
+                        txt = str(node.get("text") or "").strip()
+                        if txt:
+                            segs.append(txt)
+                        continue
+                    if tag == "a":
+                        txt = str(node.get("text") or node.get("href") or "").strip()
+                        if txt:
+                            segs.append(txt)
+                        continue
+                    if tag == "at":
+                        txt = str(node.get("user_name") or node.get("name") or "").strip()
+                        if txt:
+                            segs.append(f"@{txt}")
+                        continue
+                    if tag == "img":
+                        image_key = str(node.get("image_key") or "").strip()
+                        if image_key:
+                            resources.append(("image", {"image_key": image_key}))
+                        continue
+                    if tag in {"file", "media", "audio", "video"}:
+                        obj: Dict[str, Any] = {}
+                        for key in ("file_key", "media_key", "audio_key", "video_key", "file_token", "file_name", "name", "title"):
+                            val = node.get(key)
+                            if val not in (None, ""):
+                                obj[key] = val
+                        if obj:
+                            resources.append((tag, obj))
+                        continue
+                line = "".join(segs).strip()
+                if line:
+                    lines.append(line)
+        text = "\n".join(lines).strip()
+        uniq: List[Tuple[str, Dict[str, Any]]] = []
+        seen: set[str] = set()
+        for t, obj in resources:
+            key = self._extract_resource_key(t, obj)
+            if not key:
+                continue
+            sig = f"{t}:{key}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append((t, obj))
+        if text or uniq:
+            return text, uniq
+
+        fallback_texts: List[str] = []
+        fallback_resources: List[Tuple[str, Dict[str, Any]]] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+
+            tag = str(node.get("tag") or node.get("type") or "").strip().lower()
+            if tag == "text":
+                txt = str(node.get("text") or node.get("content") or "").strip()
+                if txt:
+                    fallback_texts.append(txt)
+            elif tag == "a":
+                txt = str(node.get("text") or node.get("href") or node.get("url") or "").strip()
+                if txt:
+                    fallback_texts.append(txt)
+            elif tag == "at":
+                txt = str(node.get("user_name") or node.get("name") or node.get("text") or "").strip()
+                if txt:
+                    fallback_texts.append(f"@{txt}")
+            elif tag == "img":
+                image_key = str(node.get("image_key") or "").strip()
+                if image_key:
+                    fallback_resources.append(("image", {"image_key": image_key}))
+            elif tag in {"file", "media", "audio", "video"}:
+                obj: Dict[str, Any] = {}
+                for key in ("file_key", "media_key", "audio_key", "video_key", "file_token", "file_name", "name", "title"):
+                    val = node.get(key)
+                    if val not in (None, ""):
+                        obj[key] = val
+                if obj:
+                    fallback_resources.append((tag, obj))
+            elif str(node.get("image_key") or "").strip():
+                fallback_resources.append(("image", {"image_key": str(node.get("image_key") or "").strip()}))
+            elif any(str(node.get(key) or "").strip() for key in ("file_key", "media_key", "audio_key", "video_key", "file_token")):
+                inferred = "file"
+                for candidate in ("file", "media", "audio", "video"):
+                    if str(node.get(f"{candidate}_key") or "").strip():
+                        inferred = candidate
+                        break
+                obj = {}
+                for key in ("file_key", "media_key", "audio_key", "video_key", "file_token", "file_name", "name", "title"):
+                    val = node.get(key)
+                    if val not in (None, ""):
+                        obj[key] = val
+                if obj:
+                    fallback_resources.append((inferred, obj))
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+
+        walk(post or content)
+        merged_text = "\n".join([txt for txt in fallback_texts if txt]).strip()
+        uniq = []
+        seen.clear()
+        for t, obj in fallback_resources:
+            key = self._extract_resource_key(t, obj)
+            if not key:
+                continue
+            sig = f"{t}:{key}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            uniq.append((t, obj))
+        return merged_text, uniq
+
+    def _download_attachment(self, chat_id: str, msg_type: str, message_id: str, content: Dict[str, Any]) -> str:
+        file_key = self._extract_resource_key(msg_type, content)
+        if not file_key:
+            raise RuntimeError(f"missing resource key for message type={msg_type}")
+
+        raw_name = str(content.get("file_name") or content.get("name") or content.get("title") or "").strip()
+        base_name = _sanitize_filename(raw_name, f"{msg_type}_{file_key[:10]}")
+        suffix = Path(base_name).suffix.lower()
+        if not suffix:
+            base_name += _guess_suffix(msg_type)
+
+        chat_dir = self.upload_root / _sanitize_filename(chat_id, "chat")
+        chat_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        save_path = chat_dir / f"{ts}_{base_name}"
+
+        if msg_type == "image":
+            if message_id:
+                try:
+                    self.feishu.download_message_resource(
+                        message_id=message_id,
+                        file_key=file_key,
+                        resource_type="image",
+                        save_path=save_path,
+                    )
+                    return str(save_path)
+                except Exception as exc:
+                    LOG.warning(
+                        "download image via message resource failed, fallback to images api: message_id=%s key=%s err=%s",
+                        message_id,
+                        file_key,
+                        exc,
+                    )
+            self.feishu.download_image(file_key, save_path)
+            return str(save_path)
+
+        if not message_id:
+            raise RuntimeError("missing message_id for non-image resource")
+
+        resource_types = [msg_type, "file", "media", "audio", "video", "image"]
+        tried: List[str] = []
+        last_exc: Exception = RuntimeError("download failed")
+        for t in resource_types:
+            if t in tried:
+                continue
+            tried.append(t)
+            try:
+                self.feishu.download_message_resource(message_id=message_id, file_key=file_key, resource_type=t, save_path=save_path)
+                return str(save_path)
+            except Exception as exc:
+                last_exc = exc
+        raise RuntimeError(f"download failed for key={file_key} tried={tried}: {last_exc}")
+
+    def _current_project_name(self, cwd: str) -> str:
+        target = str(cwd or "").strip()
+        for name, path in self.projects.items():
+            if Path(path).resolve() == Path(target).resolve():
+                return name
+        return ""
+
+    def _runtime_key(self, chat_id: str, project_name: str = "") -> str:
+        project = str(project_name or "").strip()
+        if "::" in str(chat_id or ""):
+            return str(chat_id or "").strip()
+        if not project:
+            project = self._ensure_active_project(chat_id)
+        return f"{str(chat_id or '').strip()}::{project}" if project else str(chat_id or "").strip()
+
+    def _get_active_project(self, chat_id: str) -> str:
+        with self._active_project_lock:
+            return str(self._active_project.get(str(chat_id or "")) or "").strip()
+
+    def _set_active_project(self, chat_id: str, project_name: str) -> None:
+        cid = str(chat_id or "").strip()
+        project = str(project_name or "").strip()
+        if not cid:
+            return
+        with self._active_project_lock:
+            if project:
+                self._active_project[cid] = project
+            else:
+                self._active_project.pop(cid, None)
+        self._persist_active_projects()
+
+    def _latest_project_runtime(self, chat_id: str) -> str:
+        cid = str(chat_id or "").strip()
+        if not cid or not self.state_path.exists():
+            return ""
+        try:
+            obj = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        chats = obj.get("chats") if isinstance(obj, dict) else {}
+        if not isinstance(chats, dict):
+            return ""
+        best_project = ""
+        best_ts = -1
+        for runtime_id, item in chats.items():
+            rid = str(runtime_id or "").strip()
+            if not rid.startswith(f"{cid}::") or not isinstance(item, dict):
+                continue
+            project = str(item.get("project") or "").strip() or rid.split("::", 1)[1].strip()
+            if not project:
+                continue
+            with self._projects_lock:
+                exists = project in self.projects
+            if not exists:
+                continue
+            ts = max(int(item.get("last_input_at") or 0), int(item.get("updated_at") or 0), int(item.get("last_turn_at") or 0))
+            if ts > best_ts:
+                best_ts = ts
+                best_project = project
+        return best_project
+
+    def _ensure_active_project(self, chat_id: str) -> str:
+        self._load_persisted_projects()
+        active = self._get_active_project(chat_id)
+        if active:
+            with self._projects_lock:
+                known = active in self.projects
+            if known:
+                return active
+            self._set_active_project(chat_id, "")
+        recent = self._latest_project_runtime(chat_id)
+        if recent:
+            self._set_active_project(chat_id, recent)
+            return recent
+        try:
+            legacy = self.control.status(str(chat_id or "")).get("data")
+        except Exception:
+            legacy = {}
+        if isinstance(legacy, dict):
+            inferred = self._current_project_name(str(legacy.get("cwd") or ""))
+            if inferred:
+                self._set_active_project(chat_id, inferred)
+                return inferred
+        with self._projects_lock:
+            first = next(iter(self.projects.keys()), "")
+        if first:
+            self._set_active_project(chat_id, first)
+        return first
+
+    def _ensure_project_runtime(self, chat_id: str, project_name: str) -> str:
+        project = str(project_name or "").strip()
+        cwd = str(self.projects.get(project) or "").strip()
+        runtime_key = self._runtime_key(chat_id, project)
+        try:
+            current = self.control.status(runtime_key).get("data")
+        except Exception:
+            current = {}
+        source_chat_id = str(chat_id or "").strip()
+        if USER_SESSION_ISOLATION:
+            base_chat_id = self._base_chat_id(source_chat_id)
+            if base_chat_id and base_chat_id != source_chat_id:
+                if self._claim_legacy_chat_owner(base_chat_id=base_chat_id, runtime_chat_id=source_chat_id):
+                    source_chat_id = base_chat_id
+        source_runtime_key = self._runtime_key(source_chat_id, project) if project else source_chat_id
+        try:
+            source = self.control.status(source_runtime_key).get("data")
+        except Exception:
+            source = {}
+        if cwd:
+            self.control.update_config(
+                runtime_key,
+                cwd=cwd,
+                model=str((current or {}).get("model") or (source or {}).get("model") or ""),
+                sandbox=str((current or {}).get("sandbox") or (source or {}).get("sandbox") or ""),
+                approval_policy=str((current or {}).get("approval_policy") or (source or {}).get("approval_policy") or ""),
+                personality=str((current or {}).get("personality") or (source or {}).get("personality") or ""),
+            )
+        inherited_profile = str((source or {}).get("auth_profile") or "").strip()
+        current_profile = str((current or {}).get("auth_profile") or "").strip()
+        if inherited_profile and current_profile != inherited_profile:
+            self.control.update_auth_profile(runtime_key, inherited_profile)
+        return runtime_key
+
+    def _status_data(self, chat_id: str) -> Dict[str, Any]:
+        raw = str(chat_id or "").strip()
+        if "::" in raw:
+            runtime_key = raw
+        else:
+            active_project = self._ensure_active_project(raw)
+            runtime_key = self._ensure_project_runtime(raw, active_project) if active_project else raw
+        data = self.control.status(runtime_key).get("data")
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    def _status_text(self, chat_id: str) -> str:
+        data = self._status_data(chat_id)
+        thread_id = str(data.get("thread_id") or "<none>")
+        turn_id = str(data.get("active_turn_id") or "<none>")
+        tstatus = data.get("thread_status") if isinstance(data.get("thread_status"), dict) else {}
+        token_usage_wrap = data.get("token_usage") if isinstance(data.get("token_usage"), dict) else {}
+        token_usage = token_usage_wrap.get("tokenUsage") if isinstance(token_usage_wrap.get("tokenUsage"), dict) else {}
+        rate_limits = data.get("rate_limits") if isinstance(data.get("rate_limits"), dict) else {}
+        total_usage = token_usage.get("total") if isinstance(token_usage.get("total"), dict) else {}
+        last_usage = token_usage.get("last") if isinstance(token_usage.get("last"), dict) else {}
+        model_ctx = token_usage.get("modelContextWindow")
+        pending_count = len(self._list_pending_files(self._runtime_key(chat_id)))
+        cwd = str(data.get("cwd") or "")
+        proj = self._current_project_name(cwd)
+        auto_switch_enabled = bool(data.get("auto_auth_switch_enabled"))
+        auto_switch_threshold = int(data.get("auto_auth_switch_threshold_pct") or 0)
+        last_auto_switch = data.get("last_auto_auth_switch") if isinstance(data.get("last_auto_auth_switch"), dict) else {}
+        usage_lines: List[str] = []
+        if total_usage:
+            usage_lines.append(
+                "token_total="
+                + json.dumps(
+                    {
+                        "total": total_usage.get("totalTokens"),
+                        "input": total_usage.get("inputTokens"),
+                        "cached_input": total_usage.get("cachedInputTokens"),
+                        "output": total_usage.get("outputTokens"),
+                        "reasoning_output": total_usage.get("reasoningOutputTokens"),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if last_usage:
+            usage_lines.append(
+                "token_last="
+                + json.dumps(
+                    {
+                        "total": last_usage.get("totalTokens"),
+                        "input": last_usage.get("inputTokens"),
+                        "cached_input": last_usage.get("cachedInputTokens"),
+                        "output": last_usage.get("outputTokens"),
+                        "reasoning_output": last_usage.get("reasoningOutputTokens"),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if model_ctx is not None:
+            usage_lines.append(f"model_context_window={model_ctx}")
+        usage_lines.extend(_format_rate_limit_lines(rate_limits))
+        last_from = str(last_auto_switch.get("from") or "").strip() or "default"
+        last_to = str(last_auto_switch.get("to") or "").strip() or "default"
+        last_reason = str(last_auto_switch.get("reason") or "").strip()
+        last_at = int(last_auto_switch.get("at") or 0)
+        auto_switch_lines = [f"auto_auth_switch={'on' if auto_switch_enabled else 'off'} threshold={auto_switch_threshold}%"]
+        if last_at > 0:
+            last_when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_at))
+            line = f"last_auto_switch={last_from}->{last_to} at={last_when}"
+            if last_reason:
+                line += f" reason={last_reason}"
+            auto_switch_lines.append(line)
+        return (
+            "Status\n"
+            f"chat_id={chat_id}\n"
+            f"project={proj or '<custom>'}\n"
+            f"cwd={cwd}\n"
+            f"thread_id={thread_id}\n"
+            f"active_turn_id={turn_id}\n"
+            f"thread_status={json.dumps(tstatus, ensure_ascii=False)}\n"
+            f"pending_files={pending_count}\n"
+            f"model={data.get('model') or ''}\n"
+            f"auth_profile={data.get('auth_profile') or 'default'}\n"
+            f"auth_identity={data.get('auth_identity') or ''}\n"
+            + "\n".join(auto_switch_lines)
+            + ("\n" + "\n".join(usage_lines) if usage_lines else "")
+        )
+
+    def _progress_ping_text(self, runtime_key: str, started_at: float) -> str:
+        data = self._status_data(runtime_key)
+        project_name = str(data.get("project") or "").strip()
+        progress = data.get("turn_progress") if isinstance(data.get("turn_progress"), dict) else {}
+        turn_events = data.get("turn_events") if isinstance(data.get("turn_events"), list) else []
+        elapsed = max(
+            int(progress.get("elapsed_sec") or 0),
+            max(0, int(time.time() - float(started_at or time.time()))),
+        )
+        last_event_at = int(progress.get("last_event_at") or 0)
+        silent_for = max(0, int(time.time()) - last_event_at) if last_event_at > 0 else 0
+        preview = _clean_progress_preview(str(progress.get("preview") or ""))
+        lines = [
+            "正在处理你的请求",
+            "",
+            f"已处理 {_format_elapsed_human(elapsed)}。",
+        ]
+        if preview:
+            lines.extend(["", "当前进展：", "", preview])
+        elif elapsed < 20:
+            lines.extend(["", "我正在理解你的问题，并准备接下来的处理步骤。"])
+        else:
+            lines.extend(["", "任务还在继续，暂时还没有适合展示的中间文字。"])
+        recent_events = [
+            str(evt.get("text") or "").strip()
+            for evt in turn_events[-3:]
+            if isinstance(evt, dict) and str(evt.get("text") or "").strip()
+        ]
+        if recent_events:
+            lines.extend(["", "最近在做："])
+            lines.extend([f"- {item}" for item in recent_events])
+        if silent_for >= 30:
+            lines.extend(["", f"最近 {_format_elapsed_human(silent_for)} 没有新的文字输出，可能正在读取文件或执行命令。"])
+        return _with_project_prefix("\n".join(lines), project_name)
+
+    def _progress_ping_loop(
+        self,
+        runtime_key: str,
+        reply_chat_id: str,
+        started_at: float,
+        stop_event: threading.Event,
+        streaming_card: Optional[FeishuStreamingCardSession],
+    ) -> None:
+        has_streaming_card = streaming_card is not None
+        while True:
+            interval_sec = STREAMING_CARD_UPDATE_INTERVAL_SEC if has_streaming_card else PROGRESS_PING_INTERVAL_SEC
+            if stop_event.wait(interval_sec):
+                break
+            try:
+                text = self._progress_ping_text(runtime_key=runtime_key, started_at=started_at)
+                if stop_event.is_set():
+                    return
+                if has_streaming_card:
+                    if streaming_card and streaming_card.is_active():
+                        try:
+                            streaming_card.update(text)
+                            continue
+                        except Exception as exc:
+                            LOG.warning(
+                                "stream card update degraded to text runtime_key=%s err=%s",
+                                runtime_key,
+                                exc,
+                            )
+                            has_streaming_card = False
+                    else:
+                        has_streaming_card = False
+                self.feishu.send_text(reply_chat_id, text)
+            except Exception as exc:
+                LOG.warning("progress ping failed runtime_key=%s err=%s", runtime_key, exc)
+
+    @staticmethod
+    def _is_recoverable_turn_error(err: str) -> bool:
+        text = str(err or "")
+        patterns = (
+            "disconnected while waiting for turn completion",
+            "Timeout waiting for turn completion",
+            "app-server timeout for method=",
+            "stream disconnected before completion",
+            "app-server is not running",
+            "failed writing to app-server stdin",
+        )
+        return any(p in text for p in patterns)
+
+    def _run_turn(self, runtime_key: str, text: str, image_paths: Optional[List[str]] = None) -> str:
+        for attempt in range(2):
+            try:
+                resp = self.control.turn(chat_id=runtime_key, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
+                data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+                answer = str(data.get("assistant_text") or "").strip()
+                switch_info = data.get("auto_auth_switch") if isinstance(data.get("auto_auth_switch"), dict) else {}
+                if switch_info:
+                    from_profile = str(switch_info.get("from") or "").strip() or "default"
+                    to_profile = str(switch_info.get("to") or "").strip() or "default"
+                    identity = str(switch_info.get("identity") or "").strip()
+                    note = f"已自动切换账号：`{from_profile}` -> `{to_profile}`"
+                    if identity:
+                        note += f" ({identity})"
+                    answer = (note + "\n\n" + answer).strip()
+                return answer or "(assistant returned empty text)"
+            except Exception as exc:
+                if attempt >= 1 or not self._is_recoverable_turn_error(str(exc)):
+                    raise
+                LOG.warning("turn failed with recoverable error, retry after reset runtime_key=%s err=%s", runtime_key, exc)
+                try:
+                    self.control.interrupt(chat_id=runtime_key)
+                except Exception as interrupt_exc:
+                    LOG.warning("turn recover interrupt failed runtime_key=%s err=%s", runtime_key, interrupt_exc)
+                self.control.reset(chat_id=runtime_key)
+        raise RuntimeError("turn failed after retry")
+
+    def _run_session_command(self, chat_id: str, cmd_text: str) -> str:
+        runtime_key = self._runtime_key(chat_id)
+        lock = self._chat_lock(runtime_key)
+        if not lock.acquire(blocking=False):
+            queued = self._enqueue_input(chat_id=runtime_key, text=cmd_text, image_paths=[])
+            return f"当前任务执行中，命令已加入队列（第{queued}条）。"
+        try:
+            try:
+                answer = self._run_turn(runtime_key=runtime_key, text=cmd_text, image_paths=[])
+                self._drain_queued_inputs(runtime_key, chat_id)
+                return answer
+            except Exception as first_exc:
+                first_err = str(first_exc)
+                recoverable = self._is_recoverable_turn_error(first_err)
+                if not recoverable:
+                    return f"会话命令失败: {first_err}"
+
+                recovery_steps: List[str] = []
+                try:
+                    self.control.interrupt(chat_id=runtime_key)
+                    recovery_steps.append("interrupt=ok")
+                except Exception as exc:
+                    recovery_steps.append(f"interrupt=err({exc})")
+
+                try:
+                    self.control.reset(chat_id=runtime_key)
+                    recovery_steps.append("reset=ok")
+                except Exception as exc:
+                    recovery_steps.append(f"reset=err({exc})")
+                    return f"会话命令失败: {first_err}\n自动恢复失败: {'; '.join(recovery_steps)}"
+
+                try:
+                    answer = self._run_turn(runtime_key=runtime_key, text=cmd_text, image_paths=[])
+                    self._drain_queued_inputs(runtime_key, chat_id)
+                    return answer
+                except Exception as second_exc:
+                    return (
+                        f"会话命令失败: {first_err}\n"
+                        f"已尝试自动恢复({'; '.join(recovery_steps)})后仍失败: {second_exc}"
+                    )
+        finally:
+            lock.release()
+
+    def _card_header(self, title: str) -> Dict[str, Any]:
+        return {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "blue",
+        }
+
+    def _action_button(
+        self,
+        label: str,
+        value: Dict[str, Any],
+        btn_type: str = "default",
+        project_name: str = "",
+    ) -> Dict[str, Any]:
+        payload = dict(value or {})
+        project = str(project_name or "").strip()
+        if project and not str(payload.get("project") or "").strip():
+            payload["project"] = project
+        return {
+            "tag": "button",
+            "type": btn_type,
+            "text": {"tag": "plain_text", "content": label},
+            "value": payload,
+        }
+
+    def _build_project_manage_card(self, chat_id: str) -> Dict[str, Any]:
+        status = self._status_data(chat_id)
+        cwd = str(status.get("cwd") or "")
+        project_name = str(status.get("project") or "").strip() or self._current_project_name(cwd)
+        lines = [
+            f"当前项目: `{project_name or '<custom>'}`",
+            f"cwd: `{cwd}`",
+            f"thread: `{status.get('thread_id') or '<none>'}`",
+        ]
+        if self._is_await_project_name(chat_id):
+            lines.append("新建项目流程中：请直接发送项目名，或发送 `/cancel` 取消。")
+
+        rows: List[Dict[str, Any]] = [
+            {"tag": "markdown", "content": "\n".join(lines)},
+        ]
+
+        proj_buttons: List[Dict[str, Any]] = []
+        with self._projects_lock:
+            items = sorted(self.projects.items())
+        for name, path in items:
+            label = name if len(name) <= 18 else (name[:15] + "...")
+            btype = "primary" if name == project_name else "default"
+            proj_buttons.append(self._action_button(label, {"op": "project_switch", "project": name}, btn_type=btype))
+
+        if proj_buttons:
+            chunk_size = 3
+            for idx in range(0, len(proj_buttons), chunk_size):
+                rows.append({"tag": "action", "actions": proj_buttons[idx : idx + chunk_size]})
+
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [
+                    self._action_button("新建项目", {"op": "project_create_begin"}, btn_type="primary", project_name=project_name),
+                    self._action_button("刷新状态", {"op": "open_project_manage"}, project_name=project_name),
+                    self._action_button("会话管理", {"op": "open_session_manage"}, project_name=project_name),
+                ],
+            }
+        )
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("项目管理"),
+            "elements": rows,
+        }
+
+    def _build_session_manage_card(self, chat_id: str) -> Dict[str, Any]:
+        status = self._status_data(chat_id)
+        project_name = str(status.get("project") or "").strip() or self._current_project_name(str(status.get("cwd") or ""))
+        tstatus = status.get("thread_status") if isinstance(status.get("thread_status"), dict) else {}
+        auth_profile = str(status.get("auth_profile") or "").strip() or "default"
+        auth_identity = str(status.get("auth_identity") or "").strip()
+        auto_switch_enabled = bool(status.get("auto_auth_switch_enabled"))
+        auto_switch_threshold = int(status.get("auto_auth_switch_threshold_pct") or 0)
+        last_auto_switch = status.get("last_auto_auth_switch") if isinstance(status.get("last_auto_auth_switch"), dict) else {}
+        lines = [
+            f"thread: `{status.get('thread_id') or '<none>'}`",
+            f"active_turn: `{status.get('active_turn_id') or '<none>'}`",
+            f"thread_status: `{json.dumps(tstatus, ensure_ascii=False)}`",
+            f"model: `{status.get('model') or ''}`",
+            f"account: `{auth_profile}`" + (f" ({auth_identity})" if auth_identity else ""),
+            f"auto_switch: `{'on' if auto_switch_enabled else 'off'} / {auto_switch_threshold}%`",
+            f"pending_files: `{len(self._list_pending_files(self._runtime_key(chat_id)))}`",
+        ]
+        last_from = str(last_auto_switch.get("from") or "").strip() or "default"
+        last_to = str(last_auto_switch.get("to") or "").strip() or "default"
+        last_reason = str(last_auto_switch.get("reason") or "").strip()
+        last_at = int(last_auto_switch.get("at") or 0)
+        if last_at > 0:
+            last_when = time.strftime("%m-%d %H:%M", time.localtime(last_at))
+            lines.append(f"last_switch: `{last_from} -> {last_to} @ {last_when}`")
+            if last_reason:
+                lines.append(f"reason: `{_trim(last_reason, 180)}`")
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("会话管理（Codex 内部命令）"),
+            "elements": [
+                {"tag": "markdown", "content": (f"项目：`{project_name or '<custom>'}`\n\n" + "\n".join(lines))},
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._action_button("状态 /status", {"op": "session_cmd", "cmd": "/status"}, project_name=project_name),
+                        self._action_button("审批 /approvals", {"op": "session_cmd", "cmd": "/approvals"}, project_name=project_name),
+                        self._action_button("权限 /permissions", {"op": "session_cmd", "cmd": "/permissions"}, project_name=project_name),
+                    ],
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._action_button("切换模型", {"op": "session_model_start"}, btn_type="primary", project_name=project_name),
+                        self._action_button("切换账号", {"op": "session_auth_start"}, project_name=project_name),
+                        self._action_button("中断", {"op": "session_interrupt"}, project_name=project_name),
+                    ],
+                },
+                {"tag": "action", "actions": [self._action_button("项目管理", {"op": "open_project_manage"}, project_name=project_name)]},
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": "注：文本输入会直通 Codex；斜杠命令建议通过本卡片触发。",
+                        }
+                    ],
+                },
+            ],
+        }
+
+    def _build_auth_select_card(self, current_profile: str, profiles: List[Dict[str, Any]], project_name: str = "") -> Dict[str, Any]:
+        rows: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": "选择要切换的账号。\n\n放置规范：`data/auth_profiles/<profile>.auth.json`，可选配套 `data/auth_profiles/<profile>.config.toml`。",
+            }
+        ]
+        buttons: List[Dict[str, Any]] = []
+        for item in profiles:
+            profile = str(item.get("profile") or "").strip()
+            label = profile or "default"
+            identity = str(item.get("email") or "").strip()
+            valid = bool(item.get("valid"))
+            if identity:
+                rows.append({"tag": "markdown", "content": f"- `{label}` : `{identity}`"})
+            else:
+                rows.append({"tag": "markdown", "content": f"- `{label}`"})
+            btn_type = "primary" if (profile or "default") == (current_profile or "default") else "default"
+            if valid:
+                buttons.append(
+                    self._action_button(
+                        label,
+                        {"op": "session_auth_apply", "profile": profile},
+                        btn_type=btn_type,
+                        project_name=project_name,
+                    )
+                )
+        if buttons:
+            for idx in range(0, len(buttons), 3):
+                rows.append({"tag": "action", "actions": buttons[idx : idx + 3]})
+        rows.append(
+            {
+                "tag": "action",
+                "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"}, project_name=project_name)],
+            }
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("切换账号"),
+            "elements": rows,
+        }
+
+    def _build_model_select_card(self, models: List[str], project_name: str = "") -> Dict[str, Any]:
+        rows: List[Dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": "步骤 1/3：选择模型\n\n请选择要切换的模型。",
+            }
+        ]
+        buttons = [
+            self._action_button(m, {"op": "session_model_pick", "model": m}, btn_type="primary", project_name=project_name)
+            for m in models[:12]
+        ]
+        for idx in range(0, len(buttons), 3):
+            rows.append({"tag": "action", "actions": buttons[idx : idx + 3]})
+        rows.append(
+            {"tag": "action", "actions": [self._action_button("返回会话管理", {"op": "open_session_manage"}, project_name=project_name)]}
+        )
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("切换模型 / Step1"),
+            "elements": rows,
+        }
+
+    def _build_effort_select_card(self, model: str, project_name: str = "") -> Dict[str, Any]:
+        actions = [
+            self._action_button(
+                f"{effort}",
+                {"op": "session_model_apply", "model": model, "effort": effort},
+                btn_type="primary" if effort == "high" else "default",
+                project_name=project_name,
+            )
+            for effort in SUPPORTED_EFFORTS
+        ]
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("切换模型 / Step2"),
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"步骤 2/3：选择推理强度\n\n已选模型：`{model}`",
+                },
+                {"tag": "action", "actions": actions},
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": "下一步将执行：/model use <model> + /effort <level>",
+                        }
+                    ],
+                },
+            ],
+        }
+
+    def _handle_text(
+        self,
+        chat_id: str,
+        text: str,
+        runtime_chat_id: str = "",
+        message_id: str = "",
+        sender_id: Optional[Dict[str, Any]] = None,
+        sender_name: str = "",
+    ) -> None:
+        raw = str(text or "").strip()
+        if not raw:
+            return
+        worker_chat_id = str(runtime_chat_id or chat_id or "").strip()
+        if self._consume_await_project_name(worker_chat_id):
+            if raw.lower() in {"/cancel", "cancel", "取消"}:
+                self.feishu.send_text(chat_id, "已取消新建项目。")
+                return
+            result = self._create_project_from_name(chat_id=worker_chat_id, raw_name=raw)
+            self.feishu.send_text(chat_id, result)
+            self.feishu.send_card(chat_id, self._build_project_manage_card(worker_chat_id))
+            return
+
+        sender_meta = sender_id if isinstance(sender_id, dict) else {}
+        current_user_name = str(sender_name or "").strip()
+        if (not current_user_name) and sender_meta:
+            current_user_name = self._resolve_sender_display_name(sender_meta)
+
+        soul_decl = self._extract_explicit_soul_declaration(raw)
+        if soul_decl:
+            rec = self._record_soul_declaration(soul_decl, user_name=current_user_name)
+            added = int(rec.get("added") or 0)
+            items = rec.get("items") if isinstance(rec.get("items"), list) else []
+            summary = str(rec.get("summary") or "").strip()
+            lines = [f"已更新全局记忆 soul.md（新增 {added} 条）。"]
+            if summary:
+                lines.append(f"总结：{summary}")
+            if items:
+                lines.append("本次记录：")
+                lines.extend([f"- {str(item).strip()}" for item in items if str(item).strip()])
+            self.feishu.send_text(chat_id, "\n".join(lines))
+            return
+
+        active_project = self._ensure_active_project(worker_chat_id)
+        runtime_key = self._ensure_project_runtime(worker_chat_id, active_project) if active_project else worker_chat_id
+        pending_files = self._consume_pending_files(runtime_key)
+        system_context = self._build_injected_system_context(
+            chat_id=chat_id,
+            sender_id=sender_meta,
+            sender_name=current_user_name,
+        )
+        prompt, image_paths = self._build_prompt_with_files(raw, pending_files, system_context=system_context)
+        typing_reaction_id = ""
+        progress_stop = threading.Event()
+        progress_thread: Optional[threading.Thread] = None
+        streaming_card: Optional[FeishuStreamingCardSession] = None
+        if TYPING_REACTION_ENABLED and str(message_id or "").strip():
+            try:
+                typing_reaction_id = self.feishu.add_typing_reaction(str(message_id))
+            except Exception as exc:
+                LOG.warning("typing reaction create failed message_id=%s err=%s", message_id or "<none>", exc)
+
+        try:
+            lock = self._chat_lock(runtime_key)
+            if not lock.acquire(blocking=False):
+                LOG.info("runtime busy, steering runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
+                try:
+                    self.control.steer(chat_id=runtime_key, text=prompt, image_paths=image_paths)
+                except Exception as steer_exc:
+                    queued = self._enqueue_input(chat_id=runtime_key, text=prompt, image_paths=image_paths)
+                    self.feishu.send_text(chat_id, f"steer 失败，已加入队列（第{queued}条）: {steer_exc}")
+                return
+            try:
+                start = time.time()
+                LOG.info("turn start runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
+                if str(message_id or "").strip():
+                    _set_runtime_reply_context(
+                        runtime_key,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project_name=active_project,
+                    )
+                if STREAMING_CARD_ENABLED and str(message_id or "").strip():
+                    try:
+                        streaming_card = FeishuStreamingCardSession(
+                            self.feishu,
+                            chat_id=chat_id,
+                            reply_to_message_id=str(message_id or ""),
+                            project_name=active_project,
+                        )
+                        streaming_card.start()
+                    except Exception as exc:
+                        LOG.warning("stream card start failed message_id=%s err=%s", message_id or "<none>", exc)
+                        streaming_card = None
+                progress_thread = threading.Thread(
+                    target=self._progress_ping_loop,
+                    args=(runtime_key, chat_id, start, progress_stop, streaming_card),
+                    daemon=True,
+                )
+                progress_thread.start()
+                if pending_files:
+                    self.feishu.send_text(chat_id, f"检测到 {len(pending_files)} 个附件，已自动带入本轮对话。")
+                answer = self._run_turn(runtime_key=runtime_key, text=prompt, image_paths=image_paths)
+                output_files = self._extract_output_files(answer_text=answer, exclude_paths=pending_files)
+                progress_stop.set()
+                if progress_thread:
+                    progress_thread.join(timeout=1.0)
+                if streaming_card and streaming_card.is_active():
+                    try:
+                        streaming_card.close(answer)
+                    except Exception as exc:
+                        LOG.warning("stream card close failed message_id=%s err=%s", message_id or "<none>", exc)
+                        self.feishu.smart_send(chat_id, answer)
+                else:
+                    self.feishu.smart_send(chat_id, answer)
+                self._send_output_files(chat_id, output_files)
+                self._drain_queued_inputs(runtime_key, chat_id)
+                LOG.info("turn done runtime_key=%s message_id=%s elapsed=%.3fs", runtime_key, message_id or "<none>", time.time() - start)
+            except Exception as exc:
+                LOG.exception("turn failed runtime_key=%s message_id=%s", runtime_key, message_id or "<none>")
+                progress_stop.set()
+                if progress_thread:
+                    progress_thread.join(timeout=1.0)
+                if streaming_card and streaming_card.is_active():
+                    try:
+                        streaming_card.close(f"处理失败:\n{exc}")
+                    except Exception:
+                        self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
+                else:
+                    self.feishu.send_text(chat_id, f"处理失败:\n{exc}")
+            finally:
+                progress_stop.set()
+                if progress_thread and progress_thread.is_alive():
+                    progress_thread.join(timeout=0.5)
+                lock.release()
+        finally:
+            progress_stop.set()
+            if progress_thread and progress_thread.is_alive():
+                progress_thread.join(timeout=0.5)
+            if str(message_id or "").strip():
+                _clear_runtime_reply_context(runtime_key, message_id=str(message_id or ""))
+            if typing_reaction_id and str(message_id or "").strip():
+                try:
+                    self.feishu.delete_typing_reaction(str(message_id), typing_reaction_id)
+                except Exception as exc:
+                    LOG.warning("typing reaction cleanup failed message_id=%s err=%s", message_id or "<none>", exc)
+            if streaming_card and streaming_card.is_active():
+                try:
+                    streaming_card.close()
+                except Exception as exc:
+                    LOG.warning("stream card cleanup failed message_id=%s err=%s", message_id or "<none>", exc)
+
+    def _handle_event(self, payload: Dict[str, Any]) -> None:
+        header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
+        if str(header.get("event_type") or "") != "im.message.receive_v1":
+            return
+
+        event_id = str(header.get("event_id") or "")
+        if self._dedupe_event(event_id):
+            return
+
+        event = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+        sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+        if str(sender.get("sender_type") or "") == "app":
+            return
+
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        chat_id = str(message.get("chat_id") or "")
+        if not chat_id:
+            return
+
+        sender_id = sender.get("sender_id") if isinstance(sender.get("sender_id"), dict) else {}
+        sender_name = str(sender.get("sender_name") or sender.get("name") or "").strip()
+        sender_open_id = str(sender_id.get("open_id") or "").strip()
+        sender_user_id = str(sender_id.get("user_id") or "").strip()
+        sender_union_id = str(sender_id.get("union_id") or "").strip()
+        runtime_chat_id = self._scoped_chat_id(
+            chat_id=chat_id,
+            open_id=sender_open_id,
+            user_id=sender_user_id,
+            union_id=sender_union_id,
+        )
+        self._bind_user_chat(sender_id=sender_id, chat_id=chat_id, runtime_chat_id=runtime_chat_id)
+
+        chat_type = str(message.get("chat_type") or "").strip().lower()
+        if SINGLE_CHAT_ONLY and chat_type and chat_type != "p2p":
+            self.feishu.send_text(chat_id, "This bot is configured for 1:1 chat only.")
+            return
+
+        msg_type = str(message.get("message_type") or "").strip().lower()
+        content = _parse_content_json(message.get("content"))
+
+        if msg_type == "text":
+            text = str(content.get("text") or "").strip()
+            message_id = str(message.get("message_id") or "").strip()
+            self._handle_text(
+                chat_id,
+                text,
+                runtime_chat_id=runtime_chat_id,
+                message_id=message_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+            )
+            return
+
+        if msg_type in SUPPORTED_ATTACHMENT_TYPES:
+            message_id = str(message.get("message_id") or "")
+            try:
+                saved = self._download_attachment(chat_id=chat_id, msg_type=msg_type, message_id=message_id, content=content)
+                staged = self._append_pending_file(self._runtime_key(runtime_chat_id), saved)
+                self.feishu.send_text(
+                    chat_id,
+                    f"已暂存附件 ({msg_type})\npath={saved}\n当前待处理附件: {staged}\n发送一条文本后将自动带入。",
+                )
+            except Exception as exc:
+                self.feishu.send_text(chat_id, f"附件下载失败: {exc}")
+            return
+
+        if msg_type == "post":
+            message_id = str(message.get("message_id") or "")
+            post_text, post_resources = self._extract_post_text_and_resources(content)
+
+            if post_resources:
+                for rtype, rcontent in post_resources:
+                    try:
+                        saved = self._download_attachment(
+                            chat_id=chat_id,
+                            msg_type=rtype,
+                            message_id=message_id,
+                            content=rcontent,
+                        )
+                        self._append_pending_file(self._runtime_key(runtime_chat_id), saved)
+                    except Exception as exc:
+                        LOG.warning(
+                            "post resource download failed chat_id=%s message_id=%s type=%s err=%s",
+                            chat_id,
+                            message_id,
+                            rtype,
+                            exc,
+                        )
+
+            if post_text:
+                self._handle_text(
+                    chat_id,
+                    post_text,
+                    runtime_chat_id=runtime_chat_id,
+                    message_id=message_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                )
+                return
+
+            staged = len(self._list_pending_files(self._runtime_key(runtime_chat_id)))
+            if staged > 0:
+                self.feishu.send_text(chat_id, f"已暂存 {staged} 个 post 附件。请再发一条文本指令继续处理。")
+                return
+
+            self.feishu.send_text(chat_id, "post 消息未解析到可处理内容，请补发文本或文件。")
+            return
+
+        self.feishu.send_text(chat_id, f"Unsupported message type: {msg_type}")
+
+    def _handle_menu_event(self, payload: Dict[str, Any]) -> None:
+        event_key = str(payload.get("event_key") or "").strip()
+        open_id = str(payload.get("open_id") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip()
+        union_id = str(payload.get("union_id") or "").strip()
+
+        if not event_key:
+            return
+        action = str(self.menu_actions.get(event_key) or "").strip()
+        if not action:
+            if open_id:
+                self.feishu.send_text_by_receive_id(open_id, f"未配置菜单动作: {event_key}", receive_id_type="open_id")
+            return
+
+        chat_id = self._resolve_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
+        if not chat_id:
+            if open_id:
+                self.feishu.send_text_by_receive_id(
+                    open_id,
+                    "菜单已点击，但尚未绑定会话。请先给机器人发送一条消息。",
+                    receive_id_type="open_id",
+                )
+            return
+
+        LOG.info("menu event mapped: key=%s action=%s chat_id=%s", event_key, action, chat_id)
+        self._run_card_action(chat_id=chat_id, op=action, value={})
+
+    def _handle_card_action(self, payload: P2CardActionTrigger) -> None:
+        event = payload.event
+        if not event:
+            return
+
+        raw_value: Any = event.action.value if event.action else None
+        value: Dict[str, Any] = {}
+        if isinstance(raw_value, dict):
+            value = raw_value
+        elif isinstance(raw_value, str):
+            try:
+                parsed = json.loads(raw_value)
+                if isinstance(parsed, dict):
+                    value = parsed
+            except Exception:
+                value = {}
+        op = str(value.get("op") or "").strip()
+        if not op:
+            LOG.warning("card action dropped: missing op raw_type=%s raw_value=%s", type(raw_value).__name__, str(raw_value)[:300])
+            return
+
+        operator = event.operator
+        open_id = str(getattr(operator, "open_id", "") or "")
+        user_id = str(getattr(operator, "user_id", "") or "")
+        union_id = str(getattr(operator, "union_id", "") or "")
+
+        ctx = event.context
+        chat_id = str(getattr(ctx, "open_chat_id", "") or "")
+        source_message_id = str(getattr(ctx, "open_message_id", "") or "")
+        if not chat_id:
+            chat_id = self._resolve_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
+        if not chat_id:
+            LOG.warning("card action dropped: no chat mapping op=%s", op)
+            return
+
+        runtime_chat_id = self._scoped_chat_id(chat_id=chat_id, open_id=open_id, user_id=user_id, union_id=union_id)
+        self._bind_user_chat(
+            {"open_id": open_id, "user_id": user_id, "union_id": union_id},
+            chat_id=chat_id,
+            runtime_chat_id=runtime_chat_id,
+        )
+        if op in FINAL_STREAM_CARD_ACTIONS:
+            value = dict(value)
+            value["_source_message_id"] = source_message_id
+        self._run_card_action(chat_id=runtime_chat_id, op=op, value=value)
+        if CARD_AUTO_DELETE_ON_ACTION and source_message_id and op not in FINAL_STREAM_CARD_ACTIONS:
+            try:
+                self.feishu.delete_message(source_message_id)
+            except Exception as exc:
+                LOG.warning("delete card message failed message_id=%s op=%s err=%s", source_message_id, op, exc)
+
+    def _update_final_stream_message(self, message_id: str, expanded: bool, page_delta: int = 0) -> bool:
+        state = _get_final_stream_card_state(message_id)
+        if not state:
+            return False
+        text = str(state.get("text") or "")
+        pages = _text_to_card_chunks(text, max_len=FINAL_STREAM_CARD_PAGE_LEN)
+        total = max(1, len(pages))
+        page_index = max(0, min(total - 1, int(state.get("page_index") or 0) + int(page_delta or 0)))
+        card, is_long = _build_final_stream_card(text, expanded=expanded, page_index=page_index)
+        if not is_long:
+            _clear_final_stream_card_state(message_id)
+            return False
+        self.feishu.update_message_card(message_id, card)
+        _set_final_stream_card_state(message_id, text, expanded=expanded, page_index=page_index)
+        return True
+
+    def _run_card_action(self, chat_id: str, op: str, value: Dict[str, Any]) -> None:
+        runtime_chat_id = str(chat_id or "").strip()
+        reply_chat_id = self._base_chat_id(runtime_chat_id) or runtime_chat_id
+        target_project = str(value.get("project") or "").strip()
+        scoped_runtime_chat_id = self._runtime_key(runtime_chat_id, target_project) if target_project else runtime_chat_id
+        LOG.info("card action: op=%s runtime_chat_id=%s value=%s", op, runtime_chat_id, value)
+
+        if op in FINAL_STREAM_CARD_ACTIONS:
+            source_message_id = str(value.get("_source_message_id") or "").strip()
+            if not source_message_id:
+                self.feishu.send_text(reply_chat_id, "未找到可更新的结果卡片。")
+                return
+            try:
+                if op == "stream_final_expand":
+                    ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=0)
+                elif op == "stream_final_collapse":
+                    ok = self._update_final_stream_message(source_message_id, expanded=False, page_delta=0)
+                elif op == "stream_final_prev":
+                    ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=-1)
+                else:
+                    ok = self._update_final_stream_message(source_message_id, expanded=True, page_delta=1)
+            except Exception as exc:
+                LOG.warning("final stream card action failed message_id=%s op=%s err=%s", source_message_id, op, exc)
+                self.feishu.send_text(reply_chat_id, f"更新结果卡失败: {exc}")
+                return
+            if not ok:
+                self.feishu.send_text(reply_chat_id, "这条结果当前不支持展开，完整内容可到历史页查看。")
+            return
+
+        if op == "open_project_manage":
+            self.feishu.send_card(reply_chat_id, self._build_project_manage_card(scoped_runtime_chat_id))
+            return
+
+        if op == "open_session_manage":
+            self.feishu.send_card(reply_chat_id, self._build_session_manage_card(scoped_runtime_chat_id))
+            return
+
+        if op == "project_switch":
+            project = str(value.get("project") or "").strip()
+            cwd = str(self.projects.get(project) or "").strip()
+            if not cwd:
+                self.feishu.send_text(reply_chat_id, f"未知项目: {project}")
+                return
+            try:
+                self._set_await_project_name(runtime_chat_id, False)
+                self._set_active_project(runtime_chat_id, project)
+                runtime_key = self._ensure_project_runtime(runtime_chat_id, project)
+                status = self.control.status(runtime_key).get("data") if runtime_key else {}
+                thread_id = str((status or {}).get("thread_id") or "").strip()
+                last_turn_id = str(((status or {}).get("state") or {}).get("last_turn_id") or (status or {}).get("last_turn_id") or "").strip()
+                last_user_text = str(((status or {}).get("state") or {}).get("last_user_text") or (status or {}).get("last_user_text") or "").strip()
+                has_history = bool(thread_id or last_turn_id or last_user_text)
+                if has_history:
+                    self.feishu.send_text(reply_chat_id, f"已切换到项目: {project}\n下一条消息会继续该项目最近会话。")
+                else:
+                    self.feishu.send_text(reply_chat_id, f"已切换到项目: {project}\n该项目暂时还没有历史会话，下一条消息会新开一条。")
+            except Exception as exc:
+                self.feishu.send_text(reply_chat_id, f"切换项目失败: {exc}")
+            return
+
+        if op == "project_create_begin":
+            self._set_await_project_name(runtime_chat_id, True)
+            self.feishu.send_text(
+                reply_chat_id,
+                f"请输入新项目名（将创建到 `{self.project_root}`）。\n示例：`my_new_project`\n发送 `/cancel` 可取消。",
+            )
+            return
+
+        if op == "session_interrupt":
+            try:
+                result = self.control.interrupt(self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id))
+                self.feishu.send_text(reply_chat_id, _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900))
+            except Exception as exc:
+                self.feishu.send_text(reply_chat_id, f"中断失败: {exc}")
+            return
+
+        if op == "session_cmd":
+            cmd = str(value.get("cmd") or "").strip()
+            if not cmd:
+                self.feishu.send_text(reply_chat_id, "空命令，已忽略")
+                return
+            if cmd == "/status":
+                answer = self._status_text(scoped_runtime_chat_id)
+            else:
+                answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=cmd)
+            self.feishu.smart_send(reply_chat_id, _trim(answer, 3000), title=f"Codex {cmd}")
+            return
+
+        if op == "session_model_start":
+            answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/model list")
+            models = _parse_model_candidates(answer)
+            if not models:
+                self.feishu.send_text(reply_chat_id, f"未解析到可用模型，原始返回：\n{_trim(answer, 2000)}")
+                return
+            self.feishu.send_card(reply_chat_id, self._build_model_select_card(models, project_name=target_project))
+            return
+
+        if op == "session_auth_start":
+            resp = self.control.auth_profiles()
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+            current_profile = str(self._status_data(scoped_runtime_chat_id).get("auth_profile") or "").strip()
+            self.feishu.send_card(
+                reply_chat_id,
+                self._build_auth_select_card(
+                    current_profile=current_profile,
+                    profiles=profiles,
+                    project_name=target_project,
+                ),
+            )
+            return
+
+        if op == "session_auth_apply":
+            profile = str(value.get("profile") or "").strip()
+            try:
+                runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
+                result = self.control.update_auth_profile(chat_id=runtime_key, profile=profile)
+                data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                self.control.reset(chat_id=runtime_key)
+                label = str(data.get("auth_profile") or "").strip() or "default"
+                identity = str(data.get("auth_identity") or "").strip()
+                suffix = f" ({identity})" if identity else ""
+                self.feishu.send_text(reply_chat_id, f"已切换账号: {label}{suffix}")
+            except Exception as exc:
+                self.feishu.send_text(reply_chat_id, f"切换账号失败: {exc}")
+            return
+
+        if op == "session_model_pick":
+            model = str(value.get("model") or "").strip()
+            if not model:
+                self.feishu.send_text(reply_chat_id, "未选择模型")
+                return
+            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model, project_name=target_project))
+            return
+
+        if op == "session_model_apply":
+            model = str(value.get("model") or "").strip()
+            effort = str(value.get("effort") or "").strip().lower()
+            if not model or effort not in SUPPORTED_EFFORTS:
+                self.feishu.send_text(reply_chat_id, "模型或推理强度参数无效")
+                return
+
+            result_model = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=f"/model use {model}")
+            result_effort = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=f"/effort {effort}")
+            verify = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/status")
+            synced_model = _extract_status_value(verify, "effective_model") or _extract_status_value(verify, "model") or model
+            sync_note = ""
+            try:
+                self.control.update_config(
+                    chat_id=self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id),
+                    model=synced_model,
+                )
+            except Exception as exc:
+                sync_note = f"\n\nconfig_sync_failed: {exc}"
+            self.feishu.smart_send(
+                reply_chat_id,
+                text=_trim(
+                    "模型切换完成。\n\n"
+                    f"/model use {model}\n{result_model}\n\n"
+                    f"/effort {effort}\n{result_effort}\n\n"
+                    f"verify:\n{verify}{sync_note}",
+                    3500,
+                ),
+                title="模型切换结果",
+            )
+            return
+
+        self.feishu.send_text(reply_chat_id, f"未支持的卡片动作: {op}")
+
+
+def _message_event_to_payload(data: P2ImMessageReceiveV1) -> Dict[str, Any]:
+    sender_type = ""
+    sender_open_id = ""
+    sender_user_id = ""
+    sender_union_id = ""
+    chat_id = ""
+    chat_type = ""
+    message_type = ""
+    message_id = ""
+    content = ""
+    event_id = ""
+
+    if data.header:
+        event_id = _safe_str(data.header.event_id)
+
+    if data.event:
+        if data.event.sender:
+            sender_type = _safe_str(data.event.sender.sender_type)
+            if data.event.sender.sender_id:
+                sender_open_id = _safe_str(data.event.sender.sender_id.open_id)
+                sender_user_id = _safe_str(data.event.sender.sender_id.user_id)
+                sender_union_id = _safe_str(data.event.sender.sender_id.union_id)
+        if data.event.message:
+            chat_id = _safe_str(data.event.message.chat_id)
+            chat_type = _safe_str(data.event.message.chat_type)
+            message_type = _safe_str(data.event.message.message_type)
+            message_id = _safe_str(data.event.message.message_id)
+            content = _safe_str(data.event.message.content)
+
+    return {
+        "header": {
+            "event_type": "im.message.receive_v1",
+            "event_id": event_id,
+        },
+        "event": {
+            "sender": {
+                "sender_type": sender_type or "user",
+                "sender_id": {
+                    "open_id": sender_open_id,
+                    "user_id": sender_user_id,
+                    "union_id": sender_union_id,
+                },
+            },
+            "message": {
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "message_type": message_type,
+                "content": content,
+                "message_id": message_id,
+            },
+        },
+    }
+
+
+def _menu_event_to_payload(data: P2ApplicationBotMenuV6) -> Dict[str, Any]:
+    event_key = ""
+    open_id = ""
+    user_id = ""
+    union_id = ""
+    event_id = ""
+    if data.header:
+        event_id = _safe_str(data.header.event_id)
+    if data.event:
+        event_key = _safe_str(data.event.event_key)
+        if data.event.operator and data.event.operator.operator_id:
+            open_id = _safe_str(data.event.operator.operator_id.open_id)
+            user_id = _safe_str(data.event.operator.operator_id.user_id)
+            union_id = _safe_str(data.event.operator.operator_id.union_id)
+    return {
+        "event_key": event_key,
+        "open_id": open_id,
+        "user_id": user_id,
+        "union_id": union_id,
+        "event_id": event_id,
+    }
+
+
+def _log_level_from_env() -> lark.LogLevel:
+    name = os.getenv("LOG_LEVEL", "INFO").upper()
+    if name == "DEBUG":
+        return lark.LogLevel.DEBUG
+    if name == "WARNING":
+        return lark.LogLevel.WARNING
+    if name == "ERROR":
+        return lark.LogLevel.ERROR
+    if name == "CRITICAL":
+        return lark.LogLevel.CRITICAL
+    return lark.LogLevel.INFO
+
+
+def _card_callback_ack(toast_text: str = "处理中...") -> P2CardActionTriggerResponse:
+    resp = P2CardActionTriggerResponse()
+    toast = CallBackToast()
+    toast.type = "info"
+    toast.content = toast_text
+    resp.toast = toast
+    return resp
+
+
+def main() -> None:
+    if not APP_ID or not APP_SECRET:
+        raise RuntimeError("FEISHU_APP_ID or FEISHU_APP_SECRET is empty")
+    if not API_TOKEN:
+        raise RuntimeError("BRIDGE_API_TOKEN is empty")
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+    menu_actions = _parse_json_map(os.getenv("BRIDGE_MENU_ACTIONS_JSON", ""), DEFAULT_MENU_ACTIONS)
+    projects = _parse_json_map(os.getenv("BRIDGE_PROJECTS_JSON", ""), DEFAULT_PROJECTS)
+
+    feishu = FeishuClient(APP_ID, APP_SECRET)
+    control = ControlAPI(base=CONTROL_BASE, api_prefix=API_PREFIX, api_token=API_TOKEN)
+    bridge = AppServerBotBridge(
+        feishu=feishu,
+        control=control,
+        upload_root=UPLOAD_ROOT,
+        menu_actions=menu_actions,
+        projects=projects,
+        project_root=PROJECT_ROOT,
+        projects_store_path=PROJECTS_STORE_PATH,
+        user_chat_map_path=USER_CHAT_MAP_PATH,
+    )
+    level = _log_level_from_env()
+
+    LOG.info("menu actions: %s", json.dumps(menu_actions, ensure_ascii=False))
+    LOG.info("projects: %s", json.dumps(projects, ensure_ascii=False))
+    LOG.info("attachment upload root: %s", str(UPLOAD_ROOT))
+    LOG.info("user chat map path: %s", str(USER_CHAT_MAP_PATH))
+    LOG.info(
+        "output auto send limits: max_count=%s max_size_mb=%s",
+        "unlimited" if OUTPUT_FILE_MAX_COUNT <= 0 else OUTPUT_FILE_MAX_COUNT,
+        OUTPUT_FILE_MAX_SIZE_MB,
+    )
+
+    def _on_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
+        bridge.handle_event_async(_message_event_to_payload(data))
+
+    def _on_bot_menu_v6(data: P2ApplicationBotMenuV6) -> None:
+        bridge.handle_menu_event_async(_menu_event_to_payload(data))
+
+    def _on_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+        bridge.handle_card_action_async(data)
+        return _card_callback_ack("已收到操作，处理中...")
+
+    event_handler = (
+        lark.EventDispatcherHandler.builder("", "", level)
+        .register_p2_im_message_receive_v1(_on_message_receive_v1)
+        .register_p2_application_bot_menu_v6(_on_bot_menu_v6)
+        .register_p2_card_action_trigger(_on_card_action_trigger)
+        .build()
+    )
+
+    LOG.info("Starting Feishu long connection receiver for app-server bridge...")
+    client = lark.ws.Client(APP_ID, APP_SECRET, log_level=level, event_handler=event_handler)
+    client.start()
+
+
+if __name__ == "__main__":
+    main()

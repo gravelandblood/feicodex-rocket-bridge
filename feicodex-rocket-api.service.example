@@ -1,0 +1,22 @@
+[Unit]
+Description=FeiCodex Rocket Bridge API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=-__APP_DIR__/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=BRIDGE_STATE_PATH=__APP_DIR__/data/state.json
+Environment=BRIDGE_API_PREFIX=/appbridge/api
+Environment=BRIDGE_DEFAULT_CWD=__APP_DIR__
+Environment=BRIDGE_DEFAULT_MODEL=gpt-5.3-codex
+Environment=BRIDGE_DEFAULT_SANDBOX=danger-full-access
+Environment=BRIDGE_DEFAULT_APPROVAL_POLICY=never
+Environment=BRIDGE_DEFAULT_PERSONALITY=pragmatic
+ExecStart=__APP_DIR__/.venv/bin/python -m uvicorn app:APP --host 127.0.0.1 --port 18788 --log-level info
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

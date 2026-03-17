@@ -1,0 +1,25 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Virtualenv
+.venv/
+node_modules/
+
+# Local env and runtime data
+.env
+.env.*
+!.env.example
+*.log
+state.json
+config.json
+config.local.json
+*.pem
+*.key
+
+# Runtime state/uploads
+data/*
+!data/.gitkeep
+
+# Local design references
+reference/
