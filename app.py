@@ -169,6 +169,14 @@ class HistoryAuthHealthCheckRequest(BaseModel):
     timeout_sec: int = Field(default=0, ge=0, le=1800)
 
 
+class MemorySearchRequest(BaseModel):
+    query: str = Field(default="")
+    project: str = Field(default="")
+    limit: int = Field(default=8, ge=1, le=20)
+    include_turn_text: bool = Field(default=False)
+    include_same_chat: bool = Field(default=False)
+
+
 @dataclass
 class ChatRuntime:
     chat_id: str
@@ -2120,6 +2128,39 @@ def chat_interrupt(chat_id: str, body: InterruptTurnRequest) -> Dict[str, Any]:
             ) from exc
 
 
+@ROUTER.post("/chat/{chat_id}/memory/search", dependencies=[Depends(require_api_token)])
+def chat_memory_search(chat_id: str, body: MemorySearchRequest) -> Dict[str, Any]:
+    requested_project = str(body.project or "").strip()
+    runtime_id = _runtime_id_from_chat_project(chat_id=chat_id, project=requested_project)
+    runtime = RUNTIMES.get(runtime_id)
+    with runtime.lock:
+        project_name = (
+            requested_project
+            or str(_runtime_project_name(runtime.chat_id) or "").strip()
+            or _project_label_for_cwd(runtime.cwd)
+        )
+        current_chat_id = _runtime_actual_chat_id(runtime.chat_id)
+    exclude_chat = "" if bool(body.include_same_chat) else current_chat_id
+    items = HISTORY_STORE.search_project_memories(
+        project=project_name,
+        query=str(body.query or "").strip(),
+        limit=int(body.limit or 8),
+        include_turn_text=bool(body.include_turn_text),
+        exclude_chat_id=exclude_chat,
+    )
+    return {
+        "ok": True,
+        "data": {
+            "runtime_id": runtime_id,
+            "chat_id": current_chat_id,
+            "project": project_name,
+            "query": str(body.query or "").strip(),
+            "items": items,
+            "count": len(items),
+        },
+    }
+
+
 @ROUTER.get("/history", dependencies=[Depends(require_api_token)])
 def history_json(offset: int = 0, limit: int = 50) -> Dict[str, Any]:
     page = HISTORY_STORE.project_summaries(offset=offset, limit=limit)
@@ -2268,6 +2309,38 @@ def history_turn_api(
     if not item:
         return JSONResponse(status_code=404, content={"ok": False, "error": "turn not found"})
     return JSONResponse({"ok": True, "data": {"turn": item}})
+
+
+@APP.get("/history/api/memory/search")
+def history_memory_search_api(
+    request: Request,
+    project: str = Query(default=""),
+    query: str = Query(default=""),
+    limit: int = Query(default=8, ge=1, le=20),
+    include_turn_text: bool = Query(default=False),
+    exclude_chat_id: str = Query(default=""),
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    items = HISTORY_STORE.search_project_memories(
+        project=str(project or "").strip(),
+        query=str(query or "").strip(),
+        limit=int(limit or 8),
+        include_turn_text=bool(include_turn_text),
+        exclude_chat_id=str(exclude_chat_id or "").strip(),
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "data": {
+                "project": str(project or "").strip(),
+                "query": str(query or "").strip(),
+                "items": items,
+                "count": len(items),
+            },
+        }
+    )
 
 
 @APP.get("/history/api/auth/profiles")

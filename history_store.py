@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -61,9 +62,45 @@ class BridgeHistoryStore:
                 """,
                 self._turn_values(payload),
             )
+            self._upsert_turn_memory(conn, payload)
             self._trim_excess_rows(conn)
             conn.commit()
         return dict(payload)
+
+    def search_project_memories(
+        self,
+        project: str = "",
+        query: str = "",
+        limit: int = 8,
+        include_turn_text: bool = False,
+        exclude_chat_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(20, int(limit or 8)))
+        target_project = str(project or "").strip()
+        target_query = str(query or "").strip()
+        excluded_chat = str(exclude_chat_id or "").strip()
+        with self._lock, self._connect() as conn:
+            rows = self._search_memories_rows(
+                conn=conn,
+                project=target_project,
+                query=target_query,
+                limit=safe_limit,
+                exclude_chat_id=excluded_chat,
+            )
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = {
+                "turn_id": str(row["turn_id"] or ""),
+                "project": str(row["project"] or ""),
+                "chat_id": str(row["chat_id"] or ""),
+                "summary": str(row["summary_text"] or ""),
+                "started_at": _safe_int(row["started_at"]),
+                "updated_at": _safe_int(row["updated_at"]),
+            }
+            if include_turn_text:
+                item["memory_text"] = str(row["memory_text"] or "")
+            out.append(item)
+        return out
 
     def list_turns(self, limit: int = 200) -> List[Dict[str, Any]]:
         cap = max(1, int(limit or 200))
@@ -321,8 +358,40 @@ class BridgeHistoryStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS turn_memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    turn_pk TEXT NOT NULL UNIQUE,
+                    project TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    memory_text TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_turn_memories_project_started
+                ON turn_memories(project, started_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_turn_memories_chat_started
+                ON turn_memories(chat_id, started_at DESC, id DESC);
                 """
             )
+            try:
+                conn.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS turn_memories_fts USING fts5(
+                        turn_pk UNINDEXED,
+                        project,
+                        chat_id,
+                        summary_text,
+                        memory_text,
+                        tokenize='unicode61'
+                    )
+                    """
+                )
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("turn_memories_fts_enabled", "1"))
+            except Exception:
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("turn_memories_fts_enabled", "0"))
+            self._backfill_turn_memories(conn)
             conn.commit()
 
     def _migrate_legacy_json(self) -> None:
@@ -442,17 +511,26 @@ class BridgeHistoryStore:
         overflow = int(total or 0) - self.max_turns
         if overflow <= 0:
             return
-        conn.execute(
+        rows = conn.execute(
             """
-            DELETE FROM turns
-            WHERE id IN (
-                SELECT id FROM turns
-                ORDER BY started_at ASC, ended_at ASC, id ASC
-                LIMIT ?
-            )
+            SELECT id FROM turns
+            ORDER BY started_at ASC, ended_at ASC, id ASC
+            LIMIT ?
             """,
             (overflow,),
+        ).fetchall()
+        turn_ids = [str(row["id"] or "") for row in rows if str(row["id"] or "").strip()]
+        if not turn_ids:
+            return
+        conn.executemany(
+            """
+            DELETE FROM turns
+            WHERE id = ?
+            """,
+            [(tid,) for tid in turn_ids],
         )
+        conn.executemany("DELETE FROM turn_memories WHERE turn_pk = ?", [(tid,) for tid in turn_ids])
+        self._fts_delete_many(conn, turn_ids)
 
     def _page_args(self, offset: int, limit: int) -> tuple[int, int]:
         safe_offset = max(0, int(offset or 0))
@@ -472,3 +550,198 @@ class BridgeHistoryStore:
             return json.loads(raw)
         except Exception:
             return default
+
+    def _turn_summary_text(self, item: Dict[str, Any]) -> str:
+        status = str(item.get("status") or "").strip().lower()
+        user_preview = _preview_text(item.get("user_text"), max_len=96)
+        assistant_preview = _preview_text(item.get("assistant_text"), max_len=120)
+        error_preview = _preview_text(item.get("error_text"), max_len=120)
+        if status == "failed" and error_preview:
+            return f"用户问题：{user_preview or '（空）'}；失败原因：{error_preview}"
+        if assistant_preview:
+            return f"用户问题：{user_preview or '（空）'}；结论：{assistant_preview}"
+        if error_preview:
+            return f"用户问题：{user_preview or '（空）'}；错误：{error_preview}"
+        return user_preview or "空白轮次"
+
+    def _turn_memory_text(self, item: Dict[str, Any], summary: str) -> str:
+        parts = [
+            f"project={str(item.get('project') or '')}",
+            f"chat_id={str(item.get('chat_id') or '')}",
+            f"turn_id={str(item.get('turn_id') or '')}",
+            f"status={str(item.get('status') or '')}",
+            f"cwd={str(item.get('cwd') or '')}",
+            f"model={str(item.get('model') or '')}",
+            f"auth_profile={str(item.get('auth_profile') or '')}",
+            f"summary={summary}",
+            f"user={str(item.get('user_text') or '')}",
+            f"assistant={str(item.get('assistant_text') or '')}",
+            f"error={str(item.get('error_text') or '')}",
+        ]
+        return "\n".join(parts)
+
+    def _upsert_turn_memory(self, conn: sqlite3.Connection, item: Dict[str, Any]) -> None:
+        turn_pk = str(item.get("id") or "").strip()
+        if not turn_pk:
+            return
+        summary = self._turn_summary_text(item)
+        memory_text = self._turn_memory_text(item, summary)
+        conn.execute(
+            """
+            INSERT INTO turn_memories (
+                turn_pk, project, chat_id, turn_id, started_at, updated_at, summary_text, memory_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(turn_pk) DO UPDATE SET
+                project=excluded.project,
+                chat_id=excluded.chat_id,
+                turn_id=excluded.turn_id,
+                started_at=excluded.started_at,
+                updated_at=excluded.updated_at,
+                summary_text=excluded.summary_text,
+                memory_text=excluded.memory_text
+            """,
+            (
+                turn_pk,
+                str(item.get("project") or "未命名项目"),
+                str(item.get("chat_id") or ""),
+                str(item.get("turn_id") or ""),
+                _safe_int(item.get("started_at")),
+                _safe_int(item.get("updated_at"), int(time.time())),
+                summary,
+                memory_text,
+            ),
+        )
+        self._fts_delete_many(conn, [turn_pk])
+        self._fts_insert_one(
+            conn=conn,
+            turn_pk=turn_pk,
+            project=str(item.get("project") or "未命名项目"),
+            chat_id=str(item.get("chat_id") or ""),
+            summary_text=summary,
+            memory_text=memory_text,
+        )
+
+    def _fts_enabled(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", ("turn_memories_fts_enabled",)).fetchone()
+        return bool(row and str(row["value"] or "").strip() == "1")
+
+    def _fts_delete_many(self, conn: sqlite3.Connection, turn_ids: List[str]) -> None:
+        if not turn_ids or not self._fts_enabled(conn):
+            return
+        try:
+            conn.executemany("DELETE FROM turn_memories_fts WHERE turn_pk = ?", [(tid,) for tid in turn_ids])
+        except Exception:
+            pass
+
+    def _fts_insert_one(
+        self,
+        conn: sqlite3.Connection,
+        turn_pk: str,
+        project: str,
+        chat_id: str,
+        summary_text: str,
+        memory_text: str,
+    ) -> None:
+        if not self._fts_enabled(conn):
+            return
+        try:
+            conn.execute(
+                """
+                INSERT INTO turn_memories_fts(turn_pk, project, chat_id, summary_text, memory_text)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (turn_pk, project, chat_id, summary_text, memory_text),
+            )
+        except Exception:
+            pass
+
+    def _backfill_turn_memories(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, project, chat_id, turn_id, started_at, updated_at, status, cwd, model, auth_profile,
+                   user_text, assistant_text, error_text
+            FROM turns
+            WHERE id NOT IN (SELECT turn_pk FROM turn_memories)
+            ORDER BY started_at ASC, id ASC
+            LIMIT 5000
+            """
+        ).fetchall()
+        for row in rows:
+            item = {
+                "id": str(row["id"] or ""),
+                "project": str(row["project"] or "未命名项目"),
+                "chat_id": str(row["chat_id"] or ""),
+                "turn_id": str(row["turn_id"] or ""),
+                "started_at": _safe_int(row["started_at"]),
+                "updated_at": _safe_int(row["updated_at"]),
+                "status": str(row["status"] or ""),
+                "cwd": str(row["cwd"] or ""),
+                "model": str(row["model"] or ""),
+                "auth_profile": str(row["auth_profile"] or ""),
+                "user_text": str(row["user_text"] or ""),
+                "assistant_text": str(row["assistant_text"] or ""),
+                "error_text": str(row["error_text"] or ""),
+            }
+            self._upsert_turn_memory(conn, item)
+
+    def _fts_query(self, query: str) -> str:
+        tokens = re.findall(r"[0-9A-Za-z_\u4e00-\u9fff\-\.]{2,}", str(query or "").lower())
+        if not tokens:
+            return ""
+        cleaned = tokens[:8]
+        return " AND ".join([f'"{token}"' for token in cleaned])
+
+    def _search_memories_rows(
+        self,
+        conn: sqlite3.Connection,
+        project: str,
+        query: str,
+        limit: int,
+        exclude_chat_id: str = "",
+    ) -> List[sqlite3.Row]:
+        excluded_chat = str(exclude_chat_id or "").strip()
+        target_query = str(query or "").strip()
+        if target_query and self._fts_enabled(conn):
+            fts_q = self._fts_query(target_query)
+            if fts_q:
+                try:
+                    return conn.execute(
+                        """
+                        SELECT m.*
+                        FROM turn_memories_fts f
+                        JOIN turn_memories m ON m.turn_pk = f.turn_pk
+                        WHERE (? = '' OR m.project = ?)
+                          AND (? = '' OR m.chat_id != ?)
+                          AND f.turn_memories_fts MATCH ?
+                        ORDER BY bm25(f), m.started_at DESC, m.id DESC
+                        LIMIT ?
+                        """,
+                        (project, project, excluded_chat, excluded_chat, fts_q, int(limit)),
+                    ).fetchall()
+                except Exception:
+                    pass
+        if target_query:
+            like = f"%{target_query}%"
+            return conn.execute(
+                """
+                SELECT *
+                FROM turn_memories
+                WHERE (? = '' OR project = ?)
+                  AND (? = '' OR chat_id != ?)
+                  AND (summary_text LIKE ? OR memory_text LIKE ?)
+                ORDER BY started_at DESC, id DESC
+                LIMIT ?
+                """,
+                (project, project, excluded_chat, excluded_chat, like, like, int(limit)),
+            ).fetchall()
+        return conn.execute(
+            """
+            SELECT *
+            FROM turn_memories
+            WHERE (? = '' OR project = ?)
+              AND (? = '' OR chat_id != ?)
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+            """,
+            (project, project, excluded_chat, excluded_chat, int(limit)),
+        ).fetchall()
