@@ -63,6 +63,14 @@ AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC = max(
     min(300, int(os.environ.get("BRIDGE_AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC", "90"))),
 )
 AUTH_REAL_HEALTH_CHECK_FAIL_DISABLE_SEC = max(60, int(os.environ.get("BRIDGE_AUTH_REAL_HEALTH_CHECK_FAIL_DISABLE_SEC", "900")))
+DISCONNECT_SELF_HEAL_ENABLED = str(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DISCONNECT_SELF_HEAL_THRESHOLD = max(1, int(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_THRESHOLD", "2")))
+DISCONNECT_SELF_HEAL_WINDOW_SEC = max(30, int(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_WINDOW_SEC", "900")))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -643,6 +651,60 @@ def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = Non
     if patch:
         data.update(patch)
     return STORE.upsert_chat(runtime.chat_id, data)
+
+
+def _is_disconnect_wait_error(message: str) -> bool:
+    return "app-server disconnected while waiting for turn completion" in str(message or "")
+
+
+def _disconnect_streak_patch(runtime: ChatRuntime) -> Dict[str, Any]:
+    now_ts = int(time.time())
+    persisted = STORE.get_chat(runtime.chat_id)
+    prev_ts = int(persisted.get("last_disconnect_at") or 0)
+    prev_streak = int(persisted.get("disconnect_fail_streak") or 0)
+    streak = prev_streak + 1 if prev_ts > 0 and (now_ts - prev_ts) <= DISCONNECT_SELF_HEAL_WINDOW_SEC else 1
+    return {
+        "disconnect_fail_streak": int(streak),
+        "last_disconnect_at": now_ts,
+    }
+
+
+def _maybe_self_heal_disconnected_runtime(runtime: ChatRuntime) -> Dict[str, Any]:
+    if not DISCONNECT_SELF_HEAL_ENABLED:
+        return {"healed": False, "streak": 0, "reason": ""}
+    persisted = STORE.get_chat(runtime.chat_id)
+    last_err = str(persisted.get("last_error") or "")
+    if not _is_disconnect_wait_error(last_err):
+        return {"healed": False, "streak": 0, "reason": ""}
+    streak = int(persisted.get("disconnect_fail_streak") or 0)
+    last_ts = int(persisted.get("last_disconnect_at") or 0)
+    now_ts = int(time.time())
+    if streak < DISCONNECT_SELF_HEAL_THRESHOLD:
+        return {"healed": False, "streak": streak, "reason": ""}
+    if last_ts <= 0 or (now_ts - last_ts) > DISCONNECT_SELF_HEAL_WINDOW_SEC:
+        return {"healed": False, "streak": streak, "reason": ""}
+
+    reason = f"disconnect self-heal (streak={streak})"
+    if str(runtime.auth_profile or "").strip():
+        _switch_runtime_auth_profile(runtime, profile=str(runtime.auth_profile or "").strip(), reason=reason)
+    else:
+        runtime.thread_id = ""
+        runtime.active_turn_id = ""
+        try:
+            runtime.client.stop()
+        except Exception:
+            pass
+        _persist_runtime(runtime)
+    _persist_runtime(
+        runtime,
+        {
+            "disconnect_fail_streak": 0,
+            "last_self_heal_at": now_ts,
+            "last_self_heal_reason": reason,
+            "last_error": "",
+        },
+    )
+    return {"healed": True, "streak": streak, "reason": reason}
 
 
 def _read_rate_limits(runtime: ChatRuntime, allow_request: bool = True) -> Dict[str, Any]:
@@ -1777,6 +1839,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
         _apply_runtime_auth_profile(runtime)
+        _maybe_self_heal_disconnected_runtime(runtime)
         turn_cwd = str(runtime.cwd or DEFAULT_CWD)
         turn_model = str(runtime.model or DEFAULT_MODEL)
         turn_auth_profile = str(runtime.auth_profile or "")
@@ -1903,6 +1966,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     "last_rate_limits": rate_limits,
                     "last_token_usage_profile": turn_auth_profile,
                     "last_rate_limits_profile": turn_auth_profile,
+                    "disconnect_fail_streak": 0,
                 },
             )
             if _rate_limit_exhausted(rate_limits) and not auto_auth_switch:
@@ -1999,6 +2063,9 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         err_text = str(exc) + (f"\n{note}" if note else "")
         active_for_record = ""
         with runtime.lock:
+            disconnect_patch: Dict[str, Any] = {}
+            if disconnected and _is_disconnect_wait_error(str(exc)):
+                disconnect_patch = _disconnect_streak_patch(runtime)
             active_for_record = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
             if disconnected:
                 runtime.active_turn_id = ""
@@ -2010,7 +2077,9 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 active_for_record = ""
             else:
                 runtime.active_turn_id = active_for_record
-            state = _persist_runtime(runtime, {"last_error": err_text, "last_turn_status": "failed"})
+            state_patch: Dict[str, Any] = {"last_error": err_text, "last_turn_status": "failed"}
+            state_patch.update(disconnect_patch)
+            state = _persist_runtime(runtime, state_patch)
         HISTORY_STORE.append_turn(
             _build_turn_record(
                 runtime=runtime,
