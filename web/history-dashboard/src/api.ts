@@ -1,5 +1,5 @@
 import { pageConfig } from "./config";
-import type { HistoryEnvelope, Pagination, Project, Session, Turn } from "./types";
+import type { AuthProfile, HistoryEnvelope, Pagination, Project, Session, Turn } from "./types";
 
 interface ProjectsPayload {
   projects: Project[];
@@ -23,6 +23,20 @@ interface TurnPayload {
   turn: Turn;
 }
 
+interface AuthProfilesPayload {
+  profiles: AuthProfile[];
+  timestamp: number;
+}
+
+interface AuthSwitchPayload {
+  chat_id: string;
+  runtime_id: string;
+  project: string;
+  auth_profile: string;
+  auth_identity: string;
+  state: Record<string, unknown>;
+}
+
 function buildUrl(path: string, params: Record<string, string | number | boolean | undefined>) {
   const url = new URL(path, window.location.origin);
   Object.entries(params).forEach(([key, value]) => {
@@ -39,6 +53,24 @@ function buildUrl(path: string, params: Record<string, string | number | boolean
 
 async function fetchJson<T>(path: string, params: Record<string, string | number | boolean | undefined>) {
   const response = await fetch(buildUrl(path, params), { credentials: "include" });
+  if (response.status === 401) {
+    window.location.href = "/history/entry?next=/history";
+    throw new Error("unauthorized");
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `request failed: ${response.status}`);
+  }
+  return (await response.json()) as HistoryEnvelope<T>;
+}
+
+async function postJson<T>(path: string, body: Record<string, unknown>) {
+  const response = await fetch(buildUrl(path, {}), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(body || {})
+  });
   if (response.status === 401) {
     window.location.href = "/history/entry?next=/history";
     throw new Error("unauthorized");
@@ -70,6 +102,19 @@ export const api = {
     return fetchJson<TurnPayload>("/history/api/turn", {
       turn_id: turnId,
       include_events: true
+    });
+  },
+  getAuthProfiles() {
+    return fetchJson<AuthProfilesPayload>("/history/api/auth/profiles", {});
+  },
+  healthCheckAuthProfile(profile = "") {
+    return postJson<AuthProfilesPayload>("/history/api/auth/health-check", { profile });
+  },
+  switchAuthProfile(project: string, chatId: string, profile: string) {
+    return postJson<AuthSwitchPayload>("/history/api/auth/switch", {
+      project,
+      chat_id: chatId,
+      profile
     });
   }
 };

@@ -2195,9 +2195,12 @@ class AppServerBotBridge:
                     from_profile = str(switch_info.get("from") or "").strip() or "default"
                     to_profile = str(switch_info.get("to") or "").strip() or "default"
                     identity = str(switch_info.get("identity") or "").strip()
+                    switch_note = str(switch_info.get("note") or "").strip()
                     note = f"已自动切换账号：`{from_profile}` -> `{to_profile}`"
                     if identity:
                         note += f" ({identity})"
+                    if switch_note:
+                        note += f"\n{switch_note}"
                     answer = (note + "\n\n" + answer).strip()
                 return answer or "(assistant returned empty text)"
             except Exception as exc:

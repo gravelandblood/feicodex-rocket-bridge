@@ -67,6 +67,25 @@ export interface PageConfig {
   initialChatId: string;
 }
 
+export interface AuthProfile {
+  profile: string;
+  label: string;
+  email: string;
+  valid: boolean;
+  reason: string;
+  home_dir: string;
+  source_auth_json: string;
+  status: string;
+  disabled_until: number;
+  disabled_reason: string;
+  needs_reauth: boolean;
+  risk_deactivated: boolean;
+  last_health_check_at: number;
+  last_health_error: string;
+  available: boolean;
+  disabled_remaining_sec: number;
+}
+
 export interface HistoryEnvelope<T> {
   ok: boolean;
   data: T;
