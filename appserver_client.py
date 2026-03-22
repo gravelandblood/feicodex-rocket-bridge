@@ -130,6 +130,7 @@ class CodexAppServerClient:
     def stop(self) -> None:
         self._ready = False
         self._closed.set()
+        self._clear_runtime_caches()
         proc = self.proc
         self.proc = None
         if not proc:
@@ -143,6 +144,19 @@ class CodexAppServerClient:
             except Exception:
                 pass
         self._notify_disconnect()
+
+    def _clear_runtime_caches(self) -> None:
+        # Never carry per-thread runtime snapshots across app-server restarts/disconnects.
+        with self._thread_status_lock:
+            self._thread_status.clear()
+            self._active_turn_by_thread.clear()
+            self._token_usage_by_thread.clear()
+            self._account_rate_limits.clear()
+            self._turn_started_at_by_thread.clear()
+            self._turn_last_event_at_by_thread.clear()
+            self._turn_preview_by_thread.clear()
+            self._turn_events_by_thread.clear()
+            self._last_status_type_by_thread.clear()
 
     def ensure_started(self) -> None:
         if self.proc and self.proc.poll() is None and self._ready:
@@ -623,6 +637,19 @@ class CodexAppServerClient:
         return head
 
     def _notify_disconnect(self) -> None:
+        self._ready = False
+        self._clear_runtime_caches()
+        proc = self.proc
+        self.proc = None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         with self._pending_lock:
             pending = list(self._pending.values())
             self._pending.clear()

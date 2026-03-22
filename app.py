@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,7 +28,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from appserver_client import AppServerError, AppServerTimeout, CodexAppServerClient
+from appserver_client import AppServerDisconnected, AppServerError, AppServerTimeout, CodexAppServerClient
 from history_store import BridgeHistoryStore
 from state_store import BridgeStateStore
 
@@ -55,6 +56,13 @@ AUTO_AUTH_SWITCH_ENABLED = str(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_ENABLED",
     "on",
 }
 AUTO_AUTH_SWITCH_THRESHOLD_PCT = max(1, min(100, int(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_THRESHOLD_PCT", "100"))))
+AUTH_HEALTH_CHECK_DEFAULT_MODE = str(os.environ.get("BRIDGE_AUTH_HEALTH_CHECK_DEFAULT_MODE", "real_turn")).strip().lower() or "real_turn"
+AUTH_REAL_HEALTH_CHECK_PROMPT = str(os.environ.get("BRIDGE_AUTH_REAL_HEALTH_CHECK_PROMPT", "只回复OK")).strip() or "只回复OK"
+AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC = max(
+    10,
+    min(300, int(os.environ.get("BRIDGE_AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC", "90"))),
+)
+AUTH_REAL_HEALTH_CHECK_FAIL_DISABLE_SEC = max(60, int(os.environ.get("BRIDGE_AUTH_REAL_HEALTH_CHECK_FAIL_DISABLE_SEC", "900")))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -146,6 +154,19 @@ class UpdateChatConfigRequest(BaseModel):
 
 class UpdateChatAuthProfileRequest(BaseModel):
     profile: str = Field(default="")
+
+
+class HistoryAuthSwitchRequest(BaseModel):
+    project: str = Field(default="")
+    chat_id: str = Field(default="")
+    profile: str = Field(default="")
+
+
+class HistoryAuthHealthCheckRequest(BaseModel):
+    profile: str = Field(default="")
+    mode: str = Field(default="")
+    prompt: str = Field(default="")
+    timeout_sec: int = Field(default=0, ge=0, le=1800)
 
 
 @dataclass
@@ -532,6 +553,14 @@ def _runtime_project_name(runtime_id: str) -> str:
     return raw.split("::", 1)[1].strip()
 
 
+def _runtime_id_from_chat_project(chat_id: str, project: str = "") -> str:
+    base = str(chat_id or "").strip()
+    proj = str(project or "").strip()
+    if not base:
+        return ""
+    return f"{base}::{proj}" if proj else base
+
+
 def _build_turn_record(
     runtime: ChatRuntime,
     turn_id: str,
@@ -809,23 +838,217 @@ def _decode_jwt_payload(token: str) -> Dict[str, Any]:
         return {}
 
 
-def _validate_auth_profile_file(source: Path) -> Dict[str, Any]:
+def _auth_file_sha1(path: Path) -> str:
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _parse_disable_seconds_from_message(message: str) -> int:
+    text = str(message or "")
+    lower = text.lower()
+    now = time.time()
+
+    # Example: "try again in 04:59:10"
+    for hh, mm, ss in re.findall(r"(?i)\b(?:in|after|reset(?:s)?\s+in)\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\b", lower):
+        try:
+            total = int(hh) * 3600 + int(mm) * 60 + int(ss or 0)
+            if total > 0:
+                return total
+        except Exception:
+            pass
+
+    # Example: "in 5 hours", "7 days", "5小时", "7天"
+    for value, unit in re.findall(r"(?i)(\d+)\s*(hours?|hrs?|hr|h|days?|d|小时|天)", text):
+        try:
+            num = int(value)
+        except Exception:
+            continue
+        unit_low = unit.lower()
+        if unit_low in {"h", "hr", "hrs", "hour", "hours", "小时"}:
+            return max(300, num * 3600)
+        if unit_low in {"d", "day", "days", "天"}:
+            return max(300, num * 86400)
+
+    # Example: "until 2026-03-25 12:34:56" or ISO forms
+    for token in re.findall(r"\b20\d{2}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?\b", text):
+        try:
+            dt = datetime.fromisoformat(token.replace("Z", "+00:00"))
+            ts = dt.timestamp()
+            if ts > now:
+                return max(300, int(ts - now))
+        except Exception:
+            pass
+
+    return 0
+
+
+def _classify_auth_error(message: str) -> str:
+    text = str(message or "").strip()
+    lower = text.lower()
+    if not lower:
+        return ""
+
+    if re.search(r"(disactivat|deactivat|suspend|account.+disabled|account.+banned|risk)", lower):
+        return "deactivated"
+
+    if (
+        "refresh token was already used" in lower
+        or "access token could not be refreshed" in lower
+        or "invalid_grant" in lower
+        or "refresh token has expired" in lower
+        or "reauth" in lower
+        or "login required" in lower
+    ):
+        return "needs_reauth"
+
+    if _is_auth_limit_error(text) or re.search(r"(try again in|retry after|too many requests|rate limit)", lower):
+        return "temp_disabled"
+
+    return ""
+
+
+def _auth_profile_available(meta: Dict[str, Any], now_ts: Optional[int] = None) -> bool:
+    now = int(now_ts if now_ts is not None else time.time())
+    if not bool(meta.get("valid")):
+        return False
+    status = str(meta.get("status") or "").strip().lower()
+    if status in {"needs_reauth", "deactivated"}:
+        return False
+    disabled_until = int(meta.get("disabled_until") or 0)
+    if status == "temp_disabled" and disabled_until > now:
+        return False
+    return True
+
+
+def _auth_registry_by_profile() -> Dict[str, Dict[str, Any]]:
+    data = _load_auth_registry()
+    items = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        profile = str(item.get("profile") or "").strip()
+        if profile:
+            out[profile] = dict(item)
+    return out
+
+
+def _patch_auth_registry_profile(profile: str, patch: Dict[str, Any]) -> None:
+    name = str(profile or "").strip()
+    if not name:
+        return
+    data = _load_auth_registry()
+    items = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+    changed = False
+    found = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("profile") or "").strip() != name:
+            continue
+        item.update(dict(patch or {}))
+        item["updated_at"] = int(time.time())
+        found = True
+        changed = True
+    if not found:
+        source = AUTH_PROFILES_DIR / f"{name}.auth.json"
+        if source.exists() and source.is_file():
+            entry = _validate_auth_profile_file(source)
+            entry.update(dict(patch or {}))
+            entry["updated_at"] = int(time.time())
+            items.append(entry)
+            changed = True
+    if changed:
+        _save_auth_registry([item for item in items if isinstance(item, dict)])
+
+
+def _remove_auth_profile_artifacts(profile: str) -> bool:
+    clean = str(profile or "").strip()
+    if not clean:
+        return False
+    changed = False
+    src = AUTH_PROFILES_DIR / f"{clean}.auth.json"
+    cfg = AUTH_PROFILES_DIR / f"{clean}.config.toml"
+    home = _profile_home_dir(clean)
+    try:
+        if src.exists():
+            src.unlink()
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove auth profile source failed profile=%s err=%s", clean, exc)
+    try:
+        if cfg.exists():
+            cfg.unlink()
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove auth profile config failed profile=%s err=%s", clean, exc)
+    try:
+        if home.exists() and home.is_dir():
+            shutil.rmtree(home, ignore_errors=False)
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove auth profile home failed profile=%s err=%s", clean, exc)
+    if changed:
+        _refresh_auth_profiles()
+    return changed
+
+
+def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     profile = str(source.name[: -len(".auth.json")] if source.name.endswith(".auth.json") else source.stem).strip()
+    previous_meta = dict(previous or {})
+    now_ts = int(time.time())
+    source_hash = _auth_file_sha1(source)
+    prev_hash = str(previous_meta.get("source_auth_sha1") or "").strip()
+    file_changed = bool(source_hash and prev_hash and source_hash != prev_hash)
+
     meta: Dict[str, Any] = {
         "profile": profile,
         "source_auth_json": str(source),
-        "source_config_toml": "",
+        "source_config_toml": str(previous_meta.get("source_config_toml") or "").strip(),
         "valid": False,
         "reason": "",
-        "auth_mode": "",
-        "email": "",
-        "sub": "",
+        "auth_mode": str(previous_meta.get("auth_mode") or "").strip(),
+        "email": str(previous_meta.get("email") or "").strip(),
+        "sub": str(previous_meta.get("sub") or "").strip(),
         "home_dir": str(_profile_home_dir(profile)),
+        "status": str(previous_meta.get("status") or "").strip() or "unknown",
+        "disabled_until": int(previous_meta.get("disabled_until") or 0),
+        "disabled_reason": str(previous_meta.get("disabled_reason") or "").strip(),
+        "needs_reauth": bool(previous_meta.get("needs_reauth")),
+        "risk_deactivated": bool(previous_meta.get("risk_deactivated")),
+        "last_health_check_at": int(previous_meta.get("last_health_check_at") or 0),
+        "last_health_error": str(previous_meta.get("last_health_error") or "").strip(),
+        "source_auth_sha1": source_hash,
+        "updated_at": now_ts,
     }
+    if file_changed:
+        meta["disabled_until"] = 0
+        meta["disabled_reason"] = ""
+        meta["needs_reauth"] = False
+        meta["risk_deactivated"] = False
+        meta["last_health_error"] = ""
+        meta["status"] = "unknown"
+
+    if bool(meta.get("needs_reauth")) and (not file_changed):
+        meta["status"] = "needs_reauth"
+        meta["valid"] = False
+        meta["reason"] = "auth.json 登录态已失效，请重新获取并替换该文件。"
+        return meta
+    if bool(meta.get("risk_deactivated")) and (not file_changed):
+        meta["status"] = "deactivated"
+        meta["valid"] = False
+        meta["reason"] = "账号疑似被风控/停用，已禁止继续使用。"
+        return meta
+
     try:
         data = json.loads(source.read_text(encoding="utf-8"))
     except Exception as exc:
+        meta["status"] = "invalid"
         meta["reason"] = f"invalid json: {exc}"
+        meta["last_health_check_at"] = now_ts
+        meta["last_health_error"] = meta["reason"]
         return meta
 
     auth_mode = str(data.get("auth_mode") or "").strip()
@@ -836,7 +1059,10 @@ def _validate_auth_profile_file(source: Path) -> Dict[str, Any]:
     meta["sub"] = str(payload.get("sub") or "").strip()
 
     if not auth_mode or not isinstance(tokens, dict):
+        meta["status"] = "invalid"
         meta["reason"] = "missing auth_mode/tokens"
+        meta["last_health_check_at"] = now_ts
+        meta["last_health_error"] = meta["reason"]
         return meta
 
     home_dir = _profile_home_dir(profile)
@@ -861,19 +1087,52 @@ def _validate_auth_profile_file(source: Path) -> Dict[str, Any]:
             check=False,
         )
     except Exception as exc:
+        meta["status"] = "invalid"
         meta["reason"] = f"status check failed: {exc}"
+        meta["last_health_check_at"] = now_ts
+        meta["last_health_error"] = meta["reason"]
         return meta
 
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    meta["last_health_check_at"] = now_ts
     if proc.returncode == 0 and "Logged in" in output:
-        meta["valid"] = True
+        disabled_until = int(meta.get("disabled_until") or 0)
+        if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
+            meta["valid"] = False
+            meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
+            meta["last_health_error"] = meta["reason"]
+        else:
+            meta["valid"] = True
+            meta["reason"] = ""
+            meta["status"] = "active"
+            meta["disabled_until"] = 0
+            meta["disabled_reason"] = ""
+            meta["needs_reauth"] = False
+            meta["risk_deactivated"] = False
+            meta["last_health_error"] = ""
         return meta
-    meta["reason"] = output.strip() or f"status code {proc.returncode}"
+    raw_reason = output.strip() or f"status code {proc.returncode}"
+    classified = _classify_auth_error(raw_reason)
+    meta["reason"] = raw_reason
+    meta["last_health_error"] = raw_reason
+    if classified == "needs_reauth":
+        meta["status"] = "needs_reauth"
+        meta["needs_reauth"] = True
+        meta["disabled_until"] = 0
+        meta["disabled_reason"] = "refresh token 已失效，需替换 auth.json"
+    elif classified == "deactivated":
+        meta["status"] = "deactivated"
+        meta["risk_deactivated"] = True
+        meta["disabled_until"] = 0
+        meta["disabled_reason"] = "账号疑似被停用/风控"
+    else:
+        meta["status"] = "invalid"
     return meta
 
 
 def _refresh_auth_profiles() -> List[Dict[str, Any]]:
     AUTH_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    previous_by_profile = _auth_registry_by_profile()
     profiles: List[Dict[str, Any]] = []
     for path in sorted(AUTH_PROFILES_DIR.glob("*.auth.json")):
         if not path.is_file():
@@ -881,9 +1140,171 @@ def _refresh_auth_profiles() -> List[Dict[str, Any]]:
         profile = str(path.name[: -len(".auth.json")] if path.name.endswith(".auth.json") else path.stem).strip()
         if not profile:
             continue
-        profiles.append(_validate_auth_profile_file(path))
+        profiles.append(_validate_auth_profile_file(path, previous=previous_by_profile.get(profile)))
     _save_auth_registry(profiles)
     return profiles
+
+
+def _is_real_turn_health_mode(mode: str) -> bool:
+    clean = str(mode or "").strip().lower()
+    return clean in {"real", "real_turn", "turn", "conversation", "chat"}
+
+
+def _real_turn_probe_auth_profile(profile: str, prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
+    clean = str(profile or "").strip()
+    probe_prompt = str(prompt or AUTH_REAL_HEALTH_CHECK_PROMPT).strip() or AUTH_REAL_HEALTH_CHECK_PROMPT
+    probe_timeout = int(timeout_sec or AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC)
+    probe_timeout = max(10, min(300, probe_timeout))
+    runtime_id = f"diag_auth_real_{clean or 'default'}_{int(time.time() * 1000)}"
+    runtime = RUNTIMES.get(runtime_id)
+    turn_id = ""
+    thread_id = ""
+    done_error = ""
+    done_status = ""
+    done_text = ""
+    try:
+        with runtime.lock:
+            runtime.last_input_at = int(time.time())
+            runtime.cwd = DEFAULT_CWD
+            runtime.model = DEFAULT_MODEL
+            runtime.sandbox = DEFAULT_SANDBOX
+            runtime.approval_policy = DEFAULT_APPROVAL
+            runtime.personality = DEFAULT_PERSONALITY
+            _switch_runtime_auth_profile(runtime, profile=clean, reason="history auth real health-check")
+            thread_id = _ensure_thread(runtime, reset_thread=True)
+            started = runtime.client.turn_start(thread_id=thread_id, text=probe_prompt, image_paths=[])
+            turn = started.get("turn") if isinstance(started.get("turn"), dict) else {}
+            turn_id = str(turn.get("id") or "")
+            if not turn_id:
+                raise AppServerError(f"turn/start returned no turn id: {started}")
+            runtime.active_turn_id = turn_id
+        done = runtime.client.wait_for_turn_completion(thread_id=thread_id, turn_id=turn_id, timeout_sec=probe_timeout)
+        done_status = str(done.turn_status or "")
+        done_text = str(done.text or "")
+        if isinstance(done.error, dict) and done.error:
+            done_error = json.dumps(done.error, ensure_ascii=False)
+    except HTTPException as exc:
+        done_error = str(exc.detail or exc)
+    except Exception as exc:
+        done_error = str(exc)
+    finally:
+        with runtime.lock:
+            runtime.active_turn_id = ""
+            runtime.thread_id = ""
+            try:
+                runtime.client.stop()
+            except Exception:
+                pass
+            _persist_runtime(
+                runtime,
+                {
+                    "thread_id": "",
+                    "active_turn_id": "",
+                    "last_turn_status": "completed" if not done_error else "failed",
+                    "last_turn_id": turn_id,
+                    "last_turn_at": int(time.time()),
+                    "last_error": done_error[:1200] if done_error else "",
+                },
+            )
+    ok = (not done_error) and (done_status.lower() == "completed")
+    if (not done_error) and (not ok):
+        done_error = f"turn ended with status={done_status or 'unknown'}"
+    return {
+        "ok": ok,
+        "status": done_status or ("completed" if ok else "failed"),
+        "error": done_error[:1200] if done_error else "",
+        "assistant_text": done_text[:200],
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "checked_at": int(time.time()),
+        "mode": "real_turn",
+    }
+
+
+def _apply_health_probe_result(profile: str, probe: Dict[str, Any]) -> Dict[str, Any]:
+    clean = str(profile or "").strip()
+    now_ts = int(probe.get("checked_at") or time.time())
+    ok = bool(probe.get("ok"))
+    message = str(probe.get("error") or "").strip()
+    status = str(probe.get("status") or "").strip()
+    patch: Dict[str, Any] = {
+        "last_health_check_at": now_ts,
+        "updated_at": now_ts,
+    }
+    if ok:
+        patch.update(
+            {
+                "valid": True,
+                "status": "active",
+                "reason": "",
+                "disabled_until": 0,
+                "disabled_reason": "",
+                "needs_reauth": False,
+                "risk_deactivated": False,
+                "last_health_error": "",
+            }
+        )
+    else:
+        classified = _classify_auth_error(message)
+        if classified == "needs_reauth":
+            patch.update(
+                {
+                    "valid": False,
+                    "status": "needs_reauth",
+                    "reason": message[:1200] or "真实对话检测失败：登录态失效",
+                    "needs_reauth": True,
+                    "risk_deactivated": False,
+                    "disabled_until": 0,
+                    "disabled_reason": "refresh token 已失效，需替换 auth.json",
+                    "last_health_error": message[:1200],
+                }
+            )
+        elif classified == "deactivated":
+            patch.update(
+                {
+                    "valid": False,
+                    "status": "deactivated",
+                    "reason": message[:1200] or "真实对话检测失败：账号疑似被停用/风控",
+                    "needs_reauth": False,
+                    "risk_deactivated": True,
+                    "disabled_until": 0,
+                    "disabled_reason": "账号疑似被停用/风控",
+                    "last_health_error": message[:1200],
+                }
+            )
+        else:
+            disable_sec = _parse_disable_seconds_from_message(message)
+            if disable_sec <= 0:
+                disable_sec = AUTH_REAL_HEALTH_CHECK_FAIL_DISABLE_SEC
+            disabled_until = now_ts + max(60, int(disable_sec))
+            reason = message[:1200] if message else f"真实对话检测失败：status={status or 'failed'}"
+            patch.update(
+                {
+                    "valid": False,
+                    "status": "temp_disabled",
+                    "reason": reason,
+                    "needs_reauth": False,
+                    "risk_deactivated": False,
+                    "disabled_until": disabled_until,
+                    "disabled_reason": f"真实对话检测失败，暂时禁用到 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))}",
+                    "last_health_error": reason,
+                }
+            )
+    _patch_auth_registry_profile(clean, patch)
+    refreshed = _auth_registry_by_profile().get(clean)
+    payload = dict(refreshed or {"profile": clean})
+    payload["last_probe"] = probe
+    return payload
+
+
+def _health_check_auth_profile_item(item: Dict[str, Any], mode: str, prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
+    profile = str((item or {}).get("profile") or "").strip()
+    if not _is_real_turn_health_mode(mode):
+        payload = dict(item or {})
+        payload["last_probe"] = {"mode": "status", "ok": bool(payload.get("valid")), "checked_at": int(time.time())}
+        return payload
+    probe = _real_turn_probe_auth_profile(profile=profile, prompt=prompt, timeout_sec=timeout_sec)
+    return _apply_health_probe_result(profile, probe)
 
 
 def _get_auth_profile(profile: str) -> Optional[Dict[str, Any]]:
@@ -895,8 +1316,9 @@ def _get_auth_profile(profile: str) -> Optional[Dict[str, Any]]:
 
 
 def _list_switchable_auth_profiles() -> List[Dict[str, Any]]:
-    return [{"profile": "", "label": "default", "valid": True, "email": ""}] + [
-        item for item in _refresh_auth_profiles() if bool(item.get("valid"))
+    now_ts = int(time.time())
+    return [{"profile": "", "label": "default", "valid": True, "email": "", "status": "active"}] + [
+        item for item in _refresh_auth_profiles() if _auth_profile_available(item, now_ts=now_ts)
     ]
 
 
@@ -938,6 +1360,83 @@ def _rate_limit_exhausted(rate_limits: Dict[str, Any]) -> bool:
     return False
 
 
+def _apply_auth_error_policy(
+    runtime: ChatRuntime,
+    failed_profile: str,
+    error_message: str,
+    allow_switch: bool = True,
+) -> Dict[str, Any]:
+    profile = str(failed_profile or "").strip()
+    message = str(error_message or "").strip()
+    if not profile or not message:
+        return {"classification": "", "switch": None, "note": "", "deleted": False}
+
+    classification = _classify_auth_error(message)
+    now_ts = int(time.time())
+    note = ""
+    deleted = False
+    patch: Dict[str, Any] = {
+        "valid": False,
+        "reason": message[:1200],
+        "last_health_check_at": now_ts,
+        "last_health_error": message[:1200],
+    }
+    if classification == "temp_disabled":
+        disable_sec = _parse_disable_seconds_from_message(message) or 5 * 3600
+        disabled_until = now_ts + max(300, int(disable_sec))
+        patch.update(
+            {
+                "status": "temp_disabled",
+                "disabled_until": disabled_until,
+                "disabled_reason": f"触发额度/频控上限：{message[:300]}",
+                "needs_reauth": False,
+                "risk_deactivated": False,
+            }
+        )
+        note = f"账号 `{profile}` 触发额度上限，已临时禁用至 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))}"
+    elif classification == "needs_reauth":
+        patch.update(
+            {
+                "status": "needs_reauth",
+                "disabled_until": 0,
+                "disabled_reason": "refresh token 已失效，需替换 auth.json",
+                "needs_reauth": True,
+                "risk_deactivated": False,
+            }
+        )
+        note = f"账号 `{profile}` 登录态失效，需要重新获取并替换 `auth.json`"
+    elif classification == "deactivated":
+        patch.update(
+            {
+                "status": "deactivated",
+                "disabled_until": 0,
+                "disabled_reason": "账号疑似被停用/风控",
+                "needs_reauth": False,
+                "risk_deactivated": True,
+            }
+        )
+        note = f"账号 `{profile}` 疑似被停用/风控，已从账号池移除"
+    else:
+        return {"classification": "", "switch": None, "note": "", "deleted": False}
+
+    _patch_auth_registry_profile(profile, patch)
+    if classification == "deactivated":
+        deleted = _remove_auth_profile_artifacts(profile)
+
+    switched: Optional[Dict[str, Any]] = None
+    if allow_switch:
+        target = _pick_next_auth_profile(runtime.auth_profile)
+        if target:
+            target_profile = str(target.get("profile") or "").strip()
+            if target_profile != str(runtime.auth_profile or "").strip():
+                switched = _switch_runtime_auth_profile(
+                    runtime,
+                    profile=target_profile,
+                    reason=f"auth policy {classification}: {message[:200]}",
+                )
+    return {"classification": classification, "switch": switched, "note": note, "deleted": deleted}
+
+
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     target_home = _sync_runtime_home(runtime)
     runtime.client.env["CODEX_HOME"] = str(target_home)
@@ -962,6 +1461,10 @@ def _switch_runtime_auth_profile(runtime: ChatRuntime, profile: str, reason: str
         runtime,
         {
             "last_error": "",
+            "last_token_usage": {},
+            "last_rate_limits": {},
+            "last_token_usage_profile": "",
+            "last_rate_limits_profile": "",
             "last_auto_auth_switch_from": previous,
             "last_auto_auth_switch_to": target,
             "last_auto_auth_switch_reason": str(reason or ""),
@@ -1068,11 +1571,13 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
     rate_limits: Dict[str, Any] = {}
     turn_progress: Dict[str, Any] = {}
     turn_events: List[Dict[str, Any]] = []
-    active_turn_id = str(runtime.active_turn_id or persisted.get("active_turn_id") or "")
+    runtime_active_turn_id = str(runtime.active_turn_id or "")
+    active_turn_id = str(runtime_active_turn_id or persisted.get("active_turn_id") or "")
     auth_profile = str(runtime.auth_profile or persisted.get("auth_profile") or "")
     auth_meta = _get_auth_profile(auth_profile) if auth_profile else None
 
-    if thread_id and runtime.is_client_running():
+    has_live_client = bool(thread_id and runtime.is_client_running())
+    if has_live_client:
         thread_status = runtime.client.get_thread_status(thread_id)
         token_usage = runtime.client.get_thread_token_usage(thread_id)
         rate_limits = _read_rate_limits(runtime)
@@ -1086,10 +1591,35 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
         turn_events = runtime.client.get_turn_events(thread_id=thread_id, turn_id=active_turn_id, limit=8)
     if not rate_limits:
         rate_limits = _read_rate_limits(runtime, allow_request=False)
-    if not token_usage and isinstance(persisted.get("last_token_usage"), dict):
+    if (
+        not token_usage
+        and isinstance(persisted.get("last_token_usage"), dict)
+        and str(persisted.get("last_token_usage_profile") or "") == auth_profile
+    ):
         token_usage = dict(persisted.get("last_token_usage") or {})
-    if not rate_limits and isinstance(persisted.get("last_rate_limits"), dict):
+    if (
+        not rate_limits
+        and isinstance(persisted.get("last_rate_limits"), dict)
+        and str(persisted.get("last_rate_limits_profile") or "") == auth_profile
+    ):
         rate_limits = dict(persisted.get("last_rate_limits") or {})
+    status_type = str(thread_status.get("type") or "").strip().lower()
+    state_patch: Dict[str, Any] = {}
+    persisted_active_turn = str(persisted.get("active_turn_id") or "")
+    if persisted_active_turn:
+        stale_without_live_runtime = (not has_live_client) and (not runtime_active_turn_id)
+        if stale_without_live_runtime or not active_turn_id:
+            active_turn_id = ""
+            state_patch["active_turn_id"] = ""
+        elif active_turn_id != persisted_active_turn:
+            state_patch["active_turn_id"] = active_turn_id
+    if str(persisted.get("last_turn_status") or "").strip().lower() == "running" and not active_turn_id:
+        if status_type in {"", "idle", "systemerror"}:
+            state_patch["last_turn_status"] = "failed"
+            if not str(persisted.get("last_error") or "").strip():
+                state_patch["last_error"] = "stale running state cleared after app-server disconnect/restart"
+    if state_patch:
+        persisted = _persist_runtime(runtime, state_patch)
     last_auto_auth_switch = {
         "from": str(persisted.get("last_auto_auth_switch_from") or "").strip(),
         "to": str(persisted.get("last_auto_auth_switch_to") or "").strip(),
@@ -1140,6 +1670,13 @@ def auth_profiles_list() -> Dict[str, Any]:
                     "reason": "",
                     "home_dir": "",
                     "source_auth_json": "",
+                    "status": "active",
+                    "disabled_until": 0,
+                    "disabled_reason": "",
+                    "needs_reauth": False,
+                    "risk_deactivated": False,
+                    "last_health_check_at": 0,
+                    "last_health_error": "",
                 }
             ]
             + profiles
@@ -1238,7 +1775,9 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         preflight_limits = _read_rate_limits(runtime, allow_request=runtime.is_client_running())
         if not preflight_limits:
             persisted = STORE.get_chat(chat_id)
-            preflight_limits = dict(persisted.get("last_rate_limits") or {}) if isinstance(persisted.get("last_rate_limits"), dict) else {}
+            persisted_profile = str(persisted.get("last_rate_limits_profile") or "")
+            if persisted_profile == turn_auth_profile and isinstance(persisted.get("last_rate_limits"), dict):
+                preflight_limits = dict(persisted.get("last_rate_limits") or {})
         if _rate_limit_exhausted(preflight_limits):
             auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="preflight rate limit exhausted")
         try:
@@ -1280,8 +1819,22 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
             )
         except AppServerError as exc:
-            if _is_auth_limit_error(str(exc)) and not auto_auth_switch:
-                auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason=str(exc))
+            raw_err = str(exc)
+            handled = _apply_auth_error_policy(runtime, failed_profile=turn_auth_profile, error_message=raw_err, allow_switch=True)
+            switched = handled.get("switch") if isinstance(handled, dict) else None
+            note = str((handled or {}).get("note") or "").strip()
+            if isinstance(switched, dict):
+                auto_auth_switch = switched
+                if note:
+                    auto_auth_switch["note"] = note
+                thread_id = _ensure_thread(runtime, reset_thread=True)
+                turn_start = runtime.client.turn_start(
+                    thread_id=thread_id,
+                    text=turn_input_text,
+                    image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                )
+            elif _is_auth_limit_error(raw_err) and not auto_auth_switch:
+                auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason=raw_err)
                 if auto_auth_switch:
                     thread_id = _ensure_thread(runtime, reset_thread=True)
                     turn_start = runtime.client.turn_start(
@@ -1290,16 +1843,18 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                         image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
                     )
                 else:
-                    state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
+                    err_text = raw_err + (f"\n{note}" if note else "")
+                    state = _persist_runtime(runtime, {"last_error": err_text, "last_turn_status": "failed"})
                     raise HTTPException(
                         status_code=502,
-                        detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
+                        detail={"ok": False, "error": err_text, "thread_id": runtime.thread_id, "state": state},
                     ) from exc
             else:
-                state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
+                err_text = raw_err + (f"\n{note}" if note else "")
+                state = _persist_runtime(runtime, {"last_error": err_text, "last_turn_status": "failed"})
                 raise HTTPException(
                     status_code=502,
-                    detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
+                    detail={"ok": False, "error": err_text, "thread_id": runtime.thread_id, "state": state},
                 ) from exc
 
         turn = turn_start.get("turn") if isinstance(turn_start.get("turn"), dict) else {}
@@ -1338,10 +1893,28 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     "last_error": "",
                     "last_token_usage": token_usage,
                     "last_rate_limits": rate_limits,
+                    "last_token_usage_profile": turn_auth_profile,
+                    "last_rate_limits_profile": turn_auth_profile,
                 },
             )
             if _rate_limit_exhausted(rate_limits) and not auto_auth_switch:
                 auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="post-turn rate limit exhausted")
+            done_error_text = json.dumps(done.error, ensure_ascii=False) if done.error else ""
+            if done_error_text:
+                handled = _apply_auth_error_policy(
+                    runtime,
+                    failed_profile=turn_auth_profile,
+                    error_message=done_error_text,
+                    allow_switch=True,
+                )
+                switched = handled.get("switch") if isinstance(handled, dict) else None
+                note = str((handled or {}).get("note") or "").strip()
+                if isinstance(switched, dict):
+                    auto_auth_switch = switched
+                if note:
+                    if not isinstance(auto_auth_switch, dict):
+                        auto_auth_switch = {}
+                    auto_auth_switch["note"] = note
         HISTORY_STORE.append_turn(
             _build_turn_record(
                 runtime=runtime,
@@ -1407,19 +1980,39 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             },
         ) from exc
     except AppServerError as exc:
+        disconnected = isinstance(exc, AppServerDisconnected)
+        handled = _apply_auth_error_policy(
+            runtime,
+            failed_profile=turn_auth_profile,
+            error_message=str(exc),
+            allow_switch=False,
+        )
+        note = str((handled or {}).get("note") or "").strip()
+        err_text = str(exc) + (f"\n{note}" if note else "")
+        active_for_record = ""
         with runtime.lock:
-            runtime.active_turn_id = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
-            state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
+            active_for_record = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
+            if disconnected:
+                runtime.active_turn_id = ""
+                runtime.thread_id = ""
+                try:
+                    runtime.client.stop()
+                except Exception:
+                    pass
+                active_for_record = ""
+            else:
+                runtime.active_turn_id = active_for_record
+            state = _persist_runtime(runtime, {"last_error": err_text, "last_turn_status": "failed"})
         HISTORY_STORE.append_turn(
             _build_turn_record(
                 runtime=runtime,
-                turn_id=turn_id or str(runtime.active_turn_id or ""),
+                turn_id=turn_id or active_for_record,
                 status="failed",
                 started_at=turn_started_at,
                 ended_at=int(time.time()),
                 user_text=visible_user_text,
                 assistant_text="",
-                error_text=str(exc),
+                error_text=err_text,
                 thread_id=thread_id,
                 cwd=turn_cwd,
                 model=turn_model,
@@ -1428,7 +2021,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         )
         raise HTTPException(
             status_code=502,
-            detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
+            detail={"ok": False, "error": err_text, "thread_id": runtime.thread_id, "state": state},
         ) from exc
 
 
@@ -1675,6 +2268,113 @@ def history_turn_api(
     if not item:
         return JSONResponse(status_code=404, content={"ok": False, "error": "turn not found"})
     return JSONResponse({"ok": True, "data": {"turn": item}})
+
+
+@APP.get("/history/api/auth/profiles")
+def history_auth_profiles_api(
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    now_ts = int(time.time())
+    profiles = _refresh_auth_profiles()
+    data_items: List[Dict[str, Any]] = [
+        {
+            "profile": "",
+            "label": "default",
+            "email": "",
+            "valid": True,
+            "reason": "",
+            "home_dir": str(DEFAULT_CODEX_HOME),
+            "source_auth_json": "",
+            "status": "active",
+            "disabled_until": 0,
+            "disabled_reason": "",
+            "needs_reauth": False,
+            "risk_deactivated": False,
+            "last_health_check_at": 0,
+            "last_health_error": "",
+            "available": True,
+            "disabled_remaining_sec": 0,
+        }
+    ]
+    for item in profiles:
+        profile_item = dict(item)
+        disabled_until = int(profile_item.get("disabled_until") or 0)
+        profile_item["label"] = str(profile_item.get("profile") or "").strip() or "default"
+        profile_item["available"] = _auth_profile_available(profile_item, now_ts=now_ts)
+        profile_item["disabled_remaining_sec"] = max(0, disabled_until - now_ts) if disabled_until > 0 else 0
+        data_items.append(profile_item)
+    return JSONResponse({"ok": True, "data": {"profiles": data_items, "timestamp": now_ts}})
+
+
+@APP.post("/history/api/auth/health-check")
+def history_auth_health_check_api(
+    body: HistoryAuthHealthCheckRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    target = str(body.profile or "").strip()
+    mode = str(body.mode or AUTH_HEALTH_CHECK_DEFAULT_MODE).strip().lower() or AUTH_HEALTH_CHECK_DEFAULT_MODE
+    probe_prompt = str(body.prompt or "").strip()
+    probe_timeout = int(body.timeout_sec or 0)
+    if target:
+        item = _get_auth_profile(target)
+        if not item:
+            return JSONResponse(status_code=404, content={"ok": False, "error": f"profile not found: {target}"})
+        profiles = [_health_check_auth_profile_item(item=item, mode=mode, prompt=probe_prompt, timeout_sec=probe_timeout)]
+    else:
+        seed = _refresh_auth_profiles()
+        profiles = [
+            _health_check_auth_profile_item(item=item, mode=mode, prompt=probe_prompt, timeout_sec=probe_timeout)
+            for item in seed
+        ]
+    now_ts = int(time.time())
+    normalized: List[Dict[str, Any]] = []
+    for item in profiles:
+        payload = dict(item)
+        disabled_until = int(payload.get("disabled_until") or 0)
+        payload["label"] = str(payload.get("profile") or "").strip() or "default"
+        payload["available"] = _auth_profile_available(payload, now_ts=now_ts)
+        payload["disabled_remaining_sec"] = max(0, disabled_until - now_ts) if disabled_until > 0 else 0
+        normalized.append(payload)
+    return JSONResponse({"ok": True, "data": {"profiles": normalized, "timestamp": now_ts, "mode": mode}})
+
+
+@APP.post("/history/api/auth/switch")
+def history_auth_switch_api(
+    body: HistoryAuthSwitchRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    chat_id = str(body.chat_id or "").strip()
+    profile = str(body.profile or "").strip()
+    project = str(body.project or "").strip()
+    if not chat_id:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "chat_id is required"})
+    runtime_id = _runtime_id_from_chat_project(chat_id=chat_id, project=project)
+    runtime = RUNTIMES.get(runtime_id)
+    with runtime.lock:
+        info = _switch_runtime_auth_profile(runtime, profile=profile, reason="history dashboard manual switch")
+        state = STORE.get_chat(runtime_id)
+    return JSONResponse(
+        {
+            "ok": True,
+            "data": {
+                "chat_id": chat_id,
+                "runtime_id": runtime_id,
+                "project": project,
+                "auth_profile": str(info.get("to") or "").strip(),
+                "auth_identity": str(info.get("identity") or "").strip(),
+                "state": state,
+            },
+        }
+    )
 
 
 @APP.get("/history", response_class=HTMLResponse)
