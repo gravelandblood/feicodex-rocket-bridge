@@ -148,6 +148,14 @@ cp soul.md.example soul.md
 - `GET /chat/{chat_id}/status`
 - `GET /history`
 - `GET /auth/profiles`
+- `POST /auth/profiles/upload`
+- `POST /auth/profiles/remove`
+- `POST /auth/health-check`
+- `GET /auth/control/state`
+- `POST /auth/control/upload`
+- `POST /auth/control/assign`
+- `POST /auth/control/revoke`
+- `POST /auth/control/health-check`
 - `POST /chat/{chat_id}/config`
 - `POST /chat/{chat_id}/auth-profile`
 - `POST /chat/{chat_id}/thread/reset`
@@ -174,6 +182,7 @@ cp soul.md.example soul.md
 - `FEISHU_OAUTH_AUTHORIZE_URL=...`
 - `FEISHU_OAUTH_TOKEN_URL=...`
 - `FEISHU_OAUTH_USERINFO_URL=...`
+- `BRIDGE_AUTH_CONTROL_NODES_JSON=[...]`
 
 页面会按：
 
@@ -187,6 +196,12 @@ cp soul.md.example soul.md
 - 最终回复
 - 中间过程事件
 - 失败错误（如果有）
+
+新增 auth 集中管理页：
+
+- 入口：`GET /history/auth-control`
+- 用途：上传 auth、分配到远程桥接器、回收、跨节点健康巡检
+- 约束：每个 auth 通过控制面租约与版本 token（fencing）保证同一时刻只分配到单个目标节点
 
 ## 历史 API
 

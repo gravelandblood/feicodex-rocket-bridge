@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -98,6 +99,19 @@ RUNTIME_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_RUNTIME_HOMES_DIR",
 AUTH_REGISTRY_PATH = _resolve_env_path(
     os.environ.get("BRIDGE_AUTH_REGISTRY_PATH", str(DATA_DIR / "auth_profiles_registry.json"))
 )
+AUTH_DISPATCH_FENCE_PATH = _resolve_env_path(
+    os.environ.get("BRIDGE_AUTH_DISPATCH_FENCE_PATH", str(DATA_DIR / "auth_dispatch_fence.json"))
+)
+AUTH_CONTROL_REGISTRY_PATH = _resolve_env_path(
+    os.environ.get("BRIDGE_AUTH_CONTROL_REGISTRY_PATH", str(DATA_DIR / "auth_control_registry.json"))
+)
+AUTH_CONTROL_NODES_JSON = str(os.environ.get("BRIDGE_AUTH_CONTROL_NODES_JSON", "[]")).strip() or "[]"
+AUTH_CONTROL_DEFAULT_LEASE_SEC = max(60, int(os.environ.get("BRIDGE_AUTH_CONTROL_DEFAULT_LEASE_SEC", "86400")))
+AUTH_CONTROL_MAX_LEASE_SEC = max(
+    AUTH_CONTROL_DEFAULT_LEASE_SEC,
+    int(os.environ.get("BRIDGE_AUTH_CONTROL_MAX_LEASE_SEC", "604800")),
+)
+AUTH_CONTROL_MAX_AUDIT = max(100, int(os.environ.get("BRIDGE_AUTH_CONTROL_MAX_AUDIT", "2000")))
 DEFAULT_CODEX_HOME = _resolve_env_path(os.environ.get("BRIDGE_DEFAULT_CODEX_HOME", str(Path.home() / ".codex")))
 BRIDGE_MCP_SERVER_NAME = str(os.environ.get("BRIDGE_MCP_SERVER_NAME", "feishu-bridge-files")).strip() or "feishu-bridge-files"
 BRIDGE_MCP_SERVER_PATH = _resolve_env_path(os.environ.get("BRIDGE_MCP_SERVER_PATH", str(APP_DIR / "bridge_mcp_server.py")))
@@ -127,6 +141,9 @@ FEISHU_OAUTH_TOKEN_URLS = [
 FEISHU_OAUTH_USERINFO_URL = str(
     os.environ.get("FEISHU_OAUTH_USERINFO_URL", "https://open.feishu.cn/open-apis/authen/v1/user_info")
 ).strip()
+
+_AUTH_DISPATCH_FENCE_LOCK = threading.Lock()
+_AUTH_CONTROL_LOCK = threading.Lock()
 
 
 class TurnRequest(BaseModel):
@@ -180,6 +197,62 @@ class HistoryAuthSwitchRequest(BaseModel):
 class HistoryAuthHealthCheckRequest(BaseModel):
     profile: str = Field(default="")
     mode: str = Field(default="")
+    prompt: str = Field(default="")
+    timeout_sec: int = Field(default=0, ge=0, le=1800)
+
+
+class AuthProfileUploadRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    provider: str = Field(default="codex")
+    auth_json: Any = Field(default_factory=dict)
+    config_toml: str = Field(default="")
+    assignment_version: int = Field(default=0, ge=0)
+    assignment_token: str = Field(default="")
+    assigned_server_id: str = Field(default="")
+    notes: str = Field(default="")
+
+
+class AuthProfileRemoveRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    assignment_version: int = Field(default=0, ge=0)
+    assignment_token: str = Field(default="")
+    assigned_server_id: str = Field(default="")
+    reason: str = Field(default="")
+
+
+class AuthApiHealthCheckRequest(BaseModel):
+    profile: str = Field(default="")
+    mode: str = Field(default="")
+    prompt: str = Field(default="")
+    timeout_sec: int = Field(default=0, ge=0, le=1800)
+
+
+class AuthControlUploadRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    provider: str = Field(default="codex")
+    auth_json: Any = Field(default_factory=dict)
+    config_toml: str = Field(default="")
+    label: str = Field(default="")
+    notes: str = Field(default="")
+
+
+class AuthControlAssignRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    node_id: str = Field(min_length=1)
+    lease_sec: int = Field(default=AUTH_CONTROL_DEFAULT_LEASE_SEC, ge=60, le=604800)
+    force: bool = Field(default=False)
+    notes: str = Field(default="")
+
+
+class AuthControlRevokeRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    reason: str = Field(default="")
+
+
+class AuthControlHealthCheckRequest(BaseModel):
+    profile: str = Field(default="")
+    node_id: str = Field(default="")
+    mode: str = Field(default="status")
     prompt: str = Field(default="")
     timeout_sec: int = Field(default=0, ge=0, le=1800)
 
@@ -1335,6 +1408,625 @@ def _refresh_auth_profiles() -> List[Dict[str, Any]]:
     return profiles
 
 
+def _sanitize_auth_profile_name(raw: str) -> str:
+    clean = str(raw or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", clean):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid profile, only [A-Za-z0-9._-], max 64 chars, and must start with alnum",
+        )
+    return clean
+
+
+def _normalize_auth_json_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        source = str(payload or "").strip()
+        if not source:
+            raise HTTPException(status_code=400, detail="auth_json is empty")
+        try:
+            parsed = json.loads(source)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"auth_json is not valid json: {exc}") from exc
+        return json.dumps(parsed, ensure_ascii=False, indent=2) + "\n"
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="auth_json must be a JSON object or string")
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def _load_dispatch_fence() -> Dict[str, Any]:
+    if not AUTH_DISPATCH_FENCE_PATH.exists():
+        return {"profiles": {}, "updated_at": 0}
+    try:
+        data = json.loads(AUTH_DISPATCH_FENCE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"profiles": {}, "updated_at": 0}
+    profiles = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    return {"profiles": dict(profiles), "updated_at": int(data.get("updated_at") or 0)}
+
+
+def _save_dispatch_fence(data: Dict[str, Any]) -> None:
+    AUTH_DISPATCH_FENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "profiles": dict((data or {}).get("profiles") or {}),
+        "updated_at": int(time.time()),
+    }
+    AUTH_DISPATCH_FENCE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _apply_dispatch_fence(profile: str, version: int, token: str, server_id: str, state: str) -> None:
+    if version <= 0:
+        return
+    name = _sanitize_auth_profile_name(profile)
+    clean_token = str(token or "").strip()
+    if not clean_token:
+        raise HTTPException(status_code=400, detail="assignment_token is required when assignment_version > 0")
+    with _AUTH_DISPATCH_FENCE_LOCK:
+        store = _load_dispatch_fence()
+        profiles = store.get("profiles") if isinstance(store.get("profiles"), dict) else {}
+        previous = profiles.get(name) if isinstance(profiles.get(name), dict) else {}
+        prev_version = int(previous.get("version") or 0)
+        prev_token = str(previous.get("token") or "").strip()
+        if version < prev_version:
+            raise HTTPException(
+                status_code=409,
+                detail=f"stale assignment_version: {version} < current {prev_version}",
+            )
+        if version == prev_version and prev_token and prev_token != clean_token:
+            raise HTTPException(
+                status_code=409,
+                detail=f"assignment token mismatch for same version={version}",
+            )
+        profiles[name] = {
+            "version": int(version),
+            "token": clean_token,
+            "server_id": str(server_id or "").strip(),
+            "state": str(state or "").strip() or "assigned",
+            "updated_at": int(time.time()),
+        }
+        _save_dispatch_fence({"profiles": profiles})
+
+
+def _install_auth_profile(
+    profile: str,
+    provider: str,
+    auth_json: Any,
+    config_toml: str = "",
+    assignment_version: int = 0,
+    assignment_token: str = "",
+    assigned_server_id: str = "",
+    notes: str = "",
+) -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    _apply_dispatch_fence(
+        profile=name,
+        version=int(assignment_version or 0),
+        token=str(assignment_token or "").strip(),
+        server_id=str(assigned_server_id or "").strip(),
+        state="assigned",
+    )
+    AUTH_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    auth_text = _normalize_auth_json_text(auth_json)
+    src = AUTH_PROFILES_DIR / f"{name}.auth.json"
+    tmp = AUTH_PROFILES_DIR / f".{name}.auth.json.tmp"
+    tmp.write_text(auth_text, encoding="utf-8")
+    tmp.replace(src)
+    cfg_text = str(config_toml or "").strip()
+    cfg = AUTH_PROFILES_DIR / f"{name}.config.toml"
+    if cfg_text:
+        cfg.write_text(cfg_text + ("\n" if not cfg_text.endswith("\n") else ""), encoding="utf-8")
+    elif cfg.exists():
+        cfg.unlink()
+
+    meta = _get_auth_profile(name)
+    if not meta:
+        raise HTTPException(status_code=500, detail=f"profile saved but refresh failed: {name}")
+    patch = {
+        "provider": str(provider or "codex").strip() or "codex",
+        "notes": str(notes or "").strip()[:500],
+    }
+    if int(assignment_version or 0) > 0:
+        patch.update(
+            {
+                "dispatch_server_id": str(assigned_server_id or "").strip(),
+                "dispatch_version": int(assignment_version),
+                "dispatch_token": str(assignment_token or "").strip(),
+                "dispatch_updated_at": int(time.time()),
+            }
+        )
+    _patch_auth_registry_profile(name, patch)
+    refreshed = _get_auth_profile(name) or meta
+    return refreshed
+
+
+def _remove_auth_profile(
+    profile: str,
+    assignment_version: int = 0,
+    assignment_token: str = "",
+    assigned_server_id: str = "",
+    reason: str = "",
+) -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    _apply_dispatch_fence(
+        profile=name,
+        version=int(assignment_version or 0),
+        token=str(assignment_token or "").strip(),
+        server_id=str(assigned_server_id or "").strip(),
+        state="removed",
+    )
+    changed = _remove_auth_profile_artifacts(name)
+    return {
+        "profile": name,
+        "removed": bool(changed),
+        "reason": str(reason or "").strip(),
+        "assignment_version": int(assignment_version or 0),
+        "assigned_server_id": str(assigned_server_id or "").strip(),
+    }
+
+
+def _load_auth_control_registry() -> Dict[str, Any]:
+    if not AUTH_CONTROL_REGISTRY_PATH.exists():
+        return {"auths": {}, "assignments": {}, "audit": [], "updated_at": 0}
+    try:
+        data = json.loads(AUTH_CONTROL_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"auths": {}, "assignments": {}, "audit": [], "updated_at": 0}
+    auths = data.get("auths") if isinstance(data.get("auths"), dict) else {}
+    assignments = data.get("assignments") if isinstance(data.get("assignments"), dict) else {}
+    audit = data.get("audit") if isinstance(data.get("audit"), list) else []
+    return {
+        "auths": dict(auths),
+        "assignments": dict(assignments),
+        "audit": [item for item in audit if isinstance(item, dict)][-AUTH_CONTROL_MAX_AUDIT:],
+        "updated_at": int(data.get("updated_at") or 0),
+    }
+
+
+def _save_auth_control_registry(data: Dict[str, Any]) -> None:
+    AUTH_CONTROL_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "auths": dict((data or {}).get("auths") or {}),
+        "assignments": dict((data or {}).get("assignments") or {}),
+        "audit": [item for item in list((data or {}).get("audit") or []) if isinstance(item, dict)][
+            -AUTH_CONTROL_MAX_AUDIT:
+        ],
+        "updated_at": int(time.time()),
+    }
+    AUTH_CONTROL_REGISTRY_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _audit_auth_control(
+    registry: Dict[str, Any],
+    action: str,
+    profile: str,
+    node_id: str = "",
+    ok: bool = True,
+    message: str = "",
+) -> None:
+    audit = registry.get("audit") if isinstance(registry.get("audit"), list) else []
+    audit.append(
+        {
+            "ts": int(time.time()),
+            "action": str(action or "").strip(),
+            "profile": str(profile or "").strip(),
+            "node_id": str(node_id or "").strip(),
+            "ok": bool(ok),
+            "message": str(message or "").strip()[:2000],
+        }
+    )
+    registry["audit"] = audit[-AUTH_CONTROL_MAX_AUDIT:]
+
+
+def _parse_auth_control_nodes() -> List[Dict[str, Any]]:
+    try:
+        raw = json.loads(AUTH_CONTROL_NODES_JSON)
+    except Exception:
+        raw = []
+    items = raw if isinstance(raw, list) else []
+    nodes: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        node_id = str(item.get("id") or "").strip()
+        base_url = str(item.get("base_url") or "").strip().rstrip("/")
+        if (not node_id) or (not base_url) or node_id in seen:
+            continue
+        nodes.append(
+            {
+                "id": node_id,
+                "label": str(item.get("label") or node_id),
+                "base_url": base_url,
+                "api_token": str(item.get("api_token") or API_TOKEN or "").strip(),
+                "timeout_sec": max(5, min(300, int(item.get("timeout_sec") or 45))),
+                "enabled": bool(item.get("enabled", True)),
+            }
+        )
+        seen.add(node_id)
+    return nodes
+
+
+def _auth_control_nodes_map() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in _parse_auth_control_nodes():
+        if not bool(item.get("enabled")):
+            continue
+        out[str(item.get("id") or "")] = dict(item)
+    return out
+
+
+def _call_node_api(node: Dict[str, Any], method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    base = str(node.get("base_url") or "").rstrip("/")
+    if not base:
+        raise RuntimeError(f"invalid node base_url for node={node.get('id')}")
+    url = f"{base}{API_PREFIX}{path}"
+    headers = {"Accept": "application/json"}
+    token = str(node.get("api_token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    kwargs: Dict[str, Any] = {
+        "method": str(method or "GET").upper(),
+        "url": url,
+        "headers": headers,
+        "timeout": max(5, int(node.get("timeout_sec") or 45)),
+    }
+    if body is not None:
+        kwargs["json"] = body
+    resp = requests.request(**kwargs)
+    text = str(resp.text or "").strip()
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"ok": False, "error": text[:1000] or f"http {resp.status_code}"}
+    if resp.status_code >= 400:
+        detail = str(payload.get("error") or payload.get("detail") or text or f"http {resp.status_code}")
+        raise RuntimeError(f"node={node.get('id')} api={path} failed: {detail}")
+    if not bool(payload.get("ok", True)):
+        raise RuntimeError(f"node={node.get('id')} api={path} failed: {payload.get('error')}")
+    return payload
+
+
+def _merge_auth_control_auth_meta(profile_item: Dict[str, Any], provider: str = "", label: str = "", notes: str = "") -> Dict[str, Any]:
+    profile = str(profile_item.get("profile") or "").strip()
+    source = str(profile_item.get("source_auth_json") or "").strip()
+    sha = ""
+    if source:
+        path = Path(source)
+        if path.exists() and path.is_file():
+            sha = _auth_file_sha1(path)
+    now_ts = int(time.time())
+    return {
+        "profile": profile,
+        "provider": str(provider or profile_item.get("provider") or "codex").strip() or "codex",
+        "label": str(label or profile).strip()[:120],
+        "notes": str(notes or profile_item.get("notes") or "").strip()[:500],
+        "fingerprint": sha,
+        "updated_at": now_ts,
+    }
+
+
+def _auth_control_registry_state() -> Dict[str, Any]:
+    nodes = _parse_auth_control_nodes()
+    profiles = _refresh_auth_profiles()
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        audit = registry.get("audit") if isinstance(registry.get("audit"), list) else []
+    now_ts = int(time.time())
+    merged_auths: List[Dict[str, Any]] = []
+    for item in profiles:
+        profile = str(item.get("profile") or "").strip()
+        if not profile:
+            continue
+        merged = dict(auths.get(profile) if isinstance(auths.get(profile), dict) else {})
+        merged.update(_merge_auth_control_auth_meta(item, provider=str(merged.get("provider") or "")))
+        merged["health"] = {
+            "valid": bool(item.get("valid")),
+            "status": str(item.get("status") or ""),
+            "reason": str(item.get("reason") or ""),
+            "last_health_check_at": int(item.get("last_health_check_at") or 0),
+        }
+        assignment = assignments.get(profile) if isinstance(assignments.get(profile), dict) else {}
+        merged["assignment"] = dict(assignment or {})
+        lease_expire_at = int((assignment or {}).get("lease_expire_at") or 0)
+        merged["lease_remaining_sec"] = max(0, lease_expire_at - now_ts) if lease_expire_at > 0 else 0
+        merged_auths.append(merged)
+    return {
+        "timestamp": now_ts,
+        "nodes": [{k: v for k, v in node.items() if k != "api_token"} for node in nodes],
+        "auths": sorted(merged_auths, key=lambda x: str(x.get("profile") or "")),
+        "audit": [item for item in audit if isinstance(item, dict)][-200:],
+    }
+
+
+def _auth_control_upload(
+    profile: str,
+    provider: str,
+    auth_json: Any,
+    config_toml: str = "",
+    label: str = "",
+    notes: str = "",
+) -> Dict[str, Any]:
+    item = _install_auth_profile(
+        profile=profile,
+        provider=provider,
+        auth_json=auth_json,
+        config_toml=config_toml,
+        assignment_version=0,
+        assignment_token="",
+        assigned_server_id="",
+        notes=notes,
+    )
+    meta = _merge_auth_control_auth_meta(item, provider=provider, label=label, notes=notes)
+    name = str(meta.get("profile") or "")
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        existing = auths.get(name) if isinstance(auths.get(name), dict) else {}
+        created_at = int(existing.get("created_at") or time.time())
+        merged = dict(existing)
+        merged.update(meta)
+        merged["created_at"] = created_at
+        auths[name] = merged
+        registry["auths"] = auths
+        _audit_auth_control(registry, action="upload", profile=name, ok=True, message="profile uploaded/updated")
+        _save_auth_control_registry(registry)
+    return {"profile": name, "meta": meta, "health": item}
+
+
+def _auth_control_assign(
+    profile: str,
+    node_id: str,
+    lease_sec: int,
+    force: bool = False,
+    notes: str = "",
+) -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    target_node = str(node_id or "").strip()
+    if not target_node:
+        raise HTTPException(status_code=400, detail="node_id is required")
+    nodes = _auth_control_nodes_map()
+    target = nodes.get(target_node)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node}")
+    auth_item = _get_auth_profile(name)
+    if not auth_item:
+        raise HTTPException(status_code=404, detail=f"profile not found locally: {name}")
+    if not bool(auth_item.get("valid")):
+        raise HTTPException(status_code=400, detail=f"profile is not healthy locally: {name}")
+    lease = max(60, min(AUTH_CONTROL_MAX_LEASE_SEC, int(lease_sec or AUTH_CONTROL_DEFAULT_LEASE_SEC)))
+
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        current_node = str(current.get("node_id") or "").strip()
+        if current_node and current_node != target_node and (not force):
+            raise HTTPException(
+                status_code=409,
+                detail=f"profile already assigned to {current_node}, set force=true to migrate",
+            )
+        version = int(current.get("version") or 0) + 1
+        token = secrets.token_hex(24)
+
+    if current_node and current_node != target_node:
+        old = nodes.get(current_node)
+        if old:
+            _call_node_api(
+                old,
+                "POST",
+                "/auth/profiles/remove",
+                {
+                    "profile": name,
+                    "assignment_version": version,
+                    "assignment_token": token,
+                    "assigned_server_id": target_node,
+                    "reason": f"migrate_to:{target_node}",
+                },
+            )
+    if force:
+        for nid, node in nodes.items():
+            if nid == target_node:
+                continue
+            try:
+                _call_node_api(
+                    node,
+                    "POST",
+                    "/auth/profiles/remove",
+                    {
+                        "profile": name,
+                        "assignment_version": version,
+                        "assignment_token": token,
+                        "assigned_server_id": target_node,
+                        "reason": "force_deduplicate",
+                    },
+                )
+            except Exception:
+                pass
+
+    source_auth = AUTH_PROFILES_DIR / f"{name}.auth.json"
+    source_cfg = AUTH_PROFILES_DIR / f"{name}.config.toml"
+    if not source_auth.exists():
+        raise HTTPException(status_code=404, detail=f"local auth file missing: {source_auth}")
+    _call_node_api(
+        target,
+        "POST",
+        "/auth/profiles/upload",
+        {
+            "profile": name,
+            "provider": str(auths.get(name, {}).get("provider") if isinstance(auths.get(name), dict) else "codex"),
+            "auth_json": json.loads(source_auth.read_text(encoding="utf-8")),
+            "config_toml": source_cfg.read_text(encoding="utf-8") if source_cfg.exists() else "",
+            "assignment_version": version,
+            "assignment_token": token,
+            "assigned_server_id": target_node,
+            "notes": notes,
+        },
+    )
+
+    now_ts = int(time.time())
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        existing_auth = auths.get(name) if isinstance(auths.get(name), dict) else {}
+        if not existing_auth:
+            existing_auth = _merge_auth_control_auth_meta(auth_item)
+            existing_auth["created_at"] = now_ts
+        existing_auth["updated_at"] = now_ts
+        auths[name] = existing_auth
+        assignments[name] = {
+            "profile": name,
+            "node_id": target_node,
+            "state": "assigned",
+            "version": version,
+            "token": token,
+            "lease_sec": lease,
+            "lease_expire_at": now_ts + lease,
+            "updated_at": now_ts,
+            "last_error": "",
+        }
+        registry["auths"] = auths
+        registry["assignments"] = assignments
+        _audit_auth_control(
+            registry,
+            action="assign",
+            profile=name,
+            node_id=target_node,
+            ok=True,
+            message=f"assigned with lease={lease}s version={version}",
+        )
+        _save_auth_control_registry(registry)
+    return {
+        "profile": name,
+        "node_id": target_node,
+        "version": version,
+        "lease_expire_at": now_ts + lease,
+    }
+
+
+def _auth_control_revoke(profile: str, reason: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    nodes = _auth_control_nodes_map()
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        current_node = str(current.get("node_id") or "").strip()
+        version = int(current.get("version") or 0) + 1
+        token = secrets.token_hex(24)
+    if current_node:
+        node = nodes.get(current_node)
+        if node:
+            _call_node_api(
+                node,
+                "POST",
+                "/auth/profiles/remove",
+                {
+                    "profile": name,
+                    "assignment_version": version,
+                    "assignment_token": token,
+                    "assigned_server_id": current_node,
+                    "reason": str(reason or "manual revoke"),
+                },
+            )
+    now_ts = int(time.time())
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        assignments[name] = {
+            "profile": name,
+            "node_id": "",
+            "state": "unassigned",
+            "version": version,
+            "token": token,
+            "lease_sec": 0,
+            "lease_expire_at": 0,
+            "updated_at": now_ts,
+            "last_error": str(reason or "").strip(),
+        }
+        registry["assignments"] = assignments
+        _audit_auth_control(
+            registry,
+            action="revoke",
+            profile=name,
+            node_id=current_node,
+            ok=True,
+            message=str(reason or "manual revoke"),
+        )
+        _save_auth_control_registry(registry)
+    return {"profile": name, "revoked_from": current_node, "version": version, "updated_at": now_ts}
+
+
+def _auth_control_health_check(profile: str = "", node_id: str = "", mode: str = "status", prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
+    name = str(profile or "").strip()
+    target_node_id = str(node_id or "").strip()
+    clean_mode = str(mode or "status").strip().lower() or "status"
+    nodes = _auth_control_nodes_map()
+    selected: List[Dict[str, Any]] = []
+    for nid, node in nodes.items():
+        if target_node_id and nid != target_node_id:
+            continue
+        selected.append(node)
+    if target_node_id and not selected:
+        raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node_id}")
+    out_nodes: List[Dict[str, Any]] = []
+    now_ts = int(time.time())
+    for node in selected:
+        nid = str(node.get("id") or "")
+        try:
+            if _is_real_turn_health_mode(clean_mode):
+                payload = _call_node_api(
+                    node,
+                    "POST",
+                    "/auth/health-check",
+                    {
+                        "profile": name,
+                        "mode": clean_mode,
+                        "prompt": str(prompt or "").strip(),
+                        "timeout_sec": int(timeout_sec or 0),
+                    },
+                )
+            else:
+                payload = _call_node_api(node, "GET", "/auth/profiles", None)
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+            items = [
+                item
+                for item in profiles
+                if isinstance(item, dict) and ((not name) or str(item.get("profile") or "").strip() == name)
+            ]
+            out_nodes.append({"node_id": nid, "ok": True, "profiles": items, "error": ""})
+        except Exception as exc:
+            out_nodes.append({"node_id": nid, "ok": False, "profiles": [], "error": str(exc)})
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        for item in out_nodes:
+            nid = str(item.get("node_id") or "")
+            if not bool(item.get("ok")):
+                continue
+            for p in list(assignments.values()):
+                if not isinstance(p, dict):
+                    continue
+                if str(p.get("node_id") or "").strip() != nid:
+                    continue
+                p["last_health_check_at"] = now_ts
+                p["last_health_ok"] = True
+        registry["assignments"] = assignments
+        _audit_auth_control(
+            registry,
+            action="health_check",
+            profile=name,
+            node_id=target_node_id,
+            ok=True,
+            message=f"mode={clean_mode}",
+        )
+        _save_auth_control_registry(registry)
+    return {"timestamp": now_ts, "mode": clean_mode, "profile": name, "nodes": out_nodes}
+
+
 def _is_real_turn_health_mode(mode: str) -> bool:
     clean = str(mode or "").strip().lower()
     return clean in {"real", "real_turn", "turn", "conversation", "chat"}
@@ -1872,6 +2564,110 @@ def auth_profiles_list() -> Dict[str, Any]:
             + profiles
         },
     }
+
+
+@ROUTER.post("/auth/profiles/upload", dependencies=[Depends(require_api_token)])
+def auth_profiles_upload(body: AuthProfileUploadRequest) -> Dict[str, Any]:
+    installed = _install_auth_profile(
+        profile=body.profile,
+        provider=body.provider,
+        auth_json=body.auth_json,
+        config_toml=body.config_toml,
+        assignment_version=int(body.assignment_version or 0),
+        assignment_token=str(body.assignment_token or "").strip(),
+        assigned_server_id=str(body.assigned_server_id or "").strip(),
+        notes=body.notes,
+    )
+    return {"ok": True, "data": {"profile": installed}}
+
+
+@ROUTER.post("/auth/profiles/remove", dependencies=[Depends(require_api_token)])
+def auth_profiles_remove(body: AuthProfileRemoveRequest) -> Dict[str, Any]:
+    payload = _remove_auth_profile(
+        profile=body.profile,
+        assignment_version=int(body.assignment_version or 0),
+        assignment_token=str(body.assignment_token or "").strip(),
+        assigned_server_id=str(body.assigned_server_id or "").strip(),
+        reason=body.reason,
+    )
+    return {"ok": True, "data": payload}
+
+
+@ROUTER.post("/auth/health-check", dependencies=[Depends(require_api_token)])
+def auth_profiles_health_check(body: AuthApiHealthCheckRequest) -> Dict[str, Any]:
+    target = str(body.profile or "").strip()
+    mode = str(body.mode or AUTH_HEALTH_CHECK_DEFAULT_MODE).strip().lower() or AUTH_HEALTH_CHECK_DEFAULT_MODE
+    probe_prompt = str(body.prompt or "").strip()
+    probe_timeout = int(body.timeout_sec or 0)
+    if target:
+        item = _get_auth_profile(target)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"profile not found: {target}")
+        profiles = [_health_check_auth_profile_item(item=item, mode=mode, prompt=probe_prompt, timeout_sec=probe_timeout)]
+    else:
+        seed = _refresh_auth_profiles()
+        profiles = [
+            _health_check_auth_profile_item(item=item, mode=mode, prompt=probe_prompt, timeout_sec=probe_timeout)
+            for item in seed
+        ]
+    now_ts = int(time.time())
+    normalized: List[Dict[str, Any]] = []
+    for item in profiles:
+        payload = dict(item)
+        disabled_until = int(payload.get("disabled_until") or 0)
+        payload["label"] = str(payload.get("profile") or "").strip() or "default"
+        payload["available"] = _auth_profile_available(payload, now_ts=now_ts)
+        payload["disabled_remaining_sec"] = max(0, disabled_until - now_ts) if disabled_until > 0 else 0
+        normalized.append(payload)
+    return {"ok": True, "data": {"profiles": normalized, "timestamp": now_ts, "mode": mode}}
+
+
+@ROUTER.get("/auth/control/state", dependencies=[Depends(require_api_token)])
+def auth_control_state() -> Dict[str, Any]:
+    return {"ok": True, "data": _auth_control_registry_state()}
+
+
+@ROUTER.post("/auth/control/upload", dependencies=[Depends(require_api_token)])
+def auth_control_upload(body: AuthControlUploadRequest) -> Dict[str, Any]:
+    data = _auth_control_upload(
+        profile=body.profile,
+        provider=body.provider,
+        auth_json=body.auth_json,
+        config_toml=body.config_toml,
+        label=body.label,
+        notes=body.notes,
+    )
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/assign", dependencies=[Depends(require_api_token)])
+def auth_control_assign(body: AuthControlAssignRequest) -> Dict[str, Any]:
+    data = _auth_control_assign(
+        profile=body.profile,
+        node_id=body.node_id,
+        lease_sec=int(body.lease_sec or AUTH_CONTROL_DEFAULT_LEASE_SEC),
+        force=bool(body.force),
+        notes=body.notes,
+    )
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/revoke", dependencies=[Depends(require_api_token)])
+def auth_control_revoke(body: AuthControlRevokeRequest) -> Dict[str, Any]:
+    data = _auth_control_revoke(profile=body.profile, reason=body.reason)
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/health-check", dependencies=[Depends(require_api_token)])
+def auth_control_health_check(body: AuthControlHealthCheckRequest) -> Dict[str, Any]:
+    data = _auth_control_health_check(
+        profile=body.profile,
+        node_id=body.node_id,
+        mode=body.mode,
+        prompt=body.prompt,
+        timeout_sec=int(body.timeout_sec or 0),
+    )
+    return {"ok": True, "data": data}
 
 
 @ROUTER.post("/chat/{chat_id}/config", dependencies=[Depends(require_api_token)])
@@ -2637,6 +3433,270 @@ def history_auth_switch_api(
             },
         }
     )
+
+
+@APP.get("/history/api/auth/control/state")
+def history_auth_control_state_api(
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    return JSONResponse({"ok": True, "data": _auth_control_registry_state()})
+
+
+@APP.post("/history/api/auth/control/upload")
+def history_auth_control_upload_api(
+    body: AuthControlUploadRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_upload(
+        profile=body.profile,
+        provider=body.provider,
+        auth_json=body.auth_json,
+        config_toml=body.config_toml,
+        label=body.label,
+        notes=body.notes,
+    )
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/assign")
+def history_auth_control_assign_api(
+    body: AuthControlAssignRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_assign(
+        profile=body.profile,
+        node_id=body.node_id,
+        lease_sec=int(body.lease_sec or AUTH_CONTROL_DEFAULT_LEASE_SEC),
+        force=bool(body.force),
+        notes=body.notes,
+    )
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/revoke")
+def history_auth_control_revoke_api(
+    body: AuthControlRevokeRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_revoke(profile=body.profile, reason=body.reason)
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/health-check")
+def history_auth_control_health_check_api(
+    body: AuthControlHealthCheckRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_health_check(
+        profile=body.profile,
+        node_id=body.node_id,
+        mode=body.mode,
+        prompt=body.prompt,
+        timeout_sec=int(body.timeout_sec or 0),
+    )
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.get("/history/auth-control", response_class=HTMLResponse)
+def history_auth_control_page(
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> HTMLResponse:
+    session_payload = _history_cookie_payload(request)
+    if not session_payload:
+        has_api_token = bool(str(token or "").strip() or str(authorization or "").strip())
+        if has_api_token:
+            _check_api_token(token=token, authorization=authorization)
+        else:
+            return RedirectResponse(url="/history/entry?next=/history/auth-control", status_code=302)
+    page_config = json.dumps({"authToken": str(token or "").strip()}, ensure_ascii=False)
+    html_page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Auth 集中管理</title>
+  <style>
+    body {{ margin: 0; font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f7fb; color: #1b2430; }}
+    header {{ padding: 16px 20px; background: #0f1b2a; color: #fff; font-weight: 600; }}
+    main {{ padding: 16px; display: grid; gap: 16px; }}
+    .card {{ background: #fff; border: 1px solid #d9e2ec; border-radius: 10px; padding: 12px; }}
+    .row {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
+    input, select, textarea, button {{ font: inherit; padding: 8px; border-radius: 8px; border: 1px solid #c5d2e0; }}
+    textarea {{ width: 100%; min-height: 120px; }}
+    button {{ background: #1d4ed8; color: #fff; border: 0; cursor: pointer; }}
+    button.alt {{ background: #64748b; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ border-bottom: 1px solid #e5edf5; text-align: left; padding: 8px; vertical-align: top; }}
+    code {{ background: #f2f7ff; padding: 2px 6px; border-radius: 6px; }}
+    #log {{ white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #09111f; color: #d6e2ff; padding: 10px; border-radius: 8px; max-height: 240px; overflow: auto; }}
+  </style>
+</head>
+<body>
+  <header>Auth 集中管理（上传 / 分配 / 巡检）</header>
+  <main>
+    <section class="card">
+      <div class="row">
+        <button onclick="refreshState()">刷新状态</button>
+        <button class="alt" onclick="healthCheck()">一键巡检</button>
+      </div>
+      <div id="summary" style="margin-top:8px;color:#4b5563;"></div>
+    </section>
+    <section class="card">
+      <h3>上传 Auth</h3>
+      <div class="row">
+        <input id="up_profile" placeholder="profile 名称，例如 work_01" style="min-width: 220px;" />
+        <select id="up_provider"><option value="codex">codex</option><option value="openclaw">openclaw</option></select>
+        <input id="up_label" placeholder="label（可选）" style="min-width: 180px;" />
+      </div>
+      <div style="margin-top:8px;"><textarea id="up_auth_json" placeholder='粘贴 auth.json 内容（JSON）'></textarea></div>
+      <div style="margin-top:8px;"><textarea id="up_config_toml" placeholder='config.toml（可选）'></textarea></div>
+      <div class="row" style="margin-top:8px;"><input id="up_notes" placeholder="备注（可选）" style="min-width: 320px;" /><button onclick="uploadAuth()">上传</button></div>
+    </section>
+    <section class="card">
+      <h3>分配 / 回收</h3>
+      <div class="row">
+        <select id="assign_profile"></select>
+        <select id="assign_node"></select>
+        <input id="assign_lease" type="number" min="60" step="60" value="{AUTH_CONTROL_DEFAULT_LEASE_SEC}" />
+        <label><input id="assign_force" type="checkbox" />force 迁移</label>
+        <button onclick="assignAuth()">分配</button>
+        <button class="alt" onclick="revokeAuth()">回收</button>
+      </div>
+    </section>
+    <section class="card">
+      <h3>Auth 列表</h3>
+      <table>
+        <thead><tr><th>Profile</th><th>Provider</th><th>本地健康</th><th>分配状态</th><th>租约</th></tr></thead>
+        <tbody id="auth_rows"></tbody>
+      </table>
+    </section>
+    <section class="card">
+      <h3>节点巡检结果</h3>
+      <div id="node_health"></div>
+    </section>
+    <section class="card"><h3>操作日志</h3><div id="log"></div></section>
+  </main>
+  <script>
+    window.__AUTH_CONTROL_CONFIG__ = {page_config};
+    const cfg = window.__AUTH_CONTROL_CONFIG__ || {{}};
+    const q = cfg.authToken ? `?token=${{encodeURIComponent(cfg.authToken)}}` : '';
+    let latestState = null;
+    function appendLog(msg) {{
+      const el = document.getElementById('log');
+      const ts = new Date().toLocaleString();
+      el.textContent = `[${{ts}}] ${{msg}}\\n` + el.textContent;
+    }}
+    async function api(path, method='GET', body=null) {{
+      const resp = await fetch(path + q, {{
+        method,
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: body ? JSON.stringify(body) : null,
+      }});
+      const data = await resp.json();
+      if (!resp.ok || data.ok === false) throw new Error(data.error || data.detail || resp.statusText);
+      return data.data;
+    }}
+    function renderState(data) {{
+      latestState = data;
+      const auths = Array.isArray(data.auths) ? data.auths : [];
+      const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+      document.getElementById('summary').textContent = `Auth: ${{auths.length}} | Nodes: ${{nodes.length}} | 更新时间: ${{new Date((data.timestamp||0)*1000).toLocaleString()}}`;
+      const tbody = document.getElementById('auth_rows');
+      tbody.innerHTML = '';
+      const pSel = document.getElementById('assign_profile');
+      pSel.innerHTML = '';
+      for (const a of auths) {{
+        const tr = document.createElement('tr');
+        const h = a.health || {{}};
+        const asg = a.assignment || {{}};
+        tr.innerHTML = `<td><code>${{a.profile||''}}</code></td><td>${{a.provider||''}}</td><td>${{h.status||''}} ${{h.valid?'(ok)':'(bad)'}}<br/>${{h.reason||''}}</td><td>${{asg.node_id||'未分配'}}<br/>v${{asg.version||0}}</td><td>${{a.lease_remaining_sec||0}}s</td>`;
+        tbody.appendChild(tr);
+        const op = document.createElement('option');
+        op.value = a.profile || '';
+        op.textContent = a.profile || '';
+        pSel.appendChild(op);
+      }}
+      const nSel = document.getElementById('assign_node');
+      nSel.innerHTML = '';
+      for (const n of nodes) {{
+        const op = document.createElement('option');
+        op.value = n.id || '';
+        op.textContent = `${{n.id||''}} - ${{n.label||''}}`;
+        nSel.appendChild(op);
+      }}
+    }}
+    async function refreshState() {{
+      const data = await api('/history/api/auth/control/state');
+      renderState(data);
+      appendLog('state refreshed');
+    }}
+    async function uploadAuth() {{
+      const profile = document.getElementById('up_profile').value.trim();
+      const provider = document.getElementById('up_provider').value.trim();
+      const label = document.getElementById('up_label').value.trim();
+      const notes = document.getElementById('up_notes').value.trim();
+      const authRaw = document.getElementById('up_auth_json').value.trim();
+      const cfgToml = document.getElementById('up_config_toml').value;
+      if (!profile || !authRaw) throw new Error('profile 和 auth_json 不能为空');
+      let authJson;
+      try {{ authJson = JSON.parse(authRaw); }} catch (e) {{ throw new Error('auth_json 不是合法 JSON'); }}
+      await api('/history/api/auth/control/upload', 'POST', {{ profile, provider, label, notes, auth_json: authJson, config_toml: cfgToml }});
+      appendLog(`upload ok: ${{profile}}`);
+      await refreshState();
+    }}
+    async function assignAuth() {{
+      const profile = document.getElementById('assign_profile').value.trim();
+      const node_id = document.getElementById('assign_node').value.trim();
+      const lease_sec = Number(document.getElementById('assign_lease').value || 0);
+      const force = document.getElementById('assign_force').checked;
+      if (!profile || !node_id) throw new Error('请选择 profile 和 node');
+      await api('/history/api/auth/control/assign', 'POST', {{ profile, node_id, lease_sec, force }});
+      appendLog(`assign ok: ${{profile}} -> ${{node_id}}`);
+      await refreshState();
+    }}
+    async function revokeAuth() {{
+      const profile = document.getElementById('assign_profile').value.trim();
+      if (!profile) throw new Error('请选择 profile');
+      await api('/history/api/auth/control/revoke', 'POST', {{ profile, reason: 'manual' }});
+      appendLog(`revoke ok: ${{profile}}`);
+      await refreshState();
+    }}
+    async function healthCheck() {{
+      const data = await api('/history/api/auth/control/health-check', 'POST', {{ mode: 'status' }});
+      const el = document.getElementById('node_health');
+      el.innerHTML = '';
+      for (const n of (data.nodes||[])) {{
+        const d = document.createElement('div');
+        d.style.padding = '6px 0';
+        d.textContent = `node=${{n.node_id}} ok=${{n.ok}} profiles=${{(n.profiles||[]).length}} error=${{n.error||''}}`;
+        el.appendChild(d);
+      }}
+      appendLog('health check finished');
+    }}
+    (async () => {{
+      try {{ await refreshState(); }} catch (e) {{ appendLog(String(e)); }}
+    }})();
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(html_page)
 
 
 @APP.get("/history", response_class=HTMLResponse)
