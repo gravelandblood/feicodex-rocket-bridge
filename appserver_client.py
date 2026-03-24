@@ -305,6 +305,11 @@ class CodexAppServerClient:
         final_text = ""
 
         while time.time() < deadline:
+            # If app-server exited, fail immediately instead of waiting for queue markers.
+            proc = self.proc
+            if self._closed.is_set() or (proc is not None and proc.poll() is not None):
+                raise AppServerDisconnected("app-server disconnected while waiting for turn completion")
+
             msg = self.next_notification(timeout_sec=1.0)
             if not msg:
                 continue
@@ -313,7 +318,8 @@ class CodexAppServerClient:
             params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
 
             if method == "__bridge/disconnected__":
-                raise AppServerDisconnected("app-server disconnected while waiting for turn completion")
+                # Legacy marker kept for backward compatibility; real disconnect is checked via process liveness above.
+                continue
 
             if str(params.get("threadId") or "") != str(thread_id):
                 continue
@@ -662,7 +668,6 @@ class CodexAppServerClient:
                 waiter.put_nowait(sentinel)
             except Exception:
                 pass
-        self._notifications.put({"method": "__bridge/disconnected__", "params": {}})
 
     def _new_request_id(self) -> str:
         with self._id_lock:
