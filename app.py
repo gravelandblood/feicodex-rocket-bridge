@@ -71,6 +71,13 @@ DISCONNECT_SELF_HEAL_ENABLED = str(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_E
 }
 DISCONNECT_SELF_HEAL_THRESHOLD = max(1, int(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_THRESHOLD", "2")))
 DISCONNECT_SELF_HEAL_WINDOW_SEC = max(30, int(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_WINDOW_SEC", "900")))
+DISCONNECT_SELF_HEAL_REBUILD_ENABLED = str(
+    os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_REBUILD_ENABLED", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+DISCONNECT_SELF_HEAL_FORCE_REBUILD_ON_AUTH_HEADER_ERROR = str(
+    os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_FORCE_REBUILD_ON_AUTH_HEADER_ERROR", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+DISCONNECT_SELF_HEAL_BACKUP_LIMIT = max(1, int(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_BACKUP_LIMIT", "6")))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -669,6 +676,110 @@ def _disconnect_streak_patch(runtime: ChatRuntime) -> Dict[str, Any]:
     }
 
 
+def _error_text(value: Any) -> str:
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value or "")
+
+
+def _runtime_backup_root() -> Path:
+    return RUNTIME_HOMES_DIR / "_self_heal_backups"
+
+
+def _cleanup_runtime_backups(runtime_id: str, limit: int = 0) -> None:
+    keep = max(1, int(limit or DISCONNECT_SELF_HEAL_BACKUP_LIMIT))
+    root = _runtime_backup_root()
+    if not root.exists():
+        return
+    home_name = _runtime_home_name(runtime_id)
+    prefix = f"{home_name}."
+    candidates: List[Path] = []
+    for path in root.iterdir():
+        if path.name.startswith(prefix):
+            candidates.append(path)
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    for stale in candidates[keep:]:
+        try:
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+            else:
+                stale.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _archive_runtime_home(runtime_id: str, reason: str = "") -> str:
+    src = _runtime_home_dir(runtime_id)
+    if not src.exists():
+        return ""
+    root = _runtime_backup_root()
+    root.mkdir(parents=True, exist_ok=True)
+    reason_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", str(reason or "").strip()).strip("._")
+    reason_tag = (reason_tag[:28] if reason_tag else "heal")
+    base_name = f"{src.name}.{time.strftime('%Y%m%d-%H%M%S', time.localtime())}.{reason_tag}"
+    dst = root / base_name
+    index = 1
+    while dst.exists():
+        dst = root / f"{base_name}.{index}"
+        index += 1
+    shutil.move(str(src), str(dst))
+    _cleanup_runtime_backups(runtime_id)
+    return str(dst)
+
+
+def _should_force_runtime_rebuild(persisted: Dict[str, Any]) -> bool:
+    if not DISCONNECT_SELF_HEAL_FORCE_REBUILD_ON_AUTH_HEADER_ERROR:
+        return False
+    last_turn_error_text = _error_text((persisted or {}).get("last_turn_error")).lower()
+    if not last_turn_error_text:
+        return False
+    if "missing bearer or basic authentication in header" in last_turn_error_text:
+        return True
+    if "unexpected status 401 unauthorized" in last_turn_error_text and "/v1/responses" in last_turn_error_text:
+        return True
+    return False
+
+
+def _rebuild_runtime_after_disconnect(runtime: ChatRuntime, reason: str, streak: int, force: bool = False) -> Dict[str, Any]:
+    now_ts = int(time.time())
+    backup_home = ""
+    if DISCONNECT_SELF_HEAL_REBUILD_ENABLED:
+        try:
+            backup_home = _archive_runtime_home(runtime.chat_id, reason=reason)
+        except Exception as exc:
+            LOG.warning("archive runtime home failed chat_id=%s err=%s", runtime.chat_id, exc)
+    runtime.thread_id = ""
+    runtime.active_turn_id = ""
+    try:
+        runtime.client.stop()
+    except Exception:
+        pass
+    _apply_runtime_auth_profile(runtime)
+    _persist_runtime(
+        runtime,
+        {
+            "disconnect_fail_streak": 0,
+            "last_self_heal_at": now_ts,
+            "last_self_heal_reason": reason,
+            "last_self_heal_strategy": "runtime_rebuild",
+            "last_self_heal_backup_home": backup_home,
+            "last_self_heal_force": bool(force),
+            "last_error": "",
+        },
+    )
+    LOG.warning(
+        "disconnect self-heal rebuild chat_id=%s streak=%s force=%s backup=%s",
+        runtime.chat_id,
+        streak,
+        force,
+        backup_home,
+    )
+    return {"healed": True, "streak": streak, "reason": reason, "strategy": "runtime_rebuild", "forced": bool(force)}
+
+
 def _maybe_self_heal_disconnected_runtime(runtime: ChatRuntime) -> Dict[str, Any]:
     if not DISCONNECT_SELF_HEAL_ENABLED:
         return {"healed": False, "streak": 0, "reason": ""}
@@ -679,12 +790,19 @@ def _maybe_self_heal_disconnected_runtime(runtime: ChatRuntime) -> Dict[str, Any
     streak = int(persisted.get("disconnect_fail_streak") or 0)
     last_ts = int(persisted.get("last_disconnect_at") or 0)
     now_ts = int(time.time())
-    if streak < DISCONNECT_SELF_HEAL_THRESHOLD:
+    within_window = last_ts > 0 and (now_ts - last_ts) <= DISCONNECT_SELF_HEAL_WINDOW_SEC
+    force_rebuild = _should_force_runtime_rebuild(persisted)
+    if not force_rebuild and streak < DISCONNECT_SELF_HEAL_THRESHOLD:
         return {"healed": False, "streak": streak, "reason": ""}
-    if last_ts <= 0 or (now_ts - last_ts) > DISCONNECT_SELF_HEAL_WINDOW_SEC:
+    if not force_rebuild and not within_window:
         return {"healed": False, "streak": streak, "reason": ""}
 
-    reason = f"disconnect self-heal (streak={streak})"
+    reason = f"disconnect self-heal (streak={streak}, force={int(bool(force_rebuild))})"
+    if DISCONNECT_SELF_HEAL_REBUILD_ENABLED:
+        try:
+            return _rebuild_runtime_after_disconnect(runtime, reason=reason, streak=streak, force=force_rebuild)
+        except Exception as exc:
+            LOG.warning("disconnect self-heal rebuild failed chat_id=%s err=%s", runtime.chat_id, exc)
     if str(runtime.auth_profile or "").strip():
         _switch_runtime_auth_profile(runtime, profile=str(runtime.auth_profile or "").strip(), reason=reason)
     else:
@@ -701,10 +819,12 @@ def _maybe_self_heal_disconnected_runtime(runtime: ChatRuntime) -> Dict[str, Any
             "disconnect_fail_streak": 0,
             "last_self_heal_at": now_ts,
             "last_self_heal_reason": reason,
+            "last_self_heal_strategy": "auth_reapply",
+            "last_self_heal_force": bool(force_rebuild),
             "last_error": "",
         },
     )
-    return {"healed": True, "streak": streak, "reason": reason}
+    return {"healed": True, "streak": streak, "reason": reason, "strategy": "auth_reapply", "forced": bool(force_rebuild)}
 
 
 def _read_rate_limits(runtime: ChatRuntime, allow_request: bool = True) -> Dict[str, Any]:
