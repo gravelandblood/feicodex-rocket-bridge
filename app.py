@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from appserver_client import AppServerDisconnected, AppServerError, AppServerTimeout, CodexAppServerClient
+from appserver_client import AppServerDisconnected, AppServerError, AppServerTimeout, CodexAppServerClient, TurnRunResult
 from history_store import BridgeHistoryStore
 from state_store import BridgeStateStore
 
@@ -461,8 +462,273 @@ class CodexAgentAdapter:
         return self._client.turn_interrupt(thread_id=thread_id, turn_id=turn_id)
 
 
-class ClaudeAgentAdapter(CodexAgentAdapter):
-    """Temporary adapter: route Claude provider through existing app-server transport."""
+class ClaudeAgentAdapter:
+    def __init__(self) -> None:
+        self.env: Dict[str, str] = {}
+        self._running = False
+        self._lock = threading.Lock()
+        self._threads: Dict[str, Dict[str, Any]] = {}
+        self._thread_status: Dict[str, Dict[str, Any]] = {}
+        self._active_turn_by_thread: Dict[str, str] = {}
+        self._turn_results: Dict[str, TurnRunResult] = {}
+        self._token_usage_by_thread: Dict[str, Dict[str, Any]] = {}
+        self._turn_events_by_thread: Dict[str, List[Dict[str, Any]]] = {}
+        self._turn_preview_by_thread: Dict[str, str] = {}
+        self._turn_started_at_by_thread: Dict[str, float] = {}
+        self._turn_last_event_at_by_thread: Dict[str, float] = {}
+        self._account_rate_limits: Dict[str, Any] = {}
+
+    def _api_key(self) -> str:
+        key = str(self.env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+        if not key:
+            raise AppServerError("claude adapter requires ANTHROPIC_API_KEY")
+        return key
+
+    def _base_url(self) -> str:
+        return str(self.env.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").strip().rstrip("/")
+
+    def _default_model(self) -> str:
+        return str(self.env.get("BRIDGE_CLAUDE_DEFAULT_MODEL") or os.environ.get("BRIDGE_CLAUDE_DEFAULT_MODEL") or "claude-sonnet-4-20250514").strip()
+
+    def _thread(self, thread_id: str) -> Dict[str, Any]:
+        with self._lock:
+            data = self._threads.get(thread_id)
+            if data is None:
+                data = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD}
+                self._threads[thread_id] = data
+            return data
+
+    def start(self, experimental_api: bool = True) -> Dict[str, Any]:
+        self._api_key()
+        self._running = True
+        return {"userAgent": "claude-adapter"}
+
+    def stop(self) -> None:
+        self._running = False
+
+    def is_running(self) -> bool:
+        return bool(self._running)
+
+    def thread_start(self, cwd: str = "", model: str = "", permission_mode: str = "", approval_policy: str = "", profile: str = "") -> Dict[str, Any]:
+        if not self.is_running():
+            self.start()
+        thread_id = str(uuid.uuid4())
+        with self._lock:
+            self._threads[thread_id] = {
+                "messages": [],
+                "model": str(model or self._default_model()).strip() or self._default_model(),
+                "cwd": str(cwd or DEFAULT_CWD),
+            }
+            self._thread_status[thread_id] = {"type": "idle"}
+            self._turn_events_by_thread[thread_id] = []
+            self._turn_preview_by_thread[thread_id] = ""
+            self._token_usage_by_thread[thread_id] = {}
+        return {"thread": {"id": thread_id}}
+
+    def thread_resume(
+        self,
+        thread_id: str,
+        cwd: str = "",
+        model: str = "",
+        permission_mode: str = "",
+        approval_policy: str = "",
+        profile: str = "",
+    ) -> Dict[str, Any]:
+        if not self.is_running():
+            self.start()
+        clean = str(thread_id or "").strip()
+        if not clean:
+            return self.thread_start(cwd=cwd, model=model, permission_mode=permission_mode, approval_policy=approval_policy, profile=profile)
+        with self._lock:
+            if clean not in self._threads:
+                self._threads[clean] = {
+                    "messages": [],
+                    "model": str(model or self._default_model()).strip() or self._default_model(),
+                    "cwd": str(cwd or DEFAULT_CWD),
+                }
+            else:
+                if model:
+                    self._threads[clean]["model"] = str(model).strip()
+                if cwd:
+                    self._threads[clean]["cwd"] = str(cwd).strip()
+            self._thread_status[clean] = {"type": "idle"}
+            self._turn_events_by_thread.setdefault(clean, [])
+            self._turn_preview_by_thread.setdefault(clean, "")
+            self._token_usage_by_thread.setdefault(clean, {})
+        return {"thread": {"id": clean}}
+
+    def _append_event(self, thread_id: str, text: str) -> None:
+        now_ts = time.time()
+        with self._lock:
+            events = self._turn_events_by_thread.setdefault(thread_id, [])
+            events.append({"ts": now_ts, "text": str(text or "")[:500]})
+            if len(events) > 200:
+                del events[:-200]
+            self._turn_last_event_at_by_thread[thread_id] = now_ts
+
+    def _call_anthropic_messages(self, model: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        headers = {
+            "x-api-key": self._api_key(),
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        url = f"{self._base_url()}/v1/messages"
+        payload = {
+            "model": str(model or self._default_model()),
+            "max_tokens": 4096,
+            "messages": messages,
+        }
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.post(url, headers=headers, json=payload, timeout=120)
+        if resp.status_code >= 400:
+            detail = str(resp.text or "").strip()[:1500]
+            raise AppServerError(f"claude messages api failed: http {resp.status_code} {detail}")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise AppServerError(f"claude messages api invalid json: {exc}") from exc
+        if not isinstance(data, dict):
+            raise AppServerError("claude messages api invalid payload")
+        return data
+
+    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not self.is_running():
+            self.start()
+        clean_thread_id = str(thread_id or "").strip()
+        if not clean_thread_id:
+            raise AppServerError("thread_id is required")
+        user_text = str(text or "").strip()
+        turn_id = str(uuid.uuid4())
+        with self._lock:
+            thread = self._threads.get(clean_thread_id)
+            if thread is None:
+                thread = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD}
+                self._threads[clean_thread_id] = thread
+            self._thread_status[clean_thread_id] = {"type": "running"}
+            self._active_turn_by_thread[clean_thread_id] = turn_id
+            self._turn_started_at_by_thread[clean_thread_id] = time.time()
+            self._turn_preview_by_thread[clean_thread_id] = user_text[:200]
+
+        self._append_event(clean_thread_id, f"user: {user_text[:200]}")
+        try:
+            with self._lock:
+                thread = dict(self._threads.get(clean_thread_id) or {"messages": [], "model": self._default_model()})
+                model = str(thread.get("model") or self._default_model())
+                history = list(thread.get("messages") or [])
+            request_messages = history + [{"role": "user", "content": user_text}]
+            result = self._call_anthropic_messages(model=model, messages=request_messages)
+            blocks = result.get("content") if isinstance(result.get("content"), list) else []
+            parts: List[str] = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if str(block.get("type") or "") == "text":
+                    parts.append(str(block.get("text") or ""))
+            assistant_text = "\n".join([p for p in parts if str(p).strip()]).strip()
+            usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+            token_usage = {
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
+                "provider": "claude",
+            }
+            with self._lock:
+                self._threads[clean_thread_id] = {
+                    **dict(self._threads.get(clean_thread_id) or {}),
+                    "messages": request_messages + [{"role": "assistant", "content": assistant_text}],
+                }
+                self._thread_status[clean_thread_id] = {"type": "idle"}
+                self._active_turn_by_thread.pop(clean_thread_id, None)
+                self._token_usage_by_thread[clean_thread_id] = token_usage
+                self._turn_preview_by_thread[clean_thread_id] = assistant_text[:200]
+                self._turn_results[turn_id] = TurnRunResult(
+                    thread_id=clean_thread_id,
+                    turn_id=turn_id,
+                    turn_status="completed",
+                    text=assistant_text,
+                    error=None,
+                )
+            self._append_event(clean_thread_id, f"assistant: {assistant_text[:200]}")
+        except Exception as exc:
+            err = str(exc)[:1500]
+            with self._lock:
+                self._thread_status[clean_thread_id] = {"type": "idle"}
+                self._active_turn_by_thread.pop(clean_thread_id, None)
+                self._turn_results[turn_id] = TurnRunResult(
+                    thread_id=clean_thread_id,
+                    turn_id=turn_id,
+                    turn_status="failed",
+                    text="",
+                    error={"message": err, "provider": "claude"},
+                )
+            self._append_event(clean_thread_id, f"error: {err[:200]}")
+        return {"turn": {"id": turn_id}}
+
+    def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> TurnRunResult:
+        clean_turn = str(turn_id or "").strip()
+        deadline = time.time() + max(1, int(timeout_sec))
+        while time.time() < deadline:
+            with self._lock:
+                done = self._turn_results.get(clean_turn)
+            if done:
+                return done
+            time.sleep(0.05)
+        raise AppServerTimeout(f"claude wait timeout thread={thread_id} turn={turn_id}")
+
+    def get_thread_status(self, thread_id: str) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._thread_status.get(str(thread_id or "").strip()) or {"type": "idle"})
+
+    def get_active_turn_id(self, thread_id: str) -> str:
+        with self._lock:
+            return str(self._active_turn_by_thread.get(str(thread_id or "").strip()) or "")
+
+    def get_thread_token_usage(self, thread_id: str) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._token_usage_by_thread.get(str(thread_id or "").strip()) or {})
+
+    def get_turn_progress(self, thread_id: str) -> Dict[str, Any]:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            started_at = float(self._turn_started_at_by_thread.get(clean) or 0.0)
+            last_event_at = float(self._turn_last_event_at_by_thread.get(clean) or 0.0)
+            preview = str(self._turn_preview_by_thread.get(clean) or "")
+            active_turn = str(self._active_turn_by_thread.get(clean) or "")
+        return {
+            "activeTurnId": active_turn,
+            "startedAt": started_at,
+            "lastEventAt": last_event_at,
+            "preview": preview,
+        }
+
+    def get_account_rate_limits(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._account_rate_limits or {})
+
+    def account_rate_limits_read(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._account_rate_limits or {})
+
+    def get_turn_events(self, thread_id: str, turn_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        clean = str(thread_id or "").strip()
+        cap = max(1, min(200, int(limit or 20)))
+        with self._lock:
+            events = list(self._turn_events_by_thread.get(clean) or [])
+        return events[-cap:]
+
+    def turn_steer(self, thread_id: str, expected_turn_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        return self.turn_start(thread_id=thread_id, text=text, image_paths=image_paths)
+
+    def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
+        clean_thread = str(thread_id or "").strip()
+        with self._lock:
+            active = str(self._active_turn_by_thread.get(clean_thread) or "")
+            if active and (not turn_id or str(turn_id) == active):
+                self._active_turn_by_thread.pop(clean_thread, None)
+                self._thread_status[clean_thread] = {"type": "idle"}
+                return {"ok": True, "interrupted": True, "turn_id": active}
+        return {"ok": True, "interrupted": False, "turn_id": str(turn_id or "")}
 
 
 def _normalize_agent_provider(value: str) -> str:
