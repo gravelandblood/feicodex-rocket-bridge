@@ -166,6 +166,7 @@ class TurnRequest(BaseModel):
     image_paths: list[str] = Field(default_factory=list, description="Optional local image paths")
     cwd: str = Field(default="")
     model: str = Field(default="")
+    agent_provider: str = Field(default="")
     sandbox: str = Field(default="")
     approval_policy: str = Field(default="")
     personality: str = Field(default="")
@@ -182,6 +183,7 @@ class SteerTurnRequest(BaseModel):
 class ResetThreadRequest(BaseModel):
     cwd: str = Field(default="")
     model: str = Field(default="")
+    agent_provider: str = Field(default="")
     sandbox: str = Field(default="")
     approval_policy: str = Field(default="")
     personality: str = Field(default="")
@@ -194,6 +196,7 @@ class InterruptTurnRequest(BaseModel):
 class UpdateChatConfigRequest(BaseModel):
     cwd: str = Field(default="")
     model: str = Field(default="")
+    agent_provider: str = Field(default="")
     sandbox: str = Field(default="")
     approval_policy: str = Field(default="")
     personality: str = Field(default="")
@@ -356,6 +359,9 @@ class AgentAdapter(Protocol):
     def get_thread_token_usage(self, thread_id: str) -> Dict[str, Any]:
         ...
 
+    def get_turn_progress(self, thread_id: str) -> Dict[str, Any]:
+        ...
+
     def get_account_rate_limits(self) -> Dict[str, Any]:
         ...
 
@@ -431,6 +437,9 @@ class CodexAgentAdapter:
     def get_thread_token_usage(self, thread_id: str) -> Dict[str, Any]:
         return self._client.get_thread_token_usage(thread_id=thread_id)
 
+    def get_turn_progress(self, thread_id: str) -> Dict[str, Any]:
+        return self._client.get_turn_progress(thread_id=thread_id)
+
     def get_account_rate_limits(self) -> Dict[str, Any]:
         return self._client.get_account_rate_limits()
 
@@ -452,10 +461,32 @@ class CodexAgentAdapter:
         return self._client.turn_interrupt(thread_id=thread_id, turn_id=turn_id)
 
 
+class ClaudeAgentAdapter(CodexAgentAdapter):
+    """Temporary adapter: route Claude provider through existing app-server transport."""
+
+
+def _normalize_agent_provider(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "codex"
+    aliases = {
+        "codex": "codex",
+        "openai": "codex",
+        "claude": "claude",
+        "claude_code": "claude",
+        "claude-code": "claude",
+        "anthropic": "claude",
+        "openclaw": "claude",
+    }
+    return aliases.get(raw, raw)
+
+
 def _build_agent_adapter(provider: str) -> AgentAdapter:
-    clean = str(provider or "codex").strip().lower() or "codex"
+    clean = _normalize_agent_provider(provider)
     if clean == "codex":
         return CodexAgentAdapter()
+    if clean == "claude":
+        return ClaudeAgentAdapter()
     raise ValueError(f"unsupported agent provider: {clean}")
 
 
@@ -498,7 +529,7 @@ class BridgeRuntimeManager:
                 target_project = _runtime_project_name(clean_chat_id)
                 if legacy and (not target_project or _project_label_for_cwd(legacy_cwd) == target_project):
                     persisted = dict(legacy)
-            provider = str(persisted.get("agent_provider") or "codex").strip().lower() or "codex"
+            provider = _normalize_agent_provider(str(persisted.get("agent_provider") or "codex"))
             try:
                 adapter = _build_agent_adapter(provider)
             except Exception as exc:
@@ -911,6 +942,20 @@ def _build_turn_record(
 def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
     runtime.cwd = str(getattr(body, "cwd", "") or runtime.cwd or DEFAULT_CWD)
     runtime.model = str(getattr(body, "model", "") or runtime.model or DEFAULT_MODEL)
+    requested_provider = str(getattr(body, "agent_provider", "") or "").strip()
+    if requested_provider:
+        normalized_provider = _normalize_agent_provider(requested_provider)
+        current_provider = _normalize_agent_provider(runtime.agent_provider)
+        if normalized_provider != current_provider:
+            next_adapter = _build_agent_adapter(normalized_provider)
+            try:
+                runtime.client.stop()
+            except Exception:
+                pass
+            runtime.client = next_adapter
+            runtime.agent_provider = normalized_provider
+            runtime.thread_id = ""
+            runtime.active_turn_id = ""
     runtime.sandbox = str(getattr(body, "sandbox", "") or runtime.sandbox or DEFAULT_SANDBOX)
     runtime.approval_policy = str(
         getattr(body, "approval_policy", "") or runtime.approval_policy or DEFAULT_APPROVAL
@@ -3589,14 +3634,14 @@ def _provider_for_profile(profile: str) -> str:
         return "codex"
     local = _get_auth_profile(clean)
     if isinstance(local, dict):
-        provider = str(local.get("provider") or "").strip().lower()
+        provider = _normalize_agent_provider(str(local.get("provider") or ""))
         if provider:
             return provider
     try:
         registry = _load_auth_control_registry()
         auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
         item = auths.get(clean) if isinstance(auths.get(clean), dict) else {}
-        provider = str(item.get("provider") or "").strip().lower()
+        provider = _normalize_agent_provider(str(item.get("provider") or ""))
         if provider:
             return provider
     except Exception:
@@ -3727,7 +3772,7 @@ def _apply_auth_error_policy(
 
 
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
-    if str(runtime.agent_provider or "codex").strip().lower() == "codex":
+    if _normalize_agent_provider(runtime.agent_provider) == "codex":
         target_home = _sync_runtime_home(runtime)
         runtime.client.env["CODEX_HOME"] = str(target_home)
     else:
@@ -3752,13 +3797,13 @@ def _switch_runtime_auth_profile(
         raise HTTPException(status_code=400, detail=f"unsupported provider for profile={target}: {target_provider}") from exc
 
     previous = str(runtime.auth_profile or "").strip()
-    previous_provider = str(runtime.agent_provider or "codex").strip().lower() or "codex"
+    previous_provider = _normalize_agent_provider(runtime.agent_provider)
     try:
         runtime.client.stop()
     except Exception:
         pass
     runtime.client = next_adapter
-    runtime.agent_provider = target_provider
+    runtime.agent_provider = _normalize_agent_provider(target_provider)
     runtime.auth_profile = target
     runtime.thread_id = ""
     runtime.active_turn_id = ""
@@ -3976,6 +4021,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
             "turn_events": turn_events,
             "cwd": str(runtime.cwd or persisted.get("cwd") or DEFAULT_CWD),
             "model": str(runtime.model or persisted.get("model") or DEFAULT_MODEL),
+            "agent_provider": _normalize_agent_provider(str(runtime.agent_provider or persisted.get("agent_provider") or "codex")),
             "sandbox": str(runtime.sandbox or persisted.get("sandbox") or DEFAULT_SANDBOX),
             "approval_policy": str(runtime.approval_policy or persisted.get("approval_policy") or DEFAULT_APPROVAL),
             "personality": str(runtime.personality or persisted.get("personality") or DEFAULT_PERSONALITY),
