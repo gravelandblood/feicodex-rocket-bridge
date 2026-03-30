@@ -331,7 +331,14 @@ class AgentAdapter(Protocol):
     def is_running(self) -> bool:
         ...
 
-    def thread_start(self, cwd: str = "", model: str = "", permission_mode: str = "", approval_policy: str = "", profile: str = "") -> Dict[str, Any]:
+    def thread_start(
+        self,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
         ...
 
     def thread_resume(
@@ -339,9 +346,9 @@ class AgentAdapter(Protocol):
         thread_id: str,
         cwd: str = "",
         model: str = "",
-        permission_mode: str = "",
+        sandbox: str = "",
         approval_policy: str = "",
-        profile: str = "",
+        personality: str = "",
     ) -> Dict[str, Any]:
         ...
 
@@ -396,13 +403,20 @@ class CodexAgentAdapter:
     def is_running(self) -> bool:
         return self._client.is_running()
 
-    def thread_start(self, cwd: str = "", model: str = "", permission_mode: str = "", approval_policy: str = "", profile: str = "") -> Dict[str, Any]:
+    def thread_start(
+        self,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
         return self._client.thread_start(
             cwd=cwd,
             model=model,
-            permission_mode=permission_mode,
+            sandbox=sandbox,
             approval_policy=approval_policy,
-            profile=profile,
+            personality=personality,
         )
 
     def thread_resume(
@@ -410,17 +424,16 @@ class CodexAgentAdapter:
         thread_id: str,
         cwd: str = "",
         model: str = "",
-        permission_mode: str = "",
+        sandbox: str = "",
         approval_policy: str = "",
-        profile: str = "",
+        personality: str = "",
     ) -> Dict[str, Any]:
         return self._client.thread_resume(
             thread_id=thread_id,
             cwd=cwd,
             model=model,
-            permission_mode=permission_mode,
+            sandbox=sandbox,
             approval_policy=approval_policy,
-            profile=profile,
         )
 
     def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -463,10 +476,11 @@ class CodexAgentAdapter:
 
 
 class ClaudeAgentAdapter:
-    def __init__(self) -> None:
+    def __init__(self, provider: str = "claude") -> None:
         self.env: Dict[str, str] = {}
         self._running = False
         self._lock = threading.Lock()
+        self._provider = _normalize_agent_provider(provider) or "claude"
         self._threads: Dict[str, Dict[str, Any]] = {}
         self._thread_status: Dict[str, Dict[str, Any]] = {}
         self._active_turn_by_thread: Dict[str, str] = {}
@@ -494,13 +508,18 @@ class ClaudeAgentAdapter:
         with self._lock:
             data = self._threads.get(thread_id)
             if data is None:
-                data = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD}
+                data = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD, "session_id": ""}
                 self._threads[thread_id] = data
             return data
 
     def start(self, experimental_api: bool = True) -> Dict[str, Any]:
-        self._api_key()
+        if self._provider == "claude_code":
+            self._claude_cli_bin()
+        else:
+            self._api_key()
         self._running = True
+        if self._provider == "claude_code":
+            return {"userAgent": "claude-code-adapter"}
         return {"userAgent": "claude-adapter"}
 
     def stop(self) -> None:
@@ -509,7 +528,14 @@ class ClaudeAgentAdapter:
     def is_running(self) -> bool:
         return bool(self._running)
 
-    def thread_start(self, cwd: str = "", model: str = "", permission_mode: str = "", approval_policy: str = "", profile: str = "") -> Dict[str, Any]:
+    def thread_start(
+        self,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
         if not self.is_running():
             self.start()
         thread_id = str(uuid.uuid4())
@@ -518,6 +544,7 @@ class ClaudeAgentAdapter:
                 "messages": [],
                 "model": str(model or self._default_model()).strip() or self._default_model(),
                 "cwd": str(cwd or DEFAULT_CWD),
+                "session_id": "",
             }
             self._thread_status[thread_id] = {"type": "idle"}
             self._turn_events_by_thread[thread_id] = []
@@ -530,27 +557,35 @@ class ClaudeAgentAdapter:
         thread_id: str,
         cwd: str = "",
         model: str = "",
-        permission_mode: str = "",
+        sandbox: str = "",
         approval_policy: str = "",
-        profile: str = "",
+        personality: str = "",
     ) -> Dict[str, Any]:
         if not self.is_running():
             self.start()
         clean = str(thread_id or "").strip()
         if not clean:
-            return self.thread_start(cwd=cwd, model=model, permission_mode=permission_mode, approval_policy=approval_policy, profile=profile)
+            return self.thread_start(
+                cwd=cwd,
+                model=model,
+                sandbox=sandbox,
+                approval_policy=approval_policy,
+                personality=personality,
+            )
         with self._lock:
             if clean not in self._threads:
                 self._threads[clean] = {
                     "messages": [],
                     "model": str(model or self._default_model()).strip() or self._default_model(),
                     "cwd": str(cwd or DEFAULT_CWD),
+                    "session_id": "",
                 }
             else:
                 if model:
                     self._threads[clean]["model"] = str(model).strip()
                 if cwd:
                     self._threads[clean]["cwd"] = str(cwd).strip()
+                self._threads[clean]["session_id"] = str(self._threads[clean].get("session_id") or "").strip()
             self._thread_status[clean] = {"type": "idle"}
             self._turn_events_by_thread.setdefault(clean, [])
             self._turn_preview_by_thread.setdefault(clean, "")
@@ -565,6 +600,97 @@ class ClaudeAgentAdapter:
             if len(events) > 200:
                 del events[:-200]
             self._turn_last_event_at_by_thread[thread_id] = now_ts
+
+    def _claude_cli_bin(self) -> str:
+        configured = str(self.env.get("CLAUDE_CLI_PATH") or os.environ.get("CLAUDE_CLI_PATH") or "claude").strip() or "claude"
+        candidates: List[str] = [configured]
+        if configured == "claude":
+            candidates.extend(
+                [
+                    str(Path.home() / ".local" / "bin" / "claude"),
+                    "/usr/local/bin/claude",
+                    "/usr/bin/claude",
+                ]
+            )
+        for raw in candidates:
+            clean = str(raw or "").strip()
+            if not clean:
+                continue
+            if "/" in clean:
+                candidate = Path(clean).expanduser()
+                if candidate.exists() and candidate.is_file():
+                    return str(candidate)
+            found = shutil.which(clean)
+            if found:
+                return found
+        raise AppServerError("claude_code adapter requires `claude` CLI in PATH")
+
+    def _parse_claude_cli_result(self, stdout_text: str) -> Dict[str, Any]:
+        text = str(stdout_text or "").strip()
+        if not text:
+            raise AppServerError("claude code returned empty output")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and str(payload.get("type") or "") == "result":
+                return payload
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            raise AppServerError(f"claude code output is not valid json: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise AppServerError("claude code output payload is invalid")
+        return payload
+
+    def _run_claude_code(self, cwd: str, model: str, prompt: str, resume_session_id: str = "") -> Dict[str, Any]:
+        cli = self._claude_cli_bin()
+        clean_cwd = str(cwd or DEFAULT_CWD).strip() or DEFAULT_CWD
+        clean_model = str(model or self._default_model()).strip() or self._default_model()
+        clean_prompt = str(prompt or "").strip()
+        cmd: List[str] = [
+            cli,
+            "-p",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "dontAsk",
+            "--add-dir",
+            clean_cwd,
+        ]
+        env = os.environ.copy()
+        for key, value in dict(self.env or {}).items():
+            k = str(key or "").strip()
+            v = str(value or "").strip()
+            if k and v:
+                env[k] = v
+        if str(env.get("ANTHROPIC_API_KEY") or "").strip():
+            # API key mode does not require interactive login.
+            cmd.append("--bare")
+        if clean_model:
+            cmd.extend(["--model", clean_model])
+        if resume_session_id:
+            cmd.extend(["--resume", str(resume_session_id)])
+        cmd.append(clean_prompt)
+        proc = subprocess.run(
+            cmd,
+            cwd=clean_cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=DEFAULT_TURN_TIMEOUT_SEC,
+            check=False,
+        )
+        result = self._parse_claude_cli_result(proc.stdout or "")
+        is_error = bool(result.get("is_error"))
+        if proc.returncode != 0 or is_error:
+            err_text = str(result.get("result") or proc.stderr or proc.stdout or "").strip()
+            raise AppServerError((err_text or "claude code call failed")[:1500])
+        return result
 
     def _call_anthropic_messages(self, model: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         headers = {
@@ -603,7 +729,7 @@ class ClaudeAgentAdapter:
         with self._lock:
             thread = self._threads.get(clean_thread_id)
             if thread is None:
-                thread = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD}
+                thread = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD, "session_id": ""}
                 self._threads[clean_thread_id] = thread
             self._thread_status[clean_thread_id] = {"type": "running"}
             self._active_turn_by_thread[clean_thread_id] = turn_id
@@ -611,32 +737,50 @@ class ClaudeAgentAdapter:
             self._turn_preview_by_thread[clean_thread_id] = user_text[:200]
 
         self._append_event(clean_thread_id, f"user: {user_text[:200]}")
+        provider_tag = "claude_code" if self._provider == "claude_code" else "claude"
         try:
             with self._lock:
                 thread = dict(self._threads.get(clean_thread_id) or {"messages": [], "model": self._default_model()})
                 model = str(thread.get("model") or self._default_model())
+                cwd = str(thread.get("cwd") or self.env.get("BRIDGE_MCP_RUNTIME_CWD") or DEFAULT_CWD)
+                session_id = str(thread.get("session_id") or "")
                 history = list(thread.get("messages") or [])
+            returned_session_id = session_id
             request_messages = history + [{"role": "user", "content": user_text}]
-            result = self._call_anthropic_messages(model=model, messages=request_messages)
-            blocks = result.get("content") if isinstance(result.get("content"), list) else []
-            parts: List[str] = []
-            for block in blocks:
-                if not isinstance(block, dict):
-                    continue
-                if str(block.get("type") or "") == "text":
-                    parts.append(str(block.get("text") or ""))
-            assistant_text = "\n".join([p for p in parts if str(p).strip()]).strip()
-            usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-            token_usage = {
-                "input_tokens": int(usage.get("input_tokens") or 0),
-                "output_tokens": int(usage.get("output_tokens") or 0),
-                "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
-                "provider": "claude",
-            }
+            if self._provider == "claude_code":
+                result = self._run_claude_code(cwd=cwd, model=model, prompt=user_text, resume_session_id=session_id)
+                assistant_text = str(result.get("result") or "").strip()
+                returned_session_id = str(result.get("session_id") or session_id or "")
+                usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+                token_usage = {
+                    "input_tokens": int(usage.get("input_tokens") or 0),
+                    "output_tokens": int(usage.get("output_tokens") or 0),
+                    "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
+                    "provider": "claude_code",
+                }
+                provider_tag = "claude_code"
+            else:
+                result = self._call_anthropic_messages(model=model, messages=request_messages)
+                blocks = result.get("content") if isinstance(result.get("content"), list) else []
+                parts: List[str] = []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    if str(block.get("type") or "") == "text":
+                        parts.append(str(block.get("text") or ""))
+                assistant_text = "\n".join([p for p in parts if str(p).strip()]).strip()
+                usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+                token_usage = {
+                    "input_tokens": int(usage.get("input_tokens") or 0),
+                    "output_tokens": int(usage.get("output_tokens") or 0),
+                    "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
+                    "provider": "claude",
+                }
             with self._lock:
                 self._threads[clean_thread_id] = {
                     **dict(self._threads.get(clean_thread_id) or {}),
                     "messages": request_messages + [{"role": "assistant", "content": assistant_text}],
+                    "session_id": returned_session_id,
                 }
                 self._thread_status[clean_thread_id] = {"type": "idle"}
                 self._active_turn_by_thread.pop(clean_thread_id, None)
@@ -660,7 +804,7 @@ class ClaudeAgentAdapter:
                     turn_id=turn_id,
                     turn_status="failed",
                     text="",
-                    error={"message": err, "provider": "claude"},
+                    error={"message": err, "provider": provider_tag},
                 )
             self._append_event(clean_thread_id, f"error: {err[:200]}")
         return {"turn": {"id": turn_id}}
@@ -735,14 +879,15 @@ def _normalize_agent_provider(value: str) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
         return "codex"
+    raw = raw.replace(" ", "_")
     aliases = {
         "codex": "codex",
         "openai": "codex",
         "claude": "claude",
-        "claude_code": "claude",
-        "claude-code": "claude",
+        "claude_code": "claude_code",
+        "claude-code": "claude_code",
         "anthropic": "claude",
-        "openclaw": "claude",
+        "openclaw": "openclaw",
     }
     return aliases.get(raw, raw)
 
@@ -751,8 +896,8 @@ def _build_agent_adapter(provider: str) -> AgentAdapter:
     clean = _normalize_agent_provider(provider)
     if clean == "codex":
         return CodexAgentAdapter()
-    if clean == "claude":
-        return ClaudeAgentAdapter()
+    if clean in {"claude", "claude_code", "openclaw"}:
+        return ClaudeAgentAdapter(provider=clean)
     raise ValueError(f"unsupported agent provider: {clean}")
 
 
@@ -816,6 +961,7 @@ class BridgeRuntimeManager:
                 last_input_at=int(persisted.get("last_input_at") or persisted.get("updated_at") or 0),
                 client=adapter,
             )
+            _sync_runtime_model_from_profile(runtime, force=False)
             _apply_runtime_auth_profile(runtime)
             self._runtimes[clean_chat_id] = runtime
             return runtime
@@ -1207,8 +1353,10 @@ def _build_turn_record(
 
 def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
     runtime.cwd = str(getattr(body, "cwd", "") or runtime.cwd or DEFAULT_CWD)
-    runtime.model = str(getattr(body, "model", "") or runtime.model or DEFAULT_MODEL)
+    requested_model = str(getattr(body, "model", "") or "").strip()
+    runtime.model = str(requested_model or runtime.model or DEFAULT_MODEL)
     requested_provider = str(getattr(body, "agent_provider", "") or "").strip()
+    provider_changed = False
     if requested_provider:
         normalized_provider = _normalize_agent_provider(requested_provider)
         current_provider = _normalize_agent_provider(runtime.agent_provider)
@@ -1222,6 +1370,9 @@ def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
             runtime.agent_provider = normalized_provider
             runtime.thread_id = ""
             runtime.active_turn_id = ""
+            provider_changed = True
+    if not requested_model:
+        _sync_runtime_model_from_profile(runtime, force=provider_changed)
     runtime.sandbox = str(getattr(body, "sandbox", "") or runtime.sandbox or DEFAULT_SANDBOX)
     runtime.approval_policy = str(
         getattr(body, "approval_policy", "") or runtime.approval_policy or DEFAULT_APPROVAL
@@ -1908,6 +2059,7 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
         "profile": profile,
         "source_auth_json": str(source),
         "source_config_toml": str(previous_meta.get("source_config_toml") or "").strip(),
+        "provider": _normalize_agent_provider(str(previous_meta.get("provider") or "codex")),
         "valid": False,
         "reason": "",
         "auth_mode": str(previous_meta.get("auth_mode") or "").strip(),
@@ -1957,14 +2109,50 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
         meta["last_health_error"] = meta["reason"]
         return meta
 
-    auth_mode = str(data.get("auth_mode") or "").strip()
-    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
-    payload = _decode_jwt_payload(str(tokens.get("id_token") or ""))
-    meta["auth_mode"] = auth_mode
-    meta["email"] = str(payload.get("email") or "").strip()
-    meta["sub"] = str(payload.get("sub") or "").strip()
+    provider = _infer_provider_from_auth_payload(data if isinstance(data, dict) else {}, fallback=str(meta.get("provider") or "codex"))
+    meta["provider"] = provider
+    ident = _auth_identity_from_auth_json(data if isinstance(data, dict) else {})
+    meta["email"] = str(ident.get("email") or "").strip()
+    meta["sub"] = str(ident.get("sub") or "").strip()
+    if provider == "codex":
+        auth_mode = str(data.get("auth_mode") or "").strip()
+        meta["auth_mode"] = auth_mode
 
-    if not auth_mode or not isinstance(tokens, dict):
+    cfg = source.with_name(f"{profile}.config.toml")
+    if cfg.exists() and cfg.is_file():
+        meta["source_config_toml"] = str(cfg)
+
+    disabled_until = int(meta.get("disabled_until") or 0)
+    if provider != "codex":
+        claude_env = _extract_claude_profile_env(data if isinstance(data, dict) else {})
+        if not claude_env.get("ANTHROPIC_API_KEY"):
+            meta["status"] = "invalid"
+            meta["reason"] = "missing ANTHROPIC_API_KEY/api_key"
+            meta["last_health_check_at"] = now_ts
+            meta["last_health_error"] = meta["reason"]
+            return meta
+        meta["last_health_check_at"] = now_ts
+        if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
+            meta["valid"] = False
+            meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
+            meta["last_health_error"] = meta["reason"]
+        elif bool(meta.get("check_required")):
+            meta["valid"] = False
+            meta["status"] = "unchecked"
+            meta["reason"] = "未检测"
+            meta["last_health_error"] = ""
+        else:
+            meta["valid"] = True
+            meta["reason"] = ""
+            meta["status"] = "active"
+            meta["disabled_until"] = 0
+            meta["disabled_reason"] = ""
+            meta["needs_reauth"] = False
+            meta["risk_deactivated"] = False
+            meta["last_health_error"] = ""
+        return meta
+
+    if not _is_codex_auth_payload(data if isinstance(data, dict) else {}):
         meta["status"] = "invalid"
         meta["reason"] = "missing auth_mode/tokens"
         meta["last_health_check_at"] = now_ts
@@ -1975,11 +2163,8 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
     home_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, home_dir / "auth.json")
     _ensure_bridge_mcp_server_installed(home_dir)
-
-    cfg = source.with_name(f"{profile}.config.toml")
     if cfg.exists() and cfg.is_file():
         shutil.copy2(cfg, home_dir / "config.toml")
-        meta["source_config_toml"] = str(cfg)
 
     env = os.environ.copy()
     env["CODEX_HOME"] = str(home_dir)
@@ -2002,7 +2187,6 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
     meta["last_health_check_at"] = now_ts
     if proc.returncode == 0 and "Logged in" in output:
-        disabled_until = int(meta.get("disabled_until") or 0)
         if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
@@ -2081,6 +2265,70 @@ def _normalize_auth_json_text(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
+def _extract_claude_profile_env(payload: Dict[str, Any]) -> Dict[str, str]:
+    data = payload if isinstance(payload, dict) else {}
+    env_node = data.get("env") if isinstance(data.get("env"), dict) else {}
+    anthropic_node = data.get("anthropic") if isinstance(data.get("anthropic"), dict) else {}
+
+    def _pick(*keys: str) -> str:
+        for key in keys:
+            value = ""
+            if isinstance(data.get(key), str):
+                value = str(data.get(key) or "").strip()
+            if (not value) and isinstance(env_node.get(key), str):
+                value = str(env_node.get(key) or "").strip()
+            if (not value) and isinstance(anthropic_node.get(key), str):
+                value = str(anthropic_node.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    api_key = _pick("ANTHROPIC_API_KEY", "anthropic_api_key", "api_key")
+    base_url = _pick("ANTHROPIC_BASE_URL", "anthropic_base_url", "base_url")
+    model = _pick("BRIDGE_CLAUDE_DEFAULT_MODEL", "default_model", "model")
+    out: Dict[str, str] = {}
+    if api_key:
+        out["ANTHROPIC_API_KEY"] = api_key
+    if base_url:
+        out["ANTHROPIC_BASE_URL"] = base_url.rstrip("/")
+    if model:
+        out["BRIDGE_CLAUDE_DEFAULT_MODEL"] = model
+    return out
+
+
+def _is_codex_auth_payload(payload: Dict[str, Any]) -> bool:
+    data = payload if isinstance(payload, dict) else {}
+    auth_mode = str(data.get("auth_mode") or "").strip()
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    return bool(auth_mode and isinstance(tokens, dict))
+
+
+def _infer_provider_from_auth_payload(payload: Dict[str, Any], fallback: str = "codex") -> str:
+    fallback_provider = _normalize_agent_provider(fallback)
+    if _is_codex_auth_payload(payload):
+        return "codex"
+    claude_env = _extract_claude_profile_env(payload)
+    if claude_env.get("ANTHROPIC_API_KEY"):
+        if fallback_provider in {"claude", "claude_code", "openclaw"}:
+            return fallback_provider
+        return "claude_code"
+    return fallback_provider or "codex"
+
+
+def _load_profile_auth_json(profile: str) -> Dict[str, Any]:
+    clean = str(profile or "").strip()
+    if not clean:
+        return {}
+    path = AUTH_PROFILES_DIR / f"{clean}.auth.json"
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _pending_auth_paths(profile: str) -> tuple[Path, Path]:
     name = _sanitize_auth_profile_name(profile)
     AUTH_PENDING_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -2142,9 +2390,21 @@ def _auth_identity_from_auth_json(payload: Dict[str, Any]) -> Dict[str, str]:
     tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
     token = str(tokens.get("id_token") or "").strip()
     jwt = _decode_jwt_payload(token)
+    account = data.get("account") if isinstance(data.get("account"), dict) else {}
+    email = (
+        str(jwt.get("email") or "").strip()
+        or str(data.get("email") or "").strip()
+        or str(account.get("email") or "").strip()
+    )
+    sub = (
+        str(jwt.get("sub") or "").strip()
+        or str(data.get("sub") or "").strip()
+        or str(data.get("account_id") or "").strip()
+        or str(account.get("id") or "").strip()
+    )
     return {
-        "email": str(jwt.get("email") or "").strip(),
-        "sub": str(jwt.get("sub") or "").strip(),
+        "email": email,
+        "sub": sub,
     }
 
 
@@ -2155,6 +2415,7 @@ def _pending_profile_item_from_file(path: Path) -> Dict[str, Any]:
         "profile": profile,
         "email": "",
         "sub": "",
+        "provider": "codex",
         "source_auth_json": str(path),
         "source_config_toml": str(cfg) if cfg.exists() and cfg.is_file() else "",
         "valid": False,
@@ -2175,14 +2436,22 @@ def _pending_profile_item_from_file(path: Path) -> Dict[str, Any]:
     ident = _auth_identity_from_auth_json(parsed)
     item["email"] = str(ident.get("email") or "")
     item["sub"] = str(ident.get("sub") or "")
-    auth_mode = str(parsed.get("auth_mode") or "").strip()
-    tokens = parsed.get("tokens") if isinstance(parsed.get("tokens"), dict) else {}
-    if auth_mode and isinstance(tokens, dict):
-        item["valid"] = True
-        item["status"] = "pending"
+    provider = _infer_provider_from_auth_payload(parsed, fallback="codex")
+    item["provider"] = provider
+    if provider == "codex":
+        if _is_codex_auth_payload(parsed):
+            item["valid"] = True
+            item["status"] = "pending"
+        else:
+            item["status"] = "invalid"
+            item["reason"] = "missing auth_mode/tokens"
     else:
-        item["status"] = "invalid"
-        item["reason"] = "missing auth_mode/tokens"
+        if _extract_claude_profile_env(parsed).get("ANTHROPIC_API_KEY"):
+            item["valid"] = True
+            item["status"] = "pending"
+        else:
+            item["status"] = "invalid"
+            item["reason"] = "missing ANTHROPIC_API_KEY/api_key"
     return item
 
 
@@ -2332,7 +2601,7 @@ def _mark_auth_profile_unchecked(profile: str, reason: str = "未检测") -> Non
 
 
 def _auth_control_batch_upload(provider: str, items: List[AuthControlBatchUploadItem], notes: str = "") -> Dict[str, Any]:
-    clean_provider = str(provider or "codex").strip() or "codex"
+    clean_provider = _normalize_agent_provider(provider)
     uploads = [item for item in list(items or []) if isinstance(item, AuthControlBatchUploadItem)]
     if not uploads:
         raise HTTPException(status_code=400, detail="items is empty")
@@ -2492,7 +2761,7 @@ def _install_auth_profile(
     if not meta:
         raise HTTPException(status_code=500, detail=f"profile saved but refresh failed: {name}")
     patch = {
-        "provider": str(provider or "codex").strip() or "codex",
+        "provider": _normalize_agent_provider(provider),
         "notes": str(notes or "").strip()[:500],
     }
     if int(assignment_version or 0) > 0:
@@ -2684,7 +2953,7 @@ def _merge_auth_control_auth_meta(profile_item: Dict[str, Any], provider: str = 
     now_ts = int(time.time())
     return {
         "profile": profile,
-        "provider": str(provider or profile_item.get("provider") or "codex").strip() or "codex",
+        "provider": _normalize_agent_provider(str(provider or profile_item.get("provider") or "codex")),
         "label": str(label or profile).strip()[:120],
         "notes": str(notes or profile_item.get("notes") or "").strip()[:500],
         "fingerprint": sha,
@@ -2864,7 +3133,7 @@ def _auth_control_registry_state() -> Dict[str, Any]:
             )
         merged["profile"] = profile
         merged["label"] = str(merged.get("label") or profile).strip()[:120]
-        merged["provider"] = str(merged.get("provider") or "codex").strip() or "codex"
+        merged["provider"] = _normalize_agent_provider(str(merged.get("provider") or "codex"))
         merged["notes"] = str(merged.get("notes") or "").strip()[:500]
         merged["email"] = str((local_item or {}).get("email") or merged.get("email") or "").strip()
         merged["pool"] = {
@@ -3026,7 +3295,7 @@ def _auth_control_assign(
         version = int(current.get("version") or 0) + 1
         token = secrets.token_hex(24)
         existing_auth = auths.get(name) if isinstance(auths.get(name), dict) else {}
-        provider = str(existing_auth.get("provider") or "codex").strip() or "codex"
+        provider = _normalize_agent_provider(str(existing_auth.get("provider") or "codex"))
         merged_notes = str(notes or existing_auth.get("notes") or "").strip()[:500]
 
     if current_node and current_node != target_node:
@@ -3616,6 +3885,10 @@ def _is_real_turn_health_mode(mode: str) -> bool:
 
 def _quick_quota_probe_auth_profile(profile: str) -> Dict[str, Any]:
     clean = str(profile or "").strip()
+    provider = _provider_for_profile(clean)
+    if provider in {"claude", "claude_code", "openclaw"}:
+        # Claude-like providers do not expose Codex-style quota APIs; use a lightweight real-turn probe.
+        return _real_turn_probe_auth_profile(profile=clean, prompt="只回复OK", timeout_sec=min(45, AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC))
     runtime_id = f"diag_auth_quick_{clean or 'default'}_{int(time.time() * 1000)}"
     runtime = RUNTIMES.get(runtime_id)
     done_error = ""
@@ -4037,12 +4310,76 @@ def _apply_auth_error_policy(
     return {"classification": classification, "switch": switched, "note": note, "deleted": deleted}
 
 
+def _claude_runtime_env_for_profile(profile: str) -> Dict[str, str]:
+    payload = _load_profile_auth_json(profile)
+    return _extract_claude_profile_env(payload if isinstance(payload, dict) else {})
+
+
+def _profile_default_model(profile: str, provider: str) -> str:
+    clean_provider = _normalize_agent_provider(provider)
+    if clean_provider in {"claude", "claude_code", "openclaw"}:
+        return str(_claude_runtime_env_for_profile(profile).get("BRIDGE_CLAUDE_DEFAULT_MODEL") or "").strip()
+    return ""
+
+
+def _looks_like_codex_or_openai_model(model: str) -> bool:
+    clean = str(model or "").strip().lower()
+    if not clean:
+        return True
+    if clean == str(DEFAULT_MODEL or "").strip().lower():
+        return True
+    if "codex" in clean:
+        return True
+    if clean.startswith("gpt-"):
+        return True
+    return False
+
+
+def _looks_like_claude_model(model: str) -> bool:
+    clean = str(model or "").strip().lower()
+    if not clean:
+        return False
+    if clean.startswith("claude"):
+        return True
+    if clean.startswith("anthropic/claude"):
+        return True
+    if any(token in clean for token in ("sonnet", "haiku", "opus")):
+        return True
+    return False
+
+
+def _sync_runtime_model_from_profile(runtime: ChatRuntime, force: bool = False) -> None:
+    provider = _normalize_agent_provider(runtime.agent_provider)
+    if provider == "codex":
+        if force or _looks_like_claude_model(runtime.model):
+            runtime.model = str(DEFAULT_MODEL or "").strip() or "gpt-5.3-codex"
+        return
+    if provider not in {"claude", "claude_code", "openclaw"}:
+        return
+    profile_model = _profile_default_model(runtime.auth_profile, provider)
+    if not profile_model:
+        profile_model = str(runtime.client.env.get("BRIDGE_CLAUDE_DEFAULT_MODEL") or os.environ.get("BRIDGE_CLAUDE_DEFAULT_MODEL") or "").strip()
+    if not profile_model:
+        profile_model = "claude-sonnet-4-20250514"
+    if force or _looks_like_codex_or_openai_model(runtime.model):
+        runtime.model = profile_model
+
+
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
-    if _normalize_agent_provider(runtime.agent_provider) == "codex":
+    provider = _normalize_agent_provider(runtime.agent_provider)
+    runtime.client.env.pop("CODEX_HOME", None)
+    runtime.client.env.pop("ANTHROPIC_API_KEY", None)
+    runtime.client.env.pop("ANTHROPIC_BASE_URL", None)
+    runtime.client.env.pop("BRIDGE_CLAUDE_DEFAULT_MODEL", None)
+    if provider == "codex":
         target_home = _sync_runtime_home(runtime)
         runtime.client.env["CODEX_HOME"] = str(target_home)
-    else:
-        runtime.client.env.pop("CODEX_HOME", None)
+    elif provider in {"claude", "claude_code", "openclaw"}:
+        claude_env = _claude_runtime_env_for_profile(runtime.auth_profile)
+        for key, value in claude_env.items():
+            clean = str(value or "").strip()
+            if clean:
+                runtime.client.env[key] = clean
     _apply_runtime_bridge_env(runtime)
 
 
@@ -4071,6 +4408,7 @@ def _switch_runtime_auth_profile(
     runtime.client = next_adapter
     runtime.agent_provider = _normalize_agent_provider(target_provider)
     runtime.auth_profile = target
+    _sync_runtime_model_from_profile(runtime, force=True)
     runtime.thread_id = ""
     runtime.active_turn_id = ""
     _apply_runtime_auth_profile(runtime)
@@ -4089,6 +4427,15 @@ def _switch_runtime_auth_profile(
             "last_auto_auth_switch_provider_from": previous_provider,
             "last_auto_auth_switch_provider_to": target_provider,
         },
+    )
+    LOG.info(
+        "runtime auth switched chat_id=%s from_profile=%s to_profile=%s provider=%s model=%s reason=%s",
+        runtime.chat_id,
+        previous or "default",
+        target or "default",
+        _normalize_agent_provider(target_provider),
+        str(runtime.model or ""),
+        str(reason or ""),
     )
     return {
         "from": previous,
@@ -5479,7 +5826,26 @@ def history_auth_control_page(
     .board-col.over {{ border-color: #1d4ed8; background: #eef4ff; }}
     .board-col h4 {{ margin: 0; padding: 10px; border-bottom: 1px solid #e6edf7; font-size: 14px; }}
     .board-body {{ padding: 8px; display: grid; gap: 8px; }}
-    .auth-item {{ border: 1px solid #d7e3f2; border-radius: 8px; padding: 8px; background: #fff; cursor: grab; }}
+    .auth-item {{ position: relative; overflow: hidden; border: 1px solid #d7e3f2; border-radius: 8px; padding: 8px; background: #fff; cursor: grab; }}
+    .provider-ribbon {{
+      position: absolute;
+      top: 8px;
+      right: -34px;
+      width: 120px;
+      transform: rotate(38deg);
+      transform-origin: center;
+      text-align: center;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+      line-height: 18px;
+      color: #fff;
+      pointer-events: none;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.28);
+    }}
+    .provider-ribbon-codex {{ background: linear-gradient(90deg, #2563eb, #1d4ed8); }}
+    .provider-ribbon-claude {{ background: linear-gradient(90deg, #ea580c, #c2410c); }}
+    .provider-ribbon-other {{ background: linear-gradient(90deg, #475569, #334155); }}
     .auth-head {{ display: flex; justify-content: space-between; gap: 6px; align-items: center; }}
     .tag-dup {{ font-size: 10px; border-radius: 999px; padding: 2px 6px; background: #fff1f2; color: #b91c1c; border: 1px solid #fecdd3; }}
     .status-pill {{ display: inline-block; font-size: 10px; border-radius: 999px; padding: 2px 6px; margin-top: 4px; }}
@@ -5506,7 +5872,7 @@ def history_auth_control_page(
       <div class="row">
         <button onclick="refreshState()">刷新状态</button>
         <select id="hc_mode">
-          <option value="status">快检：刷新额度（不跑完整对话）</option>
+          <option value="status">快检：Codex 刷额度 / Claude 轻量对话</option>
           <option value="real">慢检：真实对话可用性（更慢）</option>
         </select>
         <button id="btn_health_check" onclick="healthCheck()">一键巡检</button>
@@ -5521,11 +5887,26 @@ def history_auth_control_page(
         拖拽多个 auth.json 到这里，或 <input id="upload_files" type="file" multiple accept=".json,.auth.json" />
       </div>
       <div class="row" style="margin-top:8px;">
-        <select id="upload_provider"><option value="codex">codex</option><option value="openclaw">openclaw</option></select>
+        <select id="upload_provider"><option value="codex">codex</option><option value="openclaw">openclaw</option><option value="claude_code">claude code</option></select>
         <input id="upload_notes" placeholder="备注（可选）" style="min-width: 220px;" />
         <button onclick="uploadSelectedFiles()">上传到池中</button>
       </div>
       <div id="upload_selected" class="muted" style="margin-top:8px;">尚未选择文件</div>
+    </section>
+
+    <section class="card">
+      <h3>手工新增 Claude Code 账号</h3>
+      <div class="row">
+        <input id="cc_profile" placeholder="profile（必填，例如 claude_team_a）" style="min-width: 240px;" />
+        <input id="cc_api_key" type="password" placeholder="ANTHROPIC_API_KEY（必填）" style="min-width: 320px;" />
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input id="cc_base_url" placeholder="ANTHROPIC_BASE_URL（可选）" style="min-width: 320px;" />
+        <input id="cc_model" placeholder="默认模型（可选）" style="min-width: 220px;" />
+        <input id="cc_notes" placeholder="备注（可选）" style="min-width: 220px;" />
+        <button onclick="uploadClaudeCodeProfile()">保存到池中</button>
+      </div>
+      <div class="muted" style="margin-top:8px;">不需要填写 email，按 profile 管理与切换。</div>
     </section>
 
     <section class="card">
@@ -5869,7 +6250,19 @@ def history_auth_control_page(
           const op = opState[String(a.profile || '')] || null;
           const opHtml = op ? `<div class="status-pill status-${{op.kind||'running'}}">${{op.text||''}}</div>` : '';
           const quota = quotaText(quotaForEnv(a, colId));
+          const provider = String(a.provider || 'codex').trim().toLowerCase();
+          let providerLabel = 'OTHER';
+          let providerTone = 'provider-ribbon-other';
+          if (provider === 'codex') {{
+            providerLabel = 'CODEX';
+            providerTone = 'provider-ribbon-codex';
+          }} else if (provider === 'claude_code' || provider === 'claude-code' || provider === 'claude') {{
+            providerLabel = 'CLAUDE CODE';
+            providerTone = 'provider-ribbon-claude';
+          }}
+          const providerRibbon = `<div class="provider-ribbon ${{providerTone}}">${{providerLabel}}</div>`;
           item.innerHTML =
+            providerRibbon +
             `<div class="auth-head"><code>${{a.profile||''}}</code>${{dup}}</div>` +
             `<div class="muted">${{email||'无邮箱信息'}}</div>` +
             `<div class="muted">状态：${{statusText}}</div>` +
@@ -5996,6 +6389,32 @@ def history_auth_control_page(
       selectedFiles = [];
       document.getElementById('upload_files').value = '';
       document.getElementById('upload_selected').textContent = '尚未选择文件';
+      await refreshState();
+    }}
+
+    async function uploadClaudeCodeProfile() {{
+      const profile = String(document.getElementById('cc_profile')?.value || '').trim();
+      const apiKey = String(document.getElementById('cc_api_key')?.value || '').trim();
+      const baseUrl = String(document.getElementById('cc_base_url')?.value || '').trim();
+      const model = String(document.getElementById('cc_model')?.value || '').trim();
+      const notes = String(document.getElementById('cc_notes')?.value || '').trim();
+      if (!profile) throw new Error('profile 不能为空');
+      if (!apiKey) throw new Error('ANTHROPIC_API_KEY 不能为空');
+      const authJson = {{
+        api_key: apiKey,
+      }};
+      if (baseUrl) authJson.base_url = baseUrl;
+      if (model) authJson.model = model;
+      await api('/history/api/auth/control/upload', 'POST', {{
+        profile,
+        provider: 'claude_code',
+        auth_json: authJson,
+        config_toml: '',
+        label: profile,
+        notes,
+      }});
+      appendLog(`upload claude_code profile=${{profile}}`);
+      document.getElementById('cc_api_key').value = '';
       await refreshState();
     }}
 

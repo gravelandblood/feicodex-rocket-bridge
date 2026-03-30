@@ -55,6 +55,8 @@ CONTROL_BASE = str(os.getenv("BRIDGE_CONTROL_BASE", "http://127.0.0.1:18788")).s
 API_PREFIX = str(os.getenv("BRIDGE_API_PREFIX", "/appbridge/api")).strip()
 API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
 TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
+TURN_RECOVERY_MAX_RETRIES = max(0, int(os.getenv("BRIDGE_TURN_RECOVERY_MAX_RETRIES", "2")))
+TURN_RECOVERY_RETRY_BACKOFF_SEC = max(0, int(os.getenv("BRIDGE_TURN_RECOVERY_RETRY_BACKOFF_SEC", "2")))
 PROGRESS_PING_INTERVAL_SEC = max(30, int(os.getenv("BRIDGE_PROGRESS_PING_INTERVAL_SEC", "180")))
 STREAMING_CARD_UPDATE_INTERVAL_SEC = max(2, int(os.getenv("BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC", "5")))
 STREAMING_CARD_PRINT_FREQUENCY_MS = max(1, int(os.getenv("BRIDGE_STREAMING_CARD_PRINT_FREQUENCY_MS", "1")))
@@ -2185,11 +2187,22 @@ class AppServerBotBridge:
         return any(p in text for p in patterns)
 
     def _run_turn(self, runtime_key: str, text: str, image_paths: Optional[List[str]] = None) -> str:
-        for attempt in range(2):
+        max_attempts = max(1, TURN_RECOVERY_MAX_RETRIES + 1)
+        for attempt in range(max_attempts):
             try:
                 resp = self.control.turn(chat_id=runtime_key, text=text, timeout_sec=TURN_TIMEOUT_SEC, image_paths=image_paths or [])
                 data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+                turn_status = str(data.get("turn_status") or "").strip().lower()
+                turn_error_raw = data.get("turn_error")
+                if isinstance(turn_error_raw, (dict, list)):
+                    turn_error = json.dumps(turn_error_raw, ensure_ascii=False)
+                else:
+                    turn_error = str(turn_error_raw or "").strip()
                 answer = str(data.get("assistant_text") or "").strip()
+                if turn_status and turn_status != "completed":
+                    raise RuntimeError(turn_error or f"turn ended with status={turn_status}")
+                if turn_error and not answer:
+                    raise RuntimeError(turn_error)
                 switch_info = data.get("auto_auth_switch") if isinstance(data.get("auto_auth_switch"), dict) else {}
                 if switch_info:
                     from_profile = str(switch_info.get("from") or "").strip() or "default"
@@ -2204,14 +2217,22 @@ class AppServerBotBridge:
                     answer = (note + "\n\n" + answer).strip()
                 return answer or "(assistant returned empty text)"
             except Exception as exc:
-                if attempt >= 1 or not self._is_recoverable_turn_error(str(exc)):
+                if attempt >= (max_attempts - 1) or not self._is_recoverable_turn_error(str(exc)):
                     raise
-                LOG.warning("turn failed with recoverable error, retry after reset runtime_key=%s err=%s", runtime_key, exc)
+                LOG.warning(
+                    "turn failed with recoverable error, retry after reset runtime_key=%s attempt=%s/%s err=%s",
+                    runtime_key,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
                 try:
                     self.control.interrupt(chat_id=runtime_key)
                 except Exception as interrupt_exc:
                     LOG.warning("turn recover interrupt failed runtime_key=%s err=%s", runtime_key, interrupt_exc)
                 self.control.reset(chat_id=runtime_key)
+                if TURN_RECOVERY_RETRY_BACKOFF_SEC > 0:
+                    time.sleep(TURN_RECOVERY_RETRY_BACKOFF_SEC)
         raise RuntimeError("turn failed after retry")
 
     def _run_session_command(self, chat_id: str, cmd_text: str) -> str:

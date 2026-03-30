@@ -75,7 +75,7 @@ class BridgeHistoryStore:
         include_turn_text: bool = False,
         exclude_chat_id: str = "",
     ) -> List[Dict[str, Any]]:
-        safe_limit = max(1, min(20, int(limit or 8)))
+        safe_limit = max(1, min(100, int(limit or 8)))
         target_project = str(project or "").strip()
         target_query = str(query or "").strip()
         excluded_chat = str(exclude_chat_id or "").strip()

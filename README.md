@@ -115,6 +115,9 @@ cp soul.md.example soul.md
 - 默认审批策略：`BRIDGE_DEFAULT_APPROVAL_POLICY=never`
 - 默认人格：`BRIDGE_DEFAULT_PERSONALITY=pragmatic`
 - 单轮超时：`BRIDGE_TURN_TIMEOUT_SEC=21600`（默认 6 小时）
+- 进行中轮次落库间隔：`BRIDGE_TURN_CHECKPOINT_INTERVAL_SEC=3`
+- 可恢复失败重试次数：`BRIDGE_TURN_RECOVERY_MAX_RETRIES=2`
+- 可恢复失败重试退避：`BRIDGE_TURN_RECOVERY_RETRY_BACKOFF_SEC=2`
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
 - streaming card 刷新间隔：`BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC=5`（默认每 5 秒）
 - streaming card 打印频率：`BRIDGE_STREAMING_CARD_PRINT_FREQUENCY_MS=1`
@@ -135,6 +138,9 @@ cp soul.md.example soul.md
 - 全局记忆路径：`BRIDGE_SOUL_PATH=./soul.md`
 - 记忆注入长度上限：`BRIDGE_SOUL_MAX_PROMPT_CHARS=6000`
 - 记忆条目上限：`BRIDGE_SOUL_MAX_BULLETS=200`
+- 自动历史记忆注入开关：`BRIDGE_AUTO_MEMORY_INJECT_ENABLED=true`
+- 自动历史记忆条目上限：`BRIDGE_AUTO_MEMORY_INJECT_LIMIT=12`
+- 自动历史记忆注入字数上限：`BRIDGE_AUTO_MEMORY_INJECT_MAX_CHARS=5000`
 - 默认文件回传 MCP 名称：`BRIDGE_MCP_SERVER_NAME=feishu-bridge-files`
 - MCP 文件允许目录：`BRIDGE_MCP_FILE_ALLOWED_DIRS=/root/bridgespace/projects`
 - MCP 文件大小上限：`BRIDGE_MCP_FILE_MAX_SIZE_MB=30`
@@ -215,6 +221,7 @@ cp soul.md.example soul.md
 - `GET /history/api/sessions?project=<name>`
 - `GET /history/api/turns?project=<name>&chat_id=<id>&offset=0&limit=50`
 - `GET /history/api/turn?turn_id=<id>`
+- `GET /history/api/memory/search?project=<name>&query=<text>&limit=8`
 
 说明：
 
