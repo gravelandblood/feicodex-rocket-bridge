@@ -48,6 +48,7 @@ DEFAULT_SANDBOX = os.environ.get("BRIDGE_DEFAULT_SANDBOX", "danger-full-access")
 DEFAULT_APPROVAL = os.environ.get("BRIDGE_DEFAULT_APPROVAL_POLICY", "never")
 DEFAULT_PERSONALITY = os.environ.get("BRIDGE_DEFAULT_PERSONALITY", "pragmatic")
 DEFAULT_TURN_TIMEOUT_SEC = int(os.environ.get("BRIDGE_TURN_TIMEOUT_SEC", "21600"))
+TURN_CHECKPOINT_INTERVAL_SEC = max(1, int(os.environ.get("BRIDGE_TURN_CHECKPOINT_INTERVAL_SEC", "3")))
 IDLE_EVICT_SEC = max(0, int(os.environ.get("BRIDGE_IDLE_EVICT_SEC", "600")))
 IDLE_SWEEP_INTERVAL_SEC = max(10, int(os.environ.get("BRIDGE_IDLE_SWEEP_INTERVAL_SEC", "60")))
 AUTO_AUTH_SWITCH_ENABLED = str(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_ENABLED", "true")).strip().lower() in {
@@ -79,6 +80,14 @@ DISCONNECT_SELF_HEAL_FORCE_REBUILD_ON_AUTH_HEADER_ERROR = str(
     os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_FORCE_REBUILD_ON_AUTH_HEADER_ERROR", "true")
 ).strip().lower() in {"1", "true", "yes", "on"}
 DISCONNECT_SELF_HEAL_BACKUP_LIMIT = max(1, int(os.environ.get("BRIDGE_DISCONNECT_SELF_HEAL_BACKUP_LIMIT", "6")))
+AUTO_MEMORY_INJECT_ENABLED = str(os.environ.get("BRIDGE_AUTO_MEMORY_INJECT_ENABLED", "true")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+AUTO_MEMORY_INJECT_LIMIT = max(1, min(100, int(os.environ.get("BRIDGE_AUTO_MEMORY_INJECT_LIMIT", "12"))))
+AUTO_MEMORY_INJECT_MAX_CHARS = max(500, int(os.environ.get("BRIDGE_AUTO_MEMORY_INJECT_MAX_CHARS", "5000")))
 
 _state_path = Path(STATE_PATH).expanduser()
 if not _state_path.is_absolute():
@@ -94,6 +103,12 @@ def _resolve_env_path(raw: str) -> Path:
 
 
 AUTH_PROFILES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_PROFILES_DIR", str(DATA_DIR / "auth_profiles")))
+AUTH_PENDING_PROFILES_DIR = _resolve_env_path(
+    os.environ.get("BRIDGE_AUTH_PENDING_PROFILES_DIR", str(DATA_DIR / "auth_pending_profiles"))
+)
+AUTH_BACKUP_PROFILES_DIR = _resolve_env_path(
+    os.environ.get("BRIDGE_AUTH_BACKUP_PROFILES_DIR", str(DATA_DIR / "auth_backup_profiles"))
+)
 AUTH_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_AUTH_HOMES_DIR", str(DATA_DIR / "auth_homes")))
 RUNTIME_HOMES_DIR = _resolve_env_path(os.environ.get("BRIDGE_RUNTIME_HOMES_DIR", str(DATA_DIR / "runtime_homes")))
 AUTH_REGISTRY_PATH = _resolve_env_path(
@@ -236,6 +251,18 @@ class AuthControlUploadRequest(BaseModel):
     notes: str = Field(default="")
 
 
+class AuthControlBatchUploadItem(BaseModel):
+    filename: str = Field(default="")
+    auth_json: Any = Field(default_factory=dict)
+    config_toml: str = Field(default="")
+
+
+class AuthControlBatchUploadRequest(BaseModel):
+    provider: str = Field(default="codex")
+    notes: str = Field(default="")
+    items: List[AuthControlBatchUploadItem] = Field(default_factory=list)
+
+
 class AuthControlAssignRequest(BaseModel):
     profile: str = Field(min_length=1)
     node_id: str = Field(min_length=1)
@@ -249,6 +276,22 @@ class AuthControlRevokeRequest(BaseModel):
     reason: str = Field(default="")
 
 
+class AuthControlRemoveRemoteRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    node_id: str = Field(min_length=1)
+    reason: str = Field(default="")
+
+
+class AuthControlRemoveLocalRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    reason: str = Field(default="")
+
+
+class AuthControlRemovePoolRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    reason: str = Field(default="")
+
+
 class AuthControlHealthCheckRequest(BaseModel):
     profile: str = Field(default="")
     node_id: str = Field(default="")
@@ -257,10 +300,17 @@ class AuthControlHealthCheckRequest(BaseModel):
     timeout_sec: int = Field(default=0, ge=0, le=1800)
 
 
+class AuthControlCheckOneRequest(BaseModel):
+    profile: str = Field(min_length=1)
+    mode: str = Field(default="status")
+    prompt: str = Field(default="")
+    timeout_sec: int = Field(default=0, ge=0, le=1800)
+
+
 class MemorySearchRequest(BaseModel):
     query: str = Field(default="")
     project: str = Field(default="")
-    limit: int = Field(default=8, ge=1, le=20)
+    limit: int = Field(default=8, ge=1, le=100)
     include_turn_text: bool = Field(default=False)
     include_same_chat: bool = Field(default=False)
 
@@ -672,6 +722,7 @@ def _build_turn_record(
     auth_profile: Optional[str] = None,
     token_usage: Optional[Dict[str, Any]] = None,
     rate_limits: Optional[Dict[str, Any]] = None,
+    record_id: str = "",
 ) -> Dict[str, Any]:
     events = runtime.client.get_turn_events(thread_id=thread_id or runtime.thread_id, turn_id=turn_id, limit=80)
     current_cwd = str(cwd or runtime.cwd or DEFAULT_CWD)
@@ -679,8 +730,9 @@ def _build_turn_record(
     start_ts = int(started_at or 0)
     end_ts = int(ended_at or time.time())
     duration_sec = max(0, end_ts - start_ts) if start_ts > 0 else 0
+    stable_id = str(record_id or "").strip() or f"{end_ts}_{runtime.chat_id}_{turn_id or 'no_turn'}"
     return {
-        "id": f"{end_ts}_{runtime.chat_id}_{turn_id or 'no_turn'}",
+        "id": stable_id,
         "project": project,
         "chat_id": _runtime_actual_chat_id(runtime.chat_id),
         "runtime_id": runtime.chat_id,
@@ -756,6 +808,105 @@ def _error_text(value: Any) -> str:
         except Exception:
             return str(value)
     return str(value or "")
+
+
+def _looks_like_resume_prompt(text: str) -> bool:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return False
+    keywords = {
+        "continue",
+        "resume",
+        "继续",
+        "接着",
+        "接着做",
+        "继续做",
+        "继续刚才",
+        "继续上次",
+        "按这个继续",
+    }
+    if raw in keywords:
+        return True
+    if len(raw) <= 24 and ("继续" in raw or "接着" in raw):
+        return True
+    if len(raw) <= 32 and ("continue" in raw or "resume" in raw):
+        return True
+    return False
+
+
+def _build_auto_memory_prefix(project: str, user_text: str, limit: int = 0) -> str:
+    if not AUTO_MEMORY_INJECT_ENABLED:
+        return ""
+    target_project = str(project or "").strip()
+    if not target_project:
+        return ""
+    query = str(user_text or "").strip()
+    if _looks_like_resume_prompt(query):
+        query = ""
+    cap = max(1, min(100, int(limit or AUTO_MEMORY_INJECT_LIMIT)))
+    items = HISTORY_STORE.search_project_memories(
+        project=target_project,
+        query=query,
+        limit=cap,
+        include_turn_text=True,
+        exclude_chat_id="",
+    )
+    if not items:
+        return ""
+    lines: List[str] = []
+
+    def _clip_text(text: Any, cap_chars: int) -> str:
+        raw = str(text or "").strip()
+        if len(raw) <= cap_chars:
+            return raw
+        return raw[: max(1, cap_chars - 3)].rstrip() + "..."
+
+    def _memory_fields(memory_text: Any) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for line in str(memory_text or "").splitlines():
+            key, sep, value = line.partition("=")
+            if not sep:
+                continue
+            k = str(key or "").strip().lower()
+            if k in {"status", "user", "assistant", "error"}:
+                out[k] = str(value or "").strip()
+        return out
+
+    for item in items:
+        ts = int(item.get("started_at") or 0)
+        stamp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts > 0 else "unknown-time"
+        summary = str(item.get("summary") or "").strip()
+        turn_id = str(item.get("turn_id") or "").strip()
+        if not summary:
+            continue
+        lines.append(f"- [{stamp}] {summary} (turn_id={turn_id})")
+        fields = _memory_fields(item.get("memory_text"))
+        details: List[str] = []
+        status = _clip_text(fields.get("status", ""), 32)
+        user_part = _clip_text(fields.get("user", ""), 220)
+        assistant_part = _clip_text(fields.get("assistant", ""), 260)
+        error_part = _clip_text(fields.get("error", ""), 220)
+        if status:
+            details.append(f"status={status}")
+        if user_part:
+            details.append(f"user={user_part}")
+        if assistant_part:
+            details.append(f"assistant={assistant_part}")
+        if error_part:
+            details.append(f"error={error_part}")
+        if details:
+            lines.append(f"  detail: {' | '.join(details)}")
+    if not lines:
+        return ""
+    header = (
+        "[Bridge Auto Memory]\n"
+        "你正在新线程里继续老会话。下面是同项目历史摘要与关键细节，请用于恢复上下文并继续解决当前问题。\n"
+    )
+    body = "\n".join(lines)
+    payload = f"{header}{body}"
+    if len(payload) > AUTO_MEMORY_INJECT_MAX_CHARS:
+        payload = payload[: AUTO_MEMORY_INJECT_MAX_CHARS].rstrip()
+    return payload
 
 
 def _runtime_backup_root() -> Path:
@@ -900,16 +1051,37 @@ def _maybe_self_heal_disconnected_runtime(runtime: ChatRuntime) -> Dict[str, Any
     return {"healed": True, "streak": streak, "reason": reason, "strategy": "auth_reapply", "forced": bool(force_rebuild)}
 
 
+def _extract_rate_limits_payload(raw: Any) -> Dict[str, Any]:
+    def _looks_like_limits(node: Any) -> bool:
+        if not isinstance(node, dict):
+            return False
+        return isinstance(node.get("primary"), dict) or isinstance(node.get("secondary"), dict)
+
+    if _looks_like_limits(raw):
+        return dict(raw)
+    if not isinstance(raw, dict):
+        return {}
+    direct = raw.get("rateLimits")
+    if _looks_like_limits(direct):
+        return dict(direct)
+    by_id = raw.get("rateLimitsByLimitId")
+    if isinstance(by_id, dict):
+        for item in by_id.values():
+            if _looks_like_limits(item):
+                return dict(item)
+    return {}
+
+
 def _read_rate_limits(runtime: ChatRuntime, allow_request: bool = True) -> Dict[str, Any]:
-    cached = runtime.client.get_account_rate_limits()
+    cached = _extract_rate_limits_payload(runtime.client.get_account_rate_limits())
     if cached:
         return cached
     if not allow_request:
         return {}
     try:
-        read = runtime.client.account_rate_limits_read()
-        if isinstance(read.get("rateLimits"), dict):
-            return dict(read.get("rateLimits") or {})
+        read = _extract_rate_limits_payload(runtime.client.account_rate_limits_read())
+        if read:
+            return read
     except Exception:
         return {}
     return {}
@@ -1281,8 +1453,13 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
         "disabled_reason": str(previous_meta.get("disabled_reason") or "").strip(),
         "needs_reauth": bool(previous_meta.get("needs_reauth")),
         "risk_deactivated": bool(previous_meta.get("risk_deactivated")),
+        "check_required": bool(previous_meta.get("check_required")),
         "last_health_check_at": int(previous_meta.get("last_health_check_at") or 0),
         "last_health_error": str(previous_meta.get("last_health_error") or "").strip(),
+        "last_rate_limits": dict(previous_meta.get("last_rate_limits") or {})
+        if isinstance(previous_meta.get("last_rate_limits"), dict)
+        else {},
+        "last_rate_limits_at": int(previous_meta.get("last_rate_limits_at") or 0),
         "source_auth_sha1": source_hash,
         "updated_at": now_ts,
     }
@@ -1364,6 +1541,11 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
             meta["last_health_error"] = meta["reason"]
+        elif bool(meta.get("check_required")):
+            meta["valid"] = False
+            meta["status"] = "unchecked"
+            meta["reason"] = "未检测"
+            meta["last_health_error"] = ""
         else:
             meta["valid"] = True
             meta["reason"] = ""
@@ -1431,6 +1613,329 @@ def _normalize_auth_json_text(payload: Any) -> str:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="auth_json must be a JSON object or string")
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def _pending_auth_paths(profile: str) -> tuple[Path, Path]:
+    name = _sanitize_auth_profile_name(profile)
+    AUTH_PENDING_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    return (
+        AUTH_PENDING_PROFILES_DIR / f"{name}.auth.json",
+        AUTH_PENDING_PROFILES_DIR / f"{name}.config.toml",
+    )
+
+
+def _backup_auth_paths(profile: str) -> tuple[Path, Path]:
+    name = _sanitize_auth_profile_name(profile)
+    AUTH_BACKUP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    return (
+        AUTH_BACKUP_PROFILES_DIR / f"{name}.auth.json",
+        AUTH_BACKUP_PROFILES_DIR / f"{name}.config.toml",
+    )
+
+
+def _remove_pending_profile_artifacts(profile: str) -> bool:
+    name = _sanitize_auth_profile_name(profile)
+    src, cfg = _pending_auth_paths(name)
+    changed = False
+    try:
+        if src.exists():
+            src.unlink()
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove pending auth source failed profile=%s err=%s", name, exc)
+    try:
+        if cfg.exists():
+            cfg.unlink()
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove pending auth config failed profile=%s err=%s", name, exc)
+    return changed
+
+
+def _remove_backup_profile_artifacts(profile: str) -> bool:
+    name = _sanitize_auth_profile_name(profile)
+    src, cfg = _backup_auth_paths(name)
+    changed = False
+    try:
+        if src.exists():
+            src.unlink()
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove backup auth source failed profile=%s err=%s", name, exc)
+    try:
+        if cfg.exists():
+            cfg.unlink()
+            changed = True
+    except Exception as exc:
+        LOG.warning("remove backup auth config failed profile=%s err=%s", name, exc)
+    return changed
+
+
+def _auth_identity_from_auth_json(payload: Dict[str, Any]) -> Dict[str, str]:
+    data = payload if isinstance(payload, dict) else {}
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    token = str(tokens.get("id_token") or "").strip()
+    jwt = _decode_jwt_payload(token)
+    return {
+        "email": str(jwt.get("email") or "").strip(),
+        "sub": str(jwt.get("sub") or "").strip(),
+    }
+
+
+def _pending_profile_item_from_file(path: Path) -> Dict[str, Any]:
+    profile = str(path.name[: -len(".auth.json")] if path.name.endswith(".auth.json") else path.stem).strip()
+    cfg = path.with_name(f"{profile}.config.toml")
+    item: Dict[str, Any] = {
+        "profile": profile,
+        "email": "",
+        "sub": "",
+        "source_auth_json": str(path),
+        "source_config_toml": str(cfg) if cfg.exists() and cfg.is_file() else "",
+        "valid": False,
+        "status": "pending",
+        "reason": "",
+        "updated_at": int(path.stat().st_mtime) if path.exists() else int(time.time()),
+    }
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        item["status"] = "invalid"
+        item["reason"] = f"invalid json: {exc}"
+        return item
+    if not isinstance(parsed, dict):
+        item["status"] = "invalid"
+        item["reason"] = "auth_json must be object"
+        return item
+    ident = _auth_identity_from_auth_json(parsed)
+    item["email"] = str(ident.get("email") or "")
+    item["sub"] = str(ident.get("sub") or "")
+    auth_mode = str(parsed.get("auth_mode") or "").strip()
+    tokens = parsed.get("tokens") if isinstance(parsed.get("tokens"), dict) else {}
+    if auth_mode and isinstance(tokens, dict):
+        item["valid"] = True
+        item["status"] = "pending"
+    else:
+        item["status"] = "invalid"
+        item["reason"] = "missing auth_mode/tokens"
+    return item
+
+
+def _list_pending_auth_profiles() -> List[Dict[str, Any]]:
+    AUTH_PENDING_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    out: List[Dict[str, Any]] = []
+    for path in sorted(AUTH_PENDING_PROFILES_DIR.glob("*.auth.json")):
+        if not path.is_file():
+            continue
+        out.append(_pending_profile_item_from_file(path))
+    return out
+
+
+def _collect_known_profile_names() -> set[str]:
+    names: set[str] = set()
+    AUTH_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    AUTH_PENDING_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    AUTH_BACKUP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    for path in AUTH_PROFILES_DIR.glob("*.auth.json"):
+        if path.is_file():
+            names.add(str(path.name[: -len(".auth.json")]))
+    for path in AUTH_PENDING_PROFILES_DIR.glob("*.auth.json"):
+        if path.is_file():
+            names.add(str(path.name[: -len(".auth.json")]))
+    for path in AUTH_BACKUP_PROFILES_DIR.glob("*.auth.json"):
+        if path.is_file():
+            names.add(str(path.name[: -len(".auth.json")]))
+    reg = _load_auth_control_registry()
+    auths = reg.get("auths") if isinstance(reg.get("auths"), dict) else {}
+    names.update(str(k or "").strip() for k in auths.keys())
+    names.discard("")
+    return names
+
+
+def _auto_profile_alias(email: str = "", filename: str = "", used: Optional[set[str]] = None) -> str:
+    used_set = set(used or set())
+    base_source = str(email or "").strip()
+    if not base_source:
+        stem = str(Path(str(filename or "").strip()).stem or "").strip()
+        base_source = stem
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base_source.lower()).strip("._-")
+    if not base:
+        base = f"auth_{int(time.time())}"
+    if not re.match(r"^[A-Za-z0-9]", base):
+        base = f"a_{base}"
+    base = re.sub(r"_+", "_", base)[:64].rstrip("._-")
+    if not base:
+        base = "auth"
+    try:
+        clean_base = _sanitize_auth_profile_name(base)
+    except Exception:
+        clean_base = "auth"
+    if clean_base not in used_set:
+        return clean_base
+    seq = 2
+    while seq < 100000:
+        suffix = f"_{seq}"
+        candidate = (clean_base[: max(1, 64 - len(suffix))] + suffix).rstrip("._-")
+        if not re.match(r"^[A-Za-z0-9]", candidate):
+            candidate = f"a{candidate}"[:64]
+        try:
+            candidate = _sanitize_auth_profile_name(candidate)
+        except Exception:
+            seq += 1
+            continue
+        if candidate not in used_set:
+            return candidate
+        seq += 1
+    raise HTTPException(status_code=500, detail="failed to generate unique profile alias")
+
+
+def _save_pending_profile(profile: str, auth_json: Any, config_toml: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    src, cfg = _pending_auth_paths(name)
+    auth_text = _normalize_auth_json_text(auth_json)
+    tmp = src.with_name(f".{src.name}.tmp")
+    tmp.write_text(auth_text, encoding="utf-8")
+    tmp.replace(src)
+    cfg_text = str(config_toml or "").strip()
+    if cfg_text:
+        cfg.write_text(cfg_text + ("" if cfg_text.endswith("\n") else "\n"), encoding="utf-8")
+    elif cfg.exists():
+        cfg.unlink()
+    return _pending_profile_item_from_file(src)
+
+
+def _save_backup_profile(profile: str, auth_json: Any, config_toml: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    src, cfg = _backup_auth_paths(name)
+    auth_text = _normalize_auth_json_text(auth_json)
+    tmp = src.with_name(f".{src.name}.tmp")
+    tmp.write_text(auth_text, encoding="utf-8")
+    tmp.replace(src)
+    cfg_text = str(config_toml or "").strip()
+    if cfg_text:
+        cfg.write_text(cfg_text + ("" if cfg_text.endswith("\n") else "\n"), encoding="utf-8")
+    elif cfg.exists():
+        cfg.unlink()
+    return {
+        "profile": name,
+        "source_auth_json": str(src),
+        "source_config_toml": str(cfg) if cfg.exists() and cfg.is_file() else "",
+        "updated_at": int(time.time()),
+    }
+
+
+def _load_auth_payload_from_any_store(profile: str) -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    candidates = [
+        ("local", AUTH_PROFILES_DIR / f"{name}.auth.json", AUTH_PROFILES_DIR / f"{name}.config.toml"),
+        ("pending", _pending_auth_paths(name)[0], _pending_auth_paths(name)[1]),
+        ("backup", _backup_auth_paths(name)[0], _backup_auth_paths(name)[1]),
+    ]
+    for source, auth_path, cfg_path in candidates:
+        if not auth_path.exists() or (not auth_path.is_file()):
+            continue
+        try:
+            payload = json.loads(auth_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{source} auth invalid json for {name}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail=f"{source} auth must be object for {name}")
+        return {
+            "source": source,
+            "auth_json": payload,
+            "config_toml": cfg_path.read_text(encoding="utf-8") if cfg_path.exists() and cfg_path.is_file() else "",
+            "auth_path": str(auth_path),
+            "cfg_path": str(cfg_path) if cfg_path.exists() and cfg_path.is_file() else "",
+        }
+    raise HTTPException(status_code=404, detail=f"auth source not found in local/pending/backup: {name}")
+
+
+def _mark_auth_profile_unchecked(profile: str, reason: str = "未检测") -> None:
+    _patch_auth_registry_profile(
+        profile,
+        {
+            "check_required": True,
+            "valid": False,
+            "status": "unchecked",
+            "reason": str(reason or "未检测").strip(),
+            "last_health_check_at": 0,
+            "last_health_error": "",
+            "disabled_until": 0,
+            "disabled_reason": "",
+        },
+    )
+
+
+def _auth_control_batch_upload(provider: str, items: List[AuthControlBatchUploadItem], notes: str = "") -> Dict[str, Any]:
+    clean_provider = str(provider or "codex").strip() or "codex"
+    uploads = [item for item in list(items or []) if isinstance(item, AuthControlBatchUploadItem)]
+    if not uploads:
+        raise HTTPException(status_code=400, detail="items is empty")
+    used = _collect_known_profile_names()
+    created: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        for raw in uploads:
+            filename = str(raw.filename or "").strip()
+            try:
+                auth_text = _normalize_auth_json_text(raw.auth_json)
+                parsed = json.loads(auth_text)
+                ident = _auth_identity_from_auth_json(parsed if isinstance(parsed, dict) else {})
+                alias = _auto_profile_alias(email=str(ident.get("email") or ""), filename=filename, used=used)
+                item = _save_pending_profile(alias, parsed if isinstance(parsed, dict) else {}, config_toml=raw.config_toml)
+                used.add(alias)
+                now_ts = int(time.time())
+                existing = auths.get(alias) if isinstance(auths.get(alias), dict) else {}
+                auths[alias] = {
+                    **existing,
+                    "profile": alias,
+                    "provider": clean_provider,
+                    "label": str(existing.get("label") or alias).strip()[:120],
+                    "notes": str(notes or existing.get("notes") or "").strip()[:500],
+                    "pool": "pending",
+                    "updated_at": now_ts,
+                    "created_at": int(existing.get("created_at") or now_ts),
+                }
+                created.append(
+                    {
+                        "profile": alias,
+                        "email": str(item.get("email") or "").strip(),
+                        "status": str(item.get("status") or "pending"),
+                        "source": filename,
+                    }
+                )
+                _audit_auth_control(registry, action="upload_pending", profile=alias, ok=True, message=f"source={filename}")
+            except Exception as exc:
+                failed.append({"source": filename, "error": str(exc)[:500]})
+        registry["auths"] = auths
+        _save_auth_control_registry(registry)
+    return {"created": created, "failed": failed}
+
+
+def _materialize_pending_profile_to_local(profile: str, provider: str = "codex", notes: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    src, cfg = _pending_auth_paths(name)
+    if not src.exists() or not src.is_file():
+        raise HTTPException(status_code=404, detail=f"pending profile not found: {name}")
+    try:
+        auth_payload = json.loads(src.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"pending auth invalid json: {exc}") from exc
+    cfg_text = cfg.read_text(encoding="utf-8") if cfg.exists() and cfg.is_file() else ""
+    installed = _install_auth_profile(
+        profile=name,
+        provider=provider,
+        auth_json=auth_payload if isinstance(auth_payload, dict) else {},
+        config_toml=cfg_text,
+        assignment_version=0,
+        assignment_token="",
+        assigned_server_id="",
+        notes=notes,
+    )
+    _remove_pending_profile_artifacts(name)
+    _mark_auth_profile_unchecked(name, reason="新分配，待检测")
+    return installed
 
 
 def _load_dispatch_fence() -> Dict[str, Any]:
@@ -1671,7 +2176,11 @@ def _call_node_api(node: Dict[str, Any], method: str, path: str, body: Optional[
     }
     if body is not None:
         kwargs["json"] = body
-    resp = requests.request(**kwargs)
+    # Node-to-node control calls must be direct; do not inherit process proxy env.
+    # Otherwise HTTP(S)_PROXY may cause false 502 when talking to private nodes.
+    with requests.Session() as session:
+        session.trust_env = False
+        resp = session.request(**kwargs)
     text = str(resp.text or "").strip()
     try:
         payload = resp.json()
@@ -1683,6 +2192,19 @@ def _call_node_api(node: Dict[str, Any], method: str, path: str, body: Optional[
     if not bool(payload.get("ok", True)):
         raise RuntimeError(f"node={node.get('id')} api={path} failed: {payload.get('error')}")
     return payload
+
+
+def _extract_stale_assignment_current_version(message: str) -> int:
+    text = str(message or "").strip().lower()
+    if "stale assignment_version" not in text:
+        return 0
+    match = re.search(r"stale assignment_version:\s*\d+\s*<\s*current\s*(\d+)", text)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
 
 
 def _merge_auth_control_auth_meta(profile_item: Dict[str, Any], provider: str = "", label: str = "", notes: str = "") -> Dict[str, Any]:
@@ -1704,37 +2226,270 @@ def _merge_auth_control_auth_meta(profile_item: Dict[str, Any], provider: str = 
     }
 
 
+def _safe_percent(value: Any) -> Optional[float]:
+    try:
+        val = float(value)
+    except Exception:
+        return None
+    if val < 0:
+        val = 0.0
+    if val > 100:
+        val = 100.0
+    return round(val, 2)
+
+
+def _quota_view_from_rate_limits(rate_limits: Dict[str, Any], updated_at: int = 0) -> Dict[str, Any]:
+    limits = rate_limits if isinstance(rate_limits, dict) else {}
+
+    def _one(key: str) -> Dict[str, Any]:
+        node = limits.get(key) if isinstance(limits.get(key), dict) else {}
+        used = _safe_percent(node.get("usedPercent"))
+        remaining = round(max(0.0, 100.0 - used), 2) if used is not None else None
+        try:
+            resets_at = int(node.get("resetsAt") or 0)
+        except Exception:
+            resets_at = 0
+        return {
+            "used_pct": used,
+            "remaining_pct": remaining,
+            "resets_at": resets_at,
+            "window_mins": int(node.get("windowDurationMins") or 0) if str(node.get("windowDurationMins") or "").strip() else 0,
+        }
+
+    primary = _one("primary")
+    secondary = _one("secondary")
+    return {
+        "primary": primary,
+        "secondary": secondary,
+        "remaining_5h_pct": primary.get("remaining_pct"),
+        "remaining_7d_pct": secondary.get("remaining_pct"),
+        "updated_at": int(updated_at or 0),
+        "plan_type": str(limits.get("planType") or "").strip(),
+    }
+
+
+def _quota_view_from_profile_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return _quota_view_from_rate_limits({}, updated_at=0)
+    limits = item.get("last_rate_limits") if isinstance(item.get("last_rate_limits"), dict) else {}
+    updated_at = int(item.get("last_rate_limits_at") or item.get("last_health_check_at") or 0)
+    return _quota_view_from_rate_limits(limits, updated_at=updated_at)
+
+
+def _collect_auth_control_node_snapshots(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    now_ts = int(time.time())
+    for node in nodes:
+        node_id = str(node.get("id") or "").strip()
+        node_label = str(node.get("label") or node_id).strip()
+        try:
+            payload = _call_node_api(node, "GET", "/auth/profiles", None)
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
+            items: List[Dict[str, Any]] = []
+            for raw in profiles:
+                if not isinstance(raw, dict):
+                    continue
+                profile = str(raw.get("profile") or "").strip()
+                if not profile:
+                    continue
+                items.append(
+                    {
+                        "profile": profile,
+                        "email": str(raw.get("email") or "").strip(),
+                        "valid": bool(raw.get("valid")),
+                        "status": str(raw.get("status") or "").strip(),
+                        "reason": str(raw.get("reason") or "").strip(),
+                        "last_health_check_at": int(raw.get("last_health_check_at") or 0),
+                        "quota": _quota_view_from_profile_item(raw),
+                    }
+                )
+            out.append(
+                {
+                    "node_id": node_id,
+                    "label": node_label,
+                    "ok": True,
+                    "error": "",
+                    "checked_at": now_ts,
+                    "profiles": items,
+                    "profile_count": len(items),
+                }
+            )
+        except Exception as exc:
+            out.append(
+                {
+                    "node_id": node_id,
+                    "label": node_label,
+                    "ok": False,
+                    "error": str(exc)[:1000],
+                    "checked_at": now_ts,
+                    "profiles": [],
+                    "profile_count": 0,
+                }
+            )
+    return out
+
+
 def _auth_control_registry_state() -> Dict[str, Any]:
     nodes = _parse_auth_control_nodes()
     profiles = _refresh_auth_profiles()
+    pending_profiles = _list_pending_auth_profiles()
     with _AUTH_CONTROL_LOCK:
         registry = _load_auth_control_registry()
         auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
         assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
         audit = registry.get("audit") if isinstance(registry.get("audit"), list) else []
     now_ts = int(time.time())
-    merged_auths: List[Dict[str, Any]] = []
+    node_snapshots = _collect_auth_control_node_snapshots(nodes)
+    snapshot_by_node: Dict[str, Dict[str, Any]] = {
+        str(item.get("node_id") or ""): dict(item) for item in node_snapshots if isinstance(item, dict)
+    }
+    node_profiles_index: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for snap in node_snapshots:
+        node_id = str(snap.get("node_id") or "").strip()
+        pmap: Dict[str, Dict[str, Any]] = {}
+        for profile_item in list(snap.get("profiles") or []):
+            if not isinstance(profile_item, dict):
+                continue
+            profile = str(profile_item.get("profile") or "").strip()
+            if profile:
+                pmap[profile] = dict(profile_item)
+        node_profiles_index[node_id] = pmap
+
+    local_profiles: Dict[str, Dict[str, Any]] = {}
     for item in profiles:
-        profile = str(item.get("profile") or "").strip()
-        if not profile:
+        if not isinstance(item, dict):
             continue
+        profile = str(item.get("profile") or "").strip()
+        if profile:
+            local_profiles[profile] = dict(item)
+
+    pending_by_profile: Dict[str, Dict[str, Any]] = {}
+    for item in pending_profiles:
+        if not isinstance(item, dict):
+            continue
+        profile = str(item.get("profile") or "").strip()
+        if profile:
+            pending_by_profile[profile] = dict(item)
+
+    all_profiles: set[str] = set(local_profiles.keys())
+    all_profiles.update(str(k or "").strip() for k in pending_by_profile.keys())
+    all_profiles.update(str(k or "").strip() for k in auths.keys())
+    all_profiles.update(str(k or "").strip() for k in assignments.keys())
+    for pmap in node_profiles_index.values():
+        all_profiles.update(str(k or "").strip() for k in pmap.keys())
+    all_profiles.discard("")
+
+    merged_auths: List[Dict[str, Any]] = []
+    node_public = [{k: v for k, v in node.items() if k != "api_token"} for node in nodes]
+    environments = [{"id": "local", "label": "本机", "base_url": "", "enabled": True}] + node_public
+    for profile in sorted(all_profiles):
+        pending_item = pending_by_profile.get(profile) if isinstance(pending_by_profile.get(profile), dict) else {}
+        local_item = local_profiles.get(profile) if isinstance(local_profiles.get(profile), dict) else {}
         merged = dict(auths.get(profile) if isinstance(auths.get(profile), dict) else {})
-        merged.update(_merge_auth_control_auth_meta(item, provider=str(merged.get("provider") or "")))
-        merged["health"] = {
-            "valid": bool(item.get("valid")),
-            "status": str(item.get("status") or ""),
-            "reason": str(item.get("reason") or ""),
-            "last_health_check_at": int(item.get("last_health_check_at") or 0),
+        if local_item:
+            merged.update(
+                _merge_auth_control_auth_meta(
+                    local_item,
+                    provider=str(merged.get("provider") or ""),
+                    label=str(merged.get("label") or ""),
+                    notes=str(merged.get("notes") or ""),
+                )
+            )
+        merged["profile"] = profile
+        merged["label"] = str(merged.get("label") or profile).strip()[:120]
+        merged["provider"] = str(merged.get("provider") or "codex").strip() or "codex"
+        merged["notes"] = str(merged.get("notes") or "").strip()[:500]
+        merged["email"] = str((local_item or {}).get("email") or merged.get("email") or "").strip()
+        merged["pool"] = {
+            "exists": bool(pending_item),
+            "status": str((pending_item or {}).get("status") or "pending").strip(),
+            "reason": str((pending_item or {}).get("reason") or "").strip(),
+            "source_auth_json": str((pending_item or {}).get("source_auth_json") or "").strip(),
+            "source_config_toml": str((pending_item or {}).get("source_config_toml") or "").strip(),
         }
+        if not str(merged.get("email") or "").strip():
+            merged["email"] = str((pending_item or {}).get("email") or "").strip()
+        merged["local"] = {
+            "exists": bool(local_item),
+            "valid": bool((local_item or {}).get("valid")),
+            "status": str((local_item or {}).get("status") or ""),
+            "reason": str((local_item or {}).get("reason") or ""),
+            "check_required": bool((local_item or {}).get("check_required")),
+            "last_health_check_at": int((local_item or {}).get("last_health_check_at") or 0),
+            "quota": _quota_view_from_profile_item(local_item or {}),
+        }
+
         assignment = assignments.get(profile) if isinstance(assignments.get(profile), dict) else {}
         merged["assignment"] = dict(assignment or {})
         lease_expire_at = int((assignment or {}).get("lease_expire_at") or 0)
         merged["lease_remaining_sec"] = max(0, lease_expire_at - now_ts) if lease_expire_at > 0 else 0
+
+        node_rows: List[Dict[str, Any]] = []
+        for node in node_public:
+            node_id = str(node.get("id") or "").strip()
+            node_label = str(node.get("label") or node_id).strip()
+            snap = snapshot_by_node.get(node_id) if isinstance(snapshot_by_node.get(node_id), dict) else {}
+            remote_item = (
+                node_profiles_index.get(node_id, {}).get(profile)
+                if isinstance(node_profiles_index.get(node_id), dict)
+                else {}
+            )
+            present = bool(remote_item)
+            row: Dict[str, Any] = {
+                "node_id": node_id,
+                "label": node_label,
+                "ok": bool(snap.get("ok")),
+                "error": str(snap.get("error") or "").strip(),
+                "present": present,
+            }
+            if present:
+                row.update(
+                    {
+                        "email": str(remote_item.get("email") or "").strip(),
+                        "valid": bool(remote_item.get("valid")),
+                        "status": str(remote_item.get("status") or "").strip(),
+                        "reason": str(remote_item.get("reason") or "").strip(),
+                        "last_health_check_at": int(remote_item.get("last_health_check_at") or 0),
+                        "quota": dict(remote_item.get("quota") or {}),
+                    }
+                )
+            node_rows.append(row)
+        if not str(merged.get("email") or "").strip():
+            for row in node_rows:
+                remote_email = str(row.get("email") or "").strip()
+                if remote_email:
+                    merged["email"] = remote_email
+                    break
+        merged["nodes"] = node_rows
+        merged["discovered_remote"] = any(bool(item.get("present")) for item in node_rows)
+
+        assigned_node = str((assignment or {}).get("node_id") or "").strip()
+        merged["assigned_node"] = assigned_node
+        if (not pending_item) and (not local_item) and (not merged.get("discovered_remote")) and (not assigned_node):
+            continue
+        if assigned_node:
+            merged["group"] = "assigned"
+        elif bool(local_item):
+            merged["group"] = "assigned"
+        elif bool(pending_item):
+            merged["group"] = "pool"
+        else:
+            merged["group"] = "assigned"
         merged_auths.append(merged)
     return {
         "timestamp": now_ts,
-        "nodes": [{k: v for k, v in node.items() if k != "api_token"} for node in nodes],
-        "auths": sorted(merged_auths, key=lambda x: str(x.get("profile") or "")),
+        "nodes": node_public,
+        "environments": environments,
+        "pending_dir": str(AUTH_PENDING_PROFILES_DIR),
+        "node_snapshots": node_snapshots,
+        "auths": sorted(
+            merged_auths,
+            key=lambda x: (
+                0 if str(x.get("group") or "") == "pool" else 1,
+                str(x.get("profile") or ""),
+            ),
+        ),
         "audit": [item for item in audit if isinstance(item, dict)][-200:],
     }
 
@@ -1786,14 +2541,9 @@ def _auth_control_assign(
     if not target_node:
         raise HTTPException(status_code=400, detail="node_id is required")
     nodes = _auth_control_nodes_map()
-    target = nodes.get(target_node)
-    if not target:
+    target = nodes.get(target_node) if target_node != "local" else None
+    if target_node != "local" and not target:
         raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node}")
-    auth_item = _get_auth_profile(name)
-    if not auth_item:
-        raise HTTPException(status_code=404, detail=f"profile not found locally: {name}")
-    if not bool(auth_item.get("valid")):
-        raise HTTPException(status_code=400, detail=f"profile is not healthy locally: {name}")
     lease = max(60, min(AUTH_CONTROL_MAX_LEASE_SEC, int(lease_sec or AUTH_CONTROL_DEFAULT_LEASE_SEC)))
 
     with _AUTH_CONTROL_LOCK:
@@ -1809,6 +2559,9 @@ def _auth_control_assign(
             )
         version = int(current.get("version") or 0) + 1
         token = secrets.token_hex(24)
+        existing_auth = auths.get(name) if isinstance(auths.get(name), dict) else {}
+        provider = str(existing_auth.get("provider") or "codex").strip() or "codex"
+        merged_notes = str(notes or existing_auth.get("notes") or "").strip()[:500]
 
     if current_node and current_node != target_node:
         old = nodes.get(current_node)
@@ -1845,36 +2598,74 @@ def _auth_control_assign(
             except Exception:
                 pass
 
-    source_auth = AUTH_PROFILES_DIR / f"{name}.auth.json"
-    source_cfg = AUTH_PROFILES_DIR / f"{name}.config.toml"
-    if not source_auth.exists():
-        raise HTTPException(status_code=404, detail=f"local auth file missing: {source_auth}")
-    _call_node_api(
-        target,
-        "POST",
-        "/auth/profiles/upload",
-        {
-            "profile": name,
-            "provider": str(auths.get(name, {}).get("provider") if isinstance(auths.get(name), dict) else "codex"),
-            "auth_json": json.loads(source_auth.read_text(encoding="utf-8")),
-            "config_toml": source_cfg.read_text(encoding="utf-8") if source_cfg.exists() else "",
-            "assignment_version": version,
-            "assignment_token": token,
-            "assigned_server_id": target_node,
-            "notes": notes,
-        },
-    )
+    source = _load_auth_payload_from_any_store(name)
+    auth_payload = source.get("auth_json") if isinstance(source.get("auth_json"), dict) else {}
+    cfg_text = str(source.get("config_toml") or "")
+    if target_node != "local":
+        tried_stale_recover = False
+        while True:
+            try:
+                _call_node_api(
+                    target,
+                    "POST",
+                    "/auth/profiles/upload",
+                    {
+                        "profile": name,
+                        "provider": provider,
+                        "auth_json": auth_payload,
+                        "config_toml": cfg_text,
+                        "assignment_version": version,
+                        "assignment_token": token,
+                        "assigned_server_id": target_node,
+                        "notes": merged_notes,
+                    },
+                )
+                break
+            except Exception as exc:
+                # Recover from remote fencing drift: bump local version and retry once.
+                stale_current = _extract_stale_assignment_current_version(str(exc))
+                if (not tried_stale_recover) and stale_current > 0 and stale_current >= int(version):
+                    version = int(stale_current) + 1
+                    token = secrets.token_hex(24)
+                    tried_stale_recover = True
+                    LOG.warning(
+                        "auth assign stale fencing recovered profile=%s node=%s local_version_bumped_to=%s",
+                        name,
+                        target_node,
+                        version,
+                    )
+                    continue
+                raise
+        _save_backup_profile(name, auth_payload, config_toml=cfg_text)
+        _remove_pending_profile_artifacts(name)
+        _remove_auth_profile_artifacts(name)
+    else:
+        _install_auth_profile(
+            profile=name,
+            provider=provider,
+            auth_json=auth_payload,
+            config_toml=cfg_text,
+            assignment_version=0,
+            assignment_token="",
+            assigned_server_id="",
+            notes=merged_notes,
+        )
+        _remove_pending_profile_artifacts(name)
+        _save_backup_profile(name, auth_payload, config_toml=cfg_text)
 
     now_ts = int(time.time())
     with _AUTH_CONTROL_LOCK:
         registry = _load_auth_control_registry()
         auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
         assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
-        existing_auth = auths.get(name) if isinstance(auths.get(name), dict) else {}
         if not existing_auth:
-            existing_auth = _merge_auth_control_auth_meta(auth_item)
+            local_item = _get_auth_profile(name) if target_node == "local" else {}
+            existing_auth = _merge_auth_control_auth_meta(local_item if isinstance(local_item, dict) else {}, provider=provider)
             existing_auth["created_at"] = now_ts
+        existing_auth["profile"] = name
         existing_auth["updated_at"] = now_ts
+        existing_auth["provider"] = provider
+        existing_auth["notes"] = merged_notes
         auths[name] = existing_auth
         assignments[name] = {
             "profile": name,
@@ -1882,8 +2673,8 @@ def _auth_control_assign(
             "state": "assigned",
             "version": version,
             "token": token,
-            "lease_sec": lease,
-            "lease_expire_at": now_ts + lease,
+            "lease_sec": lease if target_node != "local" else 0,
+            "lease_expire_at": (now_ts + lease) if target_node != "local" else 0,
             "updated_at": now_ts,
             "last_error": "",
         }
@@ -1898,11 +2689,13 @@ def _auth_control_assign(
             message=f"assigned with lease={lease}s version={version}",
         )
         _save_auth_control_registry(registry)
+    if target_node == "local":
+        _mark_auth_profile_unchecked(name, reason="新分配，待检测")
     return {
         "profile": name,
         "node_id": target_node,
         "version": version,
-        "lease_expire_at": now_ts + lease,
+        "lease_expire_at": (now_ts + lease) if target_node != "local" else 0,
     }
 
 
@@ -1931,6 +2724,15 @@ def _auth_control_revoke(profile: str, reason: str = "") -> Dict[str, Any]:
                     "reason": str(reason or "manual revoke"),
                 },
             )
+    try:
+        source = _load_auth_payload_from_any_store(name)
+        auth_payload = source.get("auth_json") if isinstance(source.get("auth_json"), dict) else {}
+        cfg_text = str(source.get("config_toml") or "")
+        _save_pending_profile(name, auth_payload, config_toml=cfg_text)
+        _save_backup_profile(name, auth_payload, config_toml=cfg_text)
+    except Exception as exc:
+        LOG.warning("revoke load-source failed profile=%s err=%s", name, exc)
+    _remove_auth_profile_artifacts(name)
     now_ts = int(time.time())
     with _AUTH_CONTROL_LOCK:
         registry = _load_auth_control_registry()
@@ -1959,6 +2761,150 @@ def _auth_control_revoke(profile: str, reason: str = "") -> Dict[str, Any]:
     return {"profile": name, "revoked_from": current_node, "version": version, "updated_at": now_ts}
 
 
+def _auth_control_remove_remote(profile: str, node_id: str, reason: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    target_node = str(node_id or "").strip()
+    if not target_node or target_node == "local":
+        raise HTTPException(status_code=400, detail="node_id must be a remote node")
+    nodes = _auth_control_nodes_map()
+    node = nodes.get(target_node)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node}")
+
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        current_node = str(current.get("node_id") or "").strip()
+        if current_node == target_node:
+            version = int(current.get("version") or 0) + 1
+            token = secrets.token_hex(24)
+        else:
+            version = 0
+            token = ""
+
+    _call_node_api(
+        node,
+        "POST",
+        "/auth/profiles/remove",
+        {
+            "profile": name,
+            "assignment_version": int(version),
+            "assignment_token": str(token),
+            "assigned_server_id": target_node,
+            "reason": str(reason or "manual remove invalid"),
+        },
+    )
+    now_ts = int(time.time())
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        if str(current.get("node_id") or "").strip() == target_node:
+            assignments[name] = {
+                "profile": name,
+                "node_id": "",
+                "state": "unassigned",
+                "version": int(version),
+                "token": str(token),
+                "lease_sec": 0,
+                "lease_expire_at": 0,
+                "updated_at": now_ts,
+                "last_error": str(reason or "remote removed").strip(),
+            }
+        registry["assignments"] = assignments
+        _audit_auth_control(
+            registry,
+            action="remove_remote",
+            profile=name,
+            node_id=target_node,
+            ok=True,
+            message=str(reason or "manual remove invalid"),
+        )
+        _save_auth_control_registry(registry)
+    return {"profile": name, "node_id": target_node, "removed": True, "updated_at": now_ts}
+
+
+def _auth_control_remove_local(profile: str, reason: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        current_node = str(current.get("node_id") or "").strip()
+    if current_node == "local":
+        return _auth_control_revoke(profile=name, reason=str(reason or "remove local assigned profile"))
+
+    src = AUTH_PROFILES_DIR / f"{name}.auth.json"
+    cfg = AUTH_PROFILES_DIR / f"{name}.config.toml"
+    if src.exists() and src.is_file():
+        try:
+            payload = json.loads(src.read_text(encoding="utf-8"))
+            cfg_text = cfg.read_text(encoding="utf-8") if cfg.exists() and cfg.is_file() else ""
+            _save_backup_profile(name, payload if isinstance(payload, dict) else {}, config_toml=cfg_text)
+        except Exception as exc:
+            LOG.warning("remove local keep backup failed profile=%s err=%s", name, exc)
+
+    removed = _remove_auth_profile_artifacts(name)
+    now_ts = int(time.time())
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        _audit_auth_control(
+            registry,
+            action="remove_local",
+            profile=name,
+            node_id="local",
+            ok=True,
+            message=str(reason or "manual remove local"),
+        )
+        _save_auth_control_registry(registry)
+    return {"profile": name, "removed_local": bool(removed), "updated_at": now_ts}
+
+
+def _auth_control_remove_pool(profile: str, reason: str = "") -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        current_node = str(current.get("node_id") or "").strip()
+    if current_node:
+        raise HTTPException(status_code=409, detail=f"profile is assigned to {current_node}, move/revoke first")
+    src = AUTH_PROFILES_DIR / f"{name}.auth.json"
+    if src.exists() and src.is_file():
+        raise HTTPException(status_code=409, detail="profile still exists on local node, remove local copy first")
+
+    removed_pending = _remove_pending_profile_artifacts(name)
+    removed_backup = _remove_backup_profile_artifacts(name)
+    now_ts = int(time.time())
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        current = assignments.get(name) if isinstance(assignments.get(name), dict) else {}
+        if str(current.get("node_id") or "").strip():
+            raise HTTPException(status_code=409, detail=f"profile is assigned to {current.get('node_id')}, move/revoke first")
+        assignments.pop(name, None)
+        auths.pop(name, None)
+        registry["assignments"] = assignments
+        registry["auths"] = auths
+        _audit_auth_control(
+            registry,
+            action="remove_pool",
+            profile=name,
+            node_id="pool",
+            ok=True,
+            message=str(reason or "manual remove pool profile"),
+        )
+        _save_auth_control_registry(registry)
+    return {
+        "profile": name,
+        "removed_pending": bool(removed_pending),
+        "removed_backup": bool(removed_backup),
+        "updated_at": now_ts,
+    }
+
+
 def _auth_control_health_check(profile: str = "", node_id: str = "", mode: str = "status", prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
     name = str(profile or "").strip()
     target_node_id = str(node_id or "").strip()
@@ -1976,27 +2922,37 @@ def _auth_control_health_check(profile: str = "", node_id: str = "", mode: str =
     for node in selected:
         nid = str(node.get("id") or "")
         try:
-            if _is_real_turn_health_mode(clean_mode):
-                payload = _call_node_api(
-                    node,
-                    "POST",
-                    "/auth/health-check",
-                    {
-                        "profile": name,
-                        "mode": clean_mode,
-                        "prompt": str(prompt or "").strip(),
-                        "timeout_sec": int(timeout_sec or 0),
-                    },
-                )
-            else:
-                payload = _call_node_api(node, "GET", "/auth/profiles", None)
+            payload = _call_node_api(
+                node,
+                "POST",
+                "/auth/health-check",
+                {
+                    "profile": name,
+                    "mode": clean_mode,
+                    "prompt": str(prompt or "").strip(),
+                    "timeout_sec": int(timeout_sec or 0),
+                },
+            )
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
             profiles = data.get("profiles") if isinstance(data.get("profiles"), list) else []
-            items = [
-                item
-                for item in profiles
-                if isinstance(item, dict) and ((not name) or str(item.get("profile") or "").strip() == name)
-            ]
+            items: List[Dict[str, Any]] = []
+            for item in profiles:
+                if not isinstance(item, dict):
+                    continue
+                profile_name = str(item.get("profile") or "").strip()
+                if (not profile_name) or (name and profile_name != name):
+                    continue
+                items.append(
+                    {
+                        "profile": profile_name,
+                        "email": str(item.get("email") or "").strip(),
+                        "valid": bool(item.get("valid")),
+                        "status": str(item.get("status") or "").strip(),
+                        "reason": str(item.get("reason") or "").strip(),
+                        "last_health_check_at": int(item.get("last_health_check_at") or 0),
+                        "quota": _quota_view_from_profile_item(item),
+                    }
+                )
             out_nodes.append({"node_id": nid, "ok": True, "profiles": items, "error": ""})
         except Exception as exc:
             out_nodes.append({"node_id": nid, "ok": False, "profiles": [], "error": str(exc)})
@@ -2027,9 +2983,234 @@ def _auth_control_health_check(profile: str = "", node_id: str = "", mode: str =
     return {"timestamp": now_ts, "mode": clean_mode, "profile": name, "nodes": out_nodes}
 
 
+def _probe_status_from_probe(probe: Dict[str, Any]) -> Dict[str, Any]:
+    payload = probe if isinstance(probe, dict) else {}
+    ok = bool(payload.get("ok"))
+    status = str(payload.get("status") or "").strip().lower()
+    message = str(payload.get("error") or "").strip()
+    if ok:
+        return {"ok": True, "status": "active", "reason": ""}
+    classified = _classify_auth_error(message)
+    if classified:
+        return {"ok": False, "status": classified, "reason": message}
+    if status and status not in {"completed", "active"}:
+        return {"ok": False, "status": status, "reason": message or f"probe status={status}"}
+    return {"ok": False, "status": "failed", "reason": message or "probe failed"}
+
+
+def _probe_from_non_local_store(profile: str, mode: str, prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    source = _load_auth_payload_from_any_store(name)
+    auth_payload = source.get("auth_json") if isinstance(source.get("auth_json"), dict) else {}
+    cfg_text = str(source.get("config_toml") or "")
+    source_type = str(source.get("source") or "").strip()
+    identity = _auth_identity_from_auth_json(auth_payload if isinstance(auth_payload, dict) else {})
+    temp_seed = f"probe_{name}_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
+    temp_profile = _sanitize_auth_profile_name(temp_seed)
+    probe: Dict[str, Any] = {}
+    try:
+        _install_auth_profile(
+            profile=temp_profile,
+            provider="codex",
+            auth_json=auth_payload,
+            config_toml=cfg_text,
+            assignment_version=0,
+            assignment_token="",
+            assigned_server_id="",
+            notes="temp probe",
+        )
+        if _is_real_turn_health_mode(mode):
+            probe = _real_turn_probe_auth_profile(profile=temp_profile, prompt=prompt, timeout_sec=timeout_sec)
+        else:
+            probe = _quick_quota_probe_auth_profile(profile=temp_profile)
+    finally:
+        _remove_auth_profile_artifacts(temp_profile)
+        _refresh_auth_profiles()
+    return {
+        "source": source_type or "pending",
+        "email": str(identity.get("email") or "").strip(),
+        "probe": probe if isinstance(probe, dict) else {},
+    }
+
+
+def _auth_control_check_one(profile: str, mode: str = "status", prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
+    name = _sanitize_auth_profile_name(profile)
+    clean_mode = str(mode or "status").strip().lower() or "status"
+    probe_prompt = str(prompt or "").strip()
+    probe_timeout = int(timeout_sec or 0)
+    now_ts = int(time.time())
+
+    local_view: Dict[str, Any] = {"exists": False}
+    pool_view: Dict[str, Any] = {"exists": False}
+
+    local_item = _get_auth_profile(name)
+    if isinstance(local_item, dict):
+        checked = _health_check_auth_profile_item(item=local_item, mode=clean_mode, prompt=probe_prompt, timeout_sec=probe_timeout)
+        local_status = str(checked.get("status") or "").strip().lower()
+        local_view = {
+            "exists": True,
+            "email": str(checked.get("email") or "").strip(),
+            "status": str(checked.get("status") or "").strip(),
+            "reason": str(checked.get("reason") or checked.get("last_health_error") or "").strip(),
+            "check_required": bool(checked.get("check_required")),
+            "last_health_check_at": int(checked.get("last_health_check_at") or 0),
+            "quota": _quota_view_from_profile_item(checked if isinstance(checked, dict) else {}),
+            "ok": (not bool(checked.get("check_required"))) and (local_status == "active"),
+            "source": "local",
+        }
+    else:
+        pending_src, _ = _pending_auth_paths(name)
+        backup_src, _ = _backup_auth_paths(name)
+        if (pending_src.exists() and pending_src.is_file()) or (backup_src.exists() and backup_src.is_file()):
+            non_local = _probe_from_non_local_store(name, mode=clean_mode, prompt=probe_prompt, timeout_sec=probe_timeout)
+            probe = non_local.get("probe") if isinstance(non_local.get("probe"), dict) else {}
+            summary = _probe_status_from_probe(probe if isinstance(probe, dict) else {})
+            checked_at = int(probe.get("checked_at") or now_ts)
+            pool_view = {
+                "exists": True,
+                "source": str(non_local.get("source") or "pending"),
+                "email": str(non_local.get("email") or "").strip(),
+                "status": str(summary.get("status") or "").strip(),
+                "reason": str(summary.get("reason") or "").strip(),
+                "ok": bool(summary.get("ok")),
+                "check_required": not bool(summary.get("ok")),
+                "last_health_check_at": checked_at,
+                "quota": _quota_view_from_rate_limits(
+                    probe.get("rate_limits") if isinstance(probe.get("rate_limits"), dict) else {},
+                    updated_at=checked_at,
+                ),
+                "probe": probe,
+            }
+
+    remote_probe = _auth_control_health_check(
+        profile=name,
+        node_id="",
+        mode=clean_mode,
+        prompt=probe_prompt,
+        timeout_sec=probe_timeout,
+    )
+    remote_nodes_raw = remote_probe.get("nodes") if isinstance(remote_probe.get("nodes"), list) else []
+    node_label_map: Dict[str, str] = {}
+    for node in _parse_auth_control_nodes():
+        if not isinstance(node, dict):
+            continue
+        nid = str(node.get("id") or "").strip()
+        if nid:
+            node_label_map[nid] = str(node.get("label") or nid).strip()
+    remote_nodes: List[Dict[str, Any]] = []
+    for node in remote_nodes_raw:
+        if not isinstance(node, dict):
+            continue
+        nid = str(node.get("node_id") or "").strip()
+        row: Dict[str, Any] = {
+            "node_id": nid,
+            "label": node_label_map.get(nid) or nid,
+            "api_ok": bool(node.get("ok")),
+            "error": str(node.get("error") or "").strip(),
+            "present": False,
+            "ok": False,
+            "status": "",
+            "reason": "",
+            "quota": _quota_view_from_rate_limits({}, updated_at=0),
+            "email": "",
+        }
+        profiles = node.get("profiles") if isinstance(node.get("profiles"), list) else []
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("profile") or "").strip() != name:
+                continue
+            row["present"] = True
+            row["status"] = str(item.get("status") or "").strip()
+            row["reason"] = str(item.get("reason") or "").strip()
+            row["email"] = str(item.get("email") or "").strip()
+            row["quota"] = dict(item.get("quota") or {})
+            row["ok"] = bool(node.get("ok")) and str(item.get("status") or "").strip().lower() == "active"
+            break
+        remote_nodes.append(row)
+
+    if (not bool(local_view.get("exists"))) and (not bool(pool_view.get("exists"))):
+        if not any(bool(item.get("present")) for item in remote_nodes):
+            raise HTTPException(status_code=404, detail=f"profile not found in local/pending/remote: {name}")
+
+    return {
+        "timestamp": now_ts,
+        "profile": name,
+        "mode": clean_mode,
+        "local": local_view,
+        "pool": pool_view,
+        "remote_nodes": remote_nodes,
+    }
+
+
 def _is_real_turn_health_mode(mode: str) -> bool:
     clean = str(mode or "").strip().lower()
     return clean in {"real", "real_turn", "turn", "conversation", "chat"}
+
+
+def _quick_quota_probe_auth_profile(profile: str) -> Dict[str, Any]:
+    clean = str(profile or "").strip()
+    runtime_id = f"diag_auth_quick_{clean or 'default'}_{int(time.time() * 1000)}"
+    runtime = RUNTIMES.get(runtime_id)
+    done_error = ""
+    done_rate_limits: Dict[str, Any] = {}
+    try:
+        with runtime.lock:
+            runtime.last_input_at = int(time.time())
+            runtime.cwd = DEFAULT_CWD
+            runtime.model = DEFAULT_MODEL
+            runtime.sandbox = DEFAULT_SANDBOX
+            runtime.approval_policy = DEFAULT_APPROVAL
+            runtime.personality = DEFAULT_PERSONALITY
+            _switch_runtime_auth_profile(
+                runtime,
+                profile=clean,
+                reason="history auth quick quota-check",
+                allow_invalid=True,
+            )
+            _ensure_thread(runtime, reset_thread=True)
+        try:
+            done_rate_limits = _extract_rate_limits_payload(runtime.client.get_account_rate_limits())
+            if not done_rate_limits:
+                done_rate_limits = _extract_rate_limits_payload(runtime.client.account_rate_limits_read())
+        except Exception as exc:
+            done_error = str(exc)
+            done_rate_limits = {}
+    except HTTPException as exc:
+        done_error = str(exc.detail or exc)
+    except Exception as exc:
+        done_error = str(exc)
+    finally:
+        with runtime.lock:
+            runtime.active_turn_id = ""
+            runtime.thread_id = ""
+            try:
+                runtime.client.stop()
+            except Exception:
+                pass
+            _persist_runtime(
+                runtime,
+                {
+                    "thread_id": "",
+                    "active_turn_id": "",
+                    "last_turn_status": "completed" if not done_error else "failed",
+                    "last_turn_id": "",
+                    "last_turn_at": int(time.time()),
+                    "last_error": done_error[:1200] if done_error else "",
+                },
+            )
+    ok = not bool(done_error)
+    return {
+        "ok": ok,
+        "status": "completed" if ok else "failed",
+        "error": done_error[:1200] if done_error else "",
+        "assistant_text": "",
+        "rate_limits": dict(done_rate_limits or {}),
+        "thread_id": "",
+        "turn_id": "",
+        "checked_at": int(time.time()),
+        "mode": "quick_quota",
+    }
 
 
 def _real_turn_probe_auth_profile(profile: str, prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
@@ -2044,6 +3225,7 @@ def _real_turn_probe_auth_profile(profile: str, prompt: str = "", timeout_sec: i
     done_error = ""
     done_status = ""
     done_text = ""
+    done_rate_limits: Dict[str, Any] = {}
     try:
         with runtime.lock:
             runtime.last_input_at = int(time.time())
@@ -2065,6 +3247,12 @@ def _real_turn_probe_auth_profile(profile: str, prompt: str = "", timeout_sec: i
         done_text = str(done.text or "")
         if isinstance(done.error, dict) and done.error:
             done_error = json.dumps(done.error, ensure_ascii=False)
+        try:
+            done_rate_limits = _extract_rate_limits_payload(runtime.client.get_account_rate_limits())
+            if not done_rate_limits:
+                done_rate_limits = _extract_rate_limits_payload(runtime.client.account_rate_limits_read())
+        except Exception:
+            done_rate_limits = {}
     except HTTPException as exc:
         done_error = str(exc.detail or exc)
     except Exception as exc:
@@ -2096,6 +3284,7 @@ def _real_turn_probe_auth_profile(profile: str, prompt: str = "", timeout_sec: i
         "status": done_status or ("completed" if ok else "failed"),
         "error": done_error[:1200] if done_error else "",
         "assistant_text": done_text[:200],
+        "rate_limits": dict(done_rate_limits or {}),
         "thread_id": thread_id,
         "turn_id": turn_id,
         "checked_at": int(time.time()),
@@ -2112,7 +3301,12 @@ def _apply_health_probe_result(profile: str, probe: Dict[str, Any]) -> Dict[str,
     patch: Dict[str, Any] = {
         "last_health_check_at": now_ts,
         "updated_at": now_ts,
+        "check_required": False,
     }
+    probe_limits = probe.get("rate_limits")
+    if isinstance(probe_limits, dict) and probe_limits:
+        patch["last_rate_limits"] = dict(probe_limits)
+        patch["last_rate_limits_at"] = now_ts
     if ok:
         patch.update(
             {
@@ -2154,7 +3348,7 @@ def _apply_health_probe_result(profile: str, probe: Dict[str, Any]) -> Dict[str,
                     "last_health_error": message[:1200],
                 }
             )
-        else:
+        elif classified == "temp_disabled":
             disable_sec = _parse_disable_seconds_from_message(message)
             if disable_sec <= 0:
                 disable_sec = AUTH_REAL_HEALTH_CHECK_FAIL_DISABLE_SEC
@@ -2172,6 +3366,44 @@ def _apply_health_probe_result(profile: str, probe: Dict[str, Any]) -> Dict[str,
                     "last_health_error": reason,
                 }
             )
+        else:
+            # Non-auth failures (for example transient transport disconnects) should not disable the profile.
+            reason = message[:1200] if message else f"真实对话检测失败：status={status or 'failed'}"
+            patch.update({"check_required": True, "last_health_error": reason})
+    _patch_auth_registry_profile(clean, patch)
+    refreshed = _auth_registry_by_profile().get(clean)
+    payload = dict(refreshed or {"profile": clean})
+    payload["last_probe"] = probe
+    return payload
+
+
+def _apply_quick_probe_result(profile: str, probe: Dict[str, Any], previous: Dict[str, Any]) -> Dict[str, Any]:
+    clean = str(profile or "").strip()
+    prior = dict(previous or {})
+    now_ts = int(probe.get("checked_at") or time.time())
+    patch: Dict[str, Any] = {
+        "last_health_check_at": now_ts,
+        "updated_at": now_ts,
+    }
+    probe_limits = probe.get("rate_limits")
+    if isinstance(probe_limits, dict) and probe_limits:
+        patch["last_rate_limits"] = dict(probe_limits)
+        patch["last_rate_limits_at"] = now_ts
+
+    if bool(probe.get("ok")):
+        patch["check_required"] = False
+        if (not bool(prior.get("needs_reauth"))) and (not bool(prior.get("risk_deactivated"))):
+            patch["valid"] = True
+            patch["status"] = "active"
+            patch["reason"] = ""
+            patch["disabled_until"] = 0
+            patch["disabled_reason"] = ""
+            patch["last_health_error"] = ""
+    else:
+        message = str(probe.get("error") or "").strip()
+        if message:
+            patch["last_health_error"] = message[:1200]
+
     _patch_auth_registry_profile(clean, patch)
     refreshed = _auth_registry_by_profile().get(clean)
     payload = dict(refreshed or {"profile": clean})
@@ -2182,9 +3414,8 @@ def _apply_health_probe_result(profile: str, probe: Dict[str, Any]) -> Dict[str,
 def _health_check_auth_profile_item(item: Dict[str, Any], mode: str, prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
     profile = str((item or {}).get("profile") or "").strip()
     if not _is_real_turn_health_mode(mode):
-        payload = dict(item or {})
-        payload["last_probe"] = {"mode": "status", "ok": bool(payload.get("valid")), "checked_at": int(time.time())}
-        return payload
+        probe = _quick_quota_probe_auth_profile(profile=profile)
+        return _apply_quick_probe_result(profile, probe, item if isinstance(item, dict) else {})
     probe = _real_turn_probe_auth_profile(profile=profile, prompt=prompt, timeout_sec=timeout_sec)
     return _apply_health_probe_result(profile, probe)
 
@@ -2325,10 +3556,15 @@ def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     _apply_runtime_bridge_env(runtime)
 
 
-def _switch_runtime_auth_profile(runtime: ChatRuntime, profile: str, reason: str = "") -> Dict[str, Any]:
+def _switch_runtime_auth_profile(
+    runtime: ChatRuntime,
+    profile: str,
+    reason: str = "",
+    allow_invalid: bool = False,
+) -> Dict[str, Any]:
     target = str(profile or "").strip()
     meta = _get_auth_profile(target) if target else {"profile": "", "email": "", "home_dir": ""}
-    if target and (not meta or not bool(meta.get("valid"))):
+    if target and (not meta or ((not bool(allow_invalid)) and (not bool(meta.get("valid"))))):
         raise HTTPException(status_code=400, detail=f"invalid auth profile: {target}")
     previous = str(runtime.auth_profile or "").strip()
     runtime.auth_profile = target
@@ -2381,18 +3617,33 @@ def _maybe_auto_switch_auth_profile(runtime: ChatRuntime, reason: str = "") -> O
     return info
 
 
-def _ensure_thread(runtime: ChatRuntime, reset_thread: bool = False) -> str:
+def _ensure_thread_info(runtime: ChatRuntime, reset_thread: bool = False) -> Dict[str, Any]:
+    prev_thread_id = str(runtime.thread_id or "").strip()
+    info: Dict[str, Any] = {
+        "thread_id": "",
+        "previous_thread_id": prev_thread_id,
+        "reset_thread": bool(reset_thread),
+        "client_started": False,
+        "resume_attempted": False,
+        "resumed": False,
+        "resume_failed": False,
+        "created_new": False,
+    }
+
     if reset_thread:
         runtime.thread_id = ""
         runtime.active_turn_id = ""
 
     if runtime.thread_id and runtime.is_client_running():
-        return runtime.thread_id
+        info["thread_id"] = str(runtime.thread_id or "")
+        return info
 
     if not runtime.is_client_running():
         runtime.client.start()
+        info["client_started"] = True
 
     if runtime.thread_id:
+        info["resume_attempted"] = True
         try:
             runtime.client.thread_resume(
                 thread_id=runtime.thread_id,
@@ -2401,8 +3652,11 @@ def _ensure_thread(runtime: ChatRuntime, reset_thread: bool = False) -> str:
                 sandbox=runtime.sandbox,
                 approval_policy=runtime.approval_policy,
             )
-            return runtime.thread_id
+            info["resumed"] = True
+            info["thread_id"] = str(runtime.thread_id or "")
+            return info
         except Exception as exc:
+            info["resume_failed"] = True
             LOG.warning("thread resume failed, creating new thread chat_id=%s err=%s", runtime.chat_id, exc)
             runtime.thread_id = ""
 
@@ -2417,8 +3671,14 @@ def _ensure_thread(runtime: ChatRuntime, reset_thread: bool = False) -> str:
     runtime.thread_id = str(thread.get("id") or "")
     if not runtime.thread_id:
         raise AppServerError(f"thread/start returned no thread id: {started}")
+    info["created_new"] = True
+    info["thread_id"] = runtime.thread_id
     _persist_runtime(runtime)
-    return runtime.thread_id
+    return info
+
+
+def _ensure_thread(runtime: ChatRuntime, reset_thread: bool = False) -> str:
+    return str(_ensure_thread_info(runtime, reset_thread=reset_thread).get("thread_id") or "")
 
 
 APP = FastAPI(title="feicodex-rocket-bridge", version="0.2.0")
@@ -2640,6 +3900,12 @@ def auth_control_upload(body: AuthControlUploadRequest) -> Dict[str, Any]:
     return {"ok": True, "data": data}
 
 
+@ROUTER.post("/auth/control/upload-batch", dependencies=[Depends(require_api_token)])
+def auth_control_upload_batch(body: AuthControlBatchUploadRequest) -> Dict[str, Any]:
+    data = _auth_control_batch_upload(provider=body.provider, items=body.items, notes=body.notes)
+    return {"ok": True, "data": data}
+
+
 @ROUTER.post("/auth/control/assign", dependencies=[Depends(require_api_token)])
 def auth_control_assign(body: AuthControlAssignRequest) -> Dict[str, Any]:
     data = _auth_control_assign(
@@ -2658,11 +3924,40 @@ def auth_control_revoke(body: AuthControlRevokeRequest) -> Dict[str, Any]:
     return {"ok": True, "data": data}
 
 
+@ROUTER.post("/auth/control/remove-remote", dependencies=[Depends(require_api_token)])
+def auth_control_remove_remote(body: AuthControlRemoveRemoteRequest) -> Dict[str, Any]:
+    data = _auth_control_remove_remote(profile=body.profile, node_id=body.node_id, reason=body.reason)
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/remove-local", dependencies=[Depends(require_api_token)])
+def auth_control_remove_local(body: AuthControlRemoveLocalRequest) -> Dict[str, Any]:
+    data = _auth_control_remove_local(profile=body.profile, reason=body.reason)
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/remove-pool", dependencies=[Depends(require_api_token)])
+def auth_control_remove_pool(body: AuthControlRemovePoolRequest) -> Dict[str, Any]:
+    data = _auth_control_remove_pool(profile=body.profile, reason=body.reason)
+    return {"ok": True, "data": data}
+
+
 @ROUTER.post("/auth/control/health-check", dependencies=[Depends(require_api_token)])
 def auth_control_health_check(body: AuthControlHealthCheckRequest) -> Dict[str, Any]:
     data = _auth_control_health_check(
         profile=body.profile,
         node_id=body.node_id,
+        mode=body.mode,
+        prompt=body.prompt,
+        timeout_sec=int(body.timeout_sec or 0),
+    )
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/check-one", dependencies=[Depends(require_api_token)])
+def auth_control_check_one(body: AuthControlCheckOneRequest) -> Dict[str, Any]:
+    data = _auth_control_check_one(
+        profile=body.profile,
         mode=body.mode,
         prompt=body.prompt,
         timeout_sec=int(body.timeout_sec or 0),
@@ -2746,6 +4041,9 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     turn_started_at = 0
     thread_id = ""
     turn_id = ""
+    turn_record_id = ""
+    checkpoint_stop: Optional[threading.Event] = None
+    checkpoint_thread: Optional[threading.Thread] = None
     turn_cwd = ""
     turn_model = ""
     turn_auth_profile = ""
@@ -2755,10 +4053,14 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
         _apply_runtime_auth_profile(runtime)
-        _maybe_self_heal_disconnected_runtime(runtime)
+        heal_info = _maybe_self_heal_disconnected_runtime(runtime)
         turn_cwd = str(runtime.cwd or DEFAULT_CWD)
         turn_model = str(runtime.model or DEFAULT_MODEL)
         turn_auth_profile = str(runtime.auth_profile or "")
+        project_name = str(_runtime_project_name(runtime.chat_id) or _project_label_for_cwd(turn_cwd) or "").strip()
+        is_resume_hint = _looks_like_resume_prompt(visible_user_text)
+        had_live_client_before = runtime.is_client_running()
+        memory_hint = bool(body.reset_thread) or is_resume_hint or bool((heal_info or {}).get("healed"))
         preflight_limits = _read_rate_limits(runtime, allow_request=runtime.is_client_running())
         if not preflight_limits:
             persisted = STORE.get_chat(chat_id)
@@ -2768,13 +4070,48 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
         if _rate_limit_exhausted(preflight_limits):
             auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="preflight rate limit exhausted")
         try:
-            thread_id = _ensure_thread(runtime, reset_thread=bool(body.reset_thread))
+            ensure_info = _ensure_thread_info(runtime, reset_thread=bool(body.reset_thread))
+            thread_id = str(ensure_info.get("thread_id") or "")
         except AppServerError as exc:
             state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "failed"})
             raise HTTPException(
                 status_code=502,
                 detail={"ok": False, "error": str(exc), "thread_id": runtime.thread_id, "state": state},
             ) from exc
+        created_new_thread = bool(ensure_info.get("created_new"))
+        previous_thread_id = str(ensure_info.get("previous_thread_id") or "").strip()
+        recovered_after_restart = bool(
+            created_new_thread
+            and (
+                bool(previous_thread_id)
+                or bool(ensure_info.get("resume_attempted"))
+                or bool(ensure_info.get("resume_failed"))
+                or bool(ensure_info.get("client_started"))
+                or (not had_live_client_before)
+            )
+        )
+        should_inject_memory = bool(
+            AUTO_MEMORY_INJECT_ENABLED
+            and (
+                memory_hint
+                or recovered_after_restart
+                or (created_new_thread and not previous_thread_id)
+            )
+        )
+        if recovered_after_restart:
+            LOG.info(
+                "auto memory inject trigger: rebuilt thread after restart/resume failure chat_id=%s prev_thread=%s new_thread=%s",
+                runtime.chat_id,
+                previous_thread_id or "",
+                thread_id,
+            )
+        if should_inject_memory:
+            prefix = _build_auto_memory_prefix(project=project_name, user_text=visible_user_text)
+            if prefix:
+                turn_input_text = (
+                    f"{prefix}\n\n[Current User Message]\n{visible_user_text}\n\n"
+                    "请基于以上历史信息继续，并优先延续之前未完成的工作。"
+                )
         active_now = str(runtime.client.get_active_turn_id(thread_id) or "")
         if active_now != str(runtime.active_turn_id or ""):
             runtime.active_turn_id = active_now
@@ -2855,7 +4192,51 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
 
         runtime.active_turn_id = turn_id
         turn_started_at = int(time.time())
+        turn_record_id = f"{turn_started_at}_{runtime.chat_id}_{turn_id or 'no_turn'}"
         _persist_runtime(runtime, {"last_user_text": visible_user_text, "last_error": ""})
+
+    def _flush_turn_checkpoint(
+        status: str,
+        assistant_text: str = "",
+        error_text: str = "",
+        ended_at: int = 0,
+        token_usage: Optional[Dict[str, Any]] = None,
+        rate_limits: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not turn_id:
+            return
+        try:
+            HISTORY_STORE.append_turn(
+                _build_turn_record(
+                    runtime=runtime,
+                    turn_id=turn_id,
+                    status=status,
+                    started_at=turn_started_at,
+                    ended_at=(ended_at or int(time.time())),
+                    user_text=visible_user_text,
+                    assistant_text=assistant_text,
+                    error_text=error_text,
+                    thread_id=thread_id,
+                    cwd=turn_cwd,
+                    model=turn_model,
+                    auth_profile=turn_auth_profile,
+                    token_usage=token_usage,
+                    rate_limits=rate_limits,
+                    record_id=turn_record_id,
+                )
+            )
+        except Exception as exc:
+            LOG.warning("checkpoint turn persist failed chat_id=%s turn_id=%s err=%s", runtime.chat_id, turn_id, exc)
+
+    checkpoint_stop = threading.Event()
+    _flush_turn_checkpoint(status="running")
+
+    def _checkpoint_loop() -> None:
+        while checkpoint_stop and not checkpoint_stop.wait(TURN_CHECKPOINT_INTERVAL_SEC):
+            _flush_turn_checkpoint(status="running")
+
+    checkpoint_thread = threading.Thread(target=_checkpoint_loop, daemon=True)
+    checkpoint_thread.start()
 
     try:
         done = runtime.client.wait_for_turn_completion(
@@ -2863,6 +4244,10 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             turn_id=turn_id,
             timeout_sec=int(body.timeout_sec),
         )
+        if checkpoint_stop:
+            checkpoint_stop.set()
+        if checkpoint_thread:
+            checkpoint_thread.join(timeout=0.3)
         thread_status = runtime.client.get_thread_status(thread_id)
         token_usage = runtime.client.get_thread_token_usage(thread_id)
         rate_limits = _read_rate_limits(runtime)
@@ -2903,23 +4288,13 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     if not isinstance(auto_auth_switch, dict):
                         auto_auth_switch = {}
                     auto_auth_switch["note"] = note
-        HISTORY_STORE.append_turn(
-            _build_turn_record(
-                runtime=runtime,
-                turn_id=done.turn_id,
-                status=done.turn_status,
-                started_at=turn_started_at,
-                ended_at=int(time.time()),
-                user_text=visible_user_text,
-                assistant_text=done.text,
-                error_text=json.dumps(done.error, ensure_ascii=False) if done.error else "",
-                thread_id=thread_id,
-                cwd=turn_cwd,
-                model=turn_model,
-                auth_profile=turn_auth_profile,
-                token_usage=token_usage,
-                rate_limits=rate_limits,
-            )
+        _flush_turn_checkpoint(
+            status=done.turn_status,
+            assistant_text=done.text,
+            error_text=json.dumps(done.error, ensure_ascii=False) if done.error else "",
+            ended_at=int(time.time()),
+            token_usage=token_usage,
+            rate_limits=rate_limits,
         )
         return {
             "ok": True,
@@ -2937,26 +4312,15 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             },
         }
     except AppServerTimeout as exc:
+        if checkpoint_stop:
+            checkpoint_stop.set()
+        if checkpoint_thread:
+            checkpoint_thread.join(timeout=0.3)
         with runtime.lock:
             active_now = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
             runtime.active_turn_id = active_now
             state = _persist_runtime(runtime, {"last_error": str(exc), "last_turn_status": "timeout"})
-        HISTORY_STORE.append_turn(
-            _build_turn_record(
-                runtime=runtime,
-                turn_id=turn_id or active_now,
-                status="timeout",
-                started_at=turn_started_at,
-                ended_at=int(time.time()),
-                user_text=visible_user_text,
-                assistant_text="",
-                error_text=str(exc),
-                thread_id=thread_id,
-                cwd=turn_cwd,
-                model=turn_model,
-                auth_profile=turn_auth_profile,
-            )
-        )
+        _flush_turn_checkpoint(status="timeout", error_text=str(exc), ended_at=int(time.time()))
         raise HTTPException(
             status_code=504,
             detail={
@@ -2968,6 +4332,10 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             },
         ) from exc
     except AppServerError as exc:
+        if checkpoint_stop:
+            checkpoint_stop.set()
+        if checkpoint_thread:
+            checkpoint_thread.join(timeout=0.3)
         disconnected = isinstance(exc, AppServerDisconnected)
         handled = _apply_auth_error_policy(
             runtime,
@@ -2996,26 +4364,17 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             state_patch: Dict[str, Any] = {"last_error": err_text, "last_turn_status": "failed"}
             state_patch.update(disconnect_patch)
             state = _persist_runtime(runtime, state_patch)
-        HISTORY_STORE.append_turn(
-            _build_turn_record(
-                runtime=runtime,
-                turn_id=turn_id or active_for_record,
-                status="failed",
-                started_at=turn_started_at,
-                ended_at=int(time.time()),
-                user_text=visible_user_text,
-                assistant_text="",
-                error_text=err_text,
-                thread_id=thread_id,
-                cwd=turn_cwd,
-                model=turn_model,
-                auth_profile=turn_auth_profile,
-            )
-        )
+        _flush_turn_checkpoint(status="failed", error_text=err_text, ended_at=int(time.time()))
         raise HTTPException(
             status_code=502,
             detail={"ok": False, "error": err_text, "thread_id": runtime.thread_id, "state": state},
         ) from exc
+    except Exception:
+        if checkpoint_stop:
+            checkpoint_stop.set()
+        if checkpoint_thread:
+            checkpoint_thread.join(timeout=0.3)
+        raise
 
 
 @ROUTER.post("/chat/{chat_id}/turn/steer", dependencies=[Depends(require_api_token)])
@@ -3301,7 +4660,7 @@ def history_memory_search_api(
     request: Request,
     project: str = Query(default=""),
     query: str = Query(default=""),
-    limit: int = Query(default=8, ge=1, le=20),
+    limit: int = Query(default=8, ge=1, le=100),
     include_turn_text: bool = Query(default=False),
     exclude_chat_id: str = Query(default=""),
     token: str = Query(default=""),
@@ -3464,6 +4823,18 @@ def history_auth_control_upload_api(
     return JSONResponse({"ok": True, "data": data})
 
 
+@APP.post("/history/api/auth/control/upload-batch")
+def history_auth_control_upload_batch_api(
+    body: AuthControlBatchUploadRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_batch_upload(provider=body.provider, items=body.items, notes=body.notes)
+    return JSONResponse({"ok": True, "data": data})
+
+
 @APP.post("/history/api/auth/control/assign")
 def history_auth_control_assign_api(
     body: AuthControlAssignRequest,
@@ -3494,6 +4865,42 @@ def history_auth_control_revoke_api(
     return JSONResponse({"ok": True, "data": data})
 
 
+@APP.post("/history/api/auth/control/remove-remote")
+def history_auth_control_remove_remote_api(
+    body: AuthControlRemoveRemoteRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_remove_remote(profile=body.profile, node_id=body.node_id, reason=body.reason)
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/remove-local")
+def history_auth_control_remove_local_api(
+    body: AuthControlRemoveLocalRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_remove_local(profile=body.profile, reason=body.reason)
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/remove-pool")
+def history_auth_control_remove_pool_api(
+    body: AuthControlRemovePoolRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_remove_pool(profile=body.profile, reason=body.reason)
+    return JSONResponse({"ok": True, "data": data})
+
+
 @APP.post("/history/api/auth/control/health-check")
 def history_auth_control_health_check_api(
     body: AuthControlHealthCheckRequest,
@@ -3505,6 +4912,23 @@ def history_auth_control_health_check_api(
     data = _auth_control_health_check(
         profile=body.profile,
         node_id=body.node_id,
+        mode=body.mode,
+        prompt=body.prompt,
+        timeout_sec=int(body.timeout_sec or 0),
+    )
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/check-one")
+def history_auth_control_check_one_api(
+    body: AuthControlCheckOneRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_check_one(
+        profile=body.profile,
         mode=body.mode,
         prompt=body.prompt,
         timeout_sec=int(body.timeout_sec or 0),
@@ -3538,59 +4962,73 @@ def history_auth_control_page(
     main {{ padding: 16px; display: grid; gap: 16px; }}
     .card {{ background: #fff; border: 1px solid #d9e2ec; border-radius: 10px; padding: 12px; }}
     .row {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
-    input, select, textarea, button {{ font: inherit; padding: 8px; border-radius: 8px; border: 1px solid #c5d2e0; }}
-    textarea {{ width: 100%; min-height: 120px; }}
+    .muted {{ color: #64748b; font-size: 12px; }}
+    .drop-zone {{ border: 2px dashed #a9bdd8; border-radius: 10px; padding: 16px; background: #f8fbff; text-align: center; }}
+    .drop-zone.dragover {{ border-color: #1d4ed8; background: #eef4ff; }}
+    .pool-list {{ display: grid; gap: 8px; }}
+    .pool-item {{ border: 1px solid #d7e3f2; border-radius: 8px; padding: 8px; background: #fbfdff; cursor: grab; }}
+    .env-grid {{ display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 8px; }}
+    .env-drop {{ border: 1px dashed #b8c8df; border-radius: 8px; min-height: 72px; padding: 8px; background: #f9fbff; }}
+    .env-drop.over {{ border-color: #1d4ed8; background: #eef4ff; }}
+    .board-grid {{ display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+    .board-col {{ border: 1px solid #d9e2ec; border-radius: 10px; background: #fbfdff; min-height: 120px; }}
+    .board-col.over {{ border-color: #1d4ed8; background: #eef4ff; }}
+    .board-col h4 {{ margin: 0; padding: 10px; border-bottom: 1px solid #e6edf7; font-size: 14px; }}
+    .board-body {{ padding: 8px; display: grid; gap: 8px; }}
+    .auth-item {{ border: 1px solid #d7e3f2; border-radius: 8px; padding: 8px; background: #fff; cursor: grab; }}
+    .auth-head {{ display: flex; justify-content: space-between; gap: 6px; align-items: center; }}
+    .tag-dup {{ font-size: 10px; border-radius: 999px; padding: 2px 6px; background: #fff1f2; color: #b91c1c; border: 1px solid #fecdd3; }}
+    .status-pill {{ display: inline-block; font-size: 10px; border-radius: 999px; padding: 2px 6px; margin-top: 4px; }}
+    .status-running {{ background: #dbeafe; color: #1d4ed8; }}
+    .status-ok {{ background: #dcfce7; color: #166534; }}
+    .status-bad {{ background: #fee2e2; color: #991b1b; }}
+    .mini {{ font-size: 11px; padding: 4px 6px; border-radius: 6px; }}
+    .node-chip {{ display: inline-block; margin: 2px 4px 2px 0; padding: 3px 7px; border-radius: 999px; font-size: 11px; border: 1px solid #d6e4ff; background: #f7faff; }}
+    input, select, button {{ font: inherit; padding: 8px; border-radius: 8px; border: 1px solid #c5d2e0; }}
     button {{ background: #1d4ed8; color: #fff; border: 0; cursor: pointer; }}
+    button:disabled {{ opacity: .65; cursor: not-allowed; }}
     button.alt {{ background: #64748b; }}
+    button.danger {{ background: #b91c1c; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ border-bottom: 1px solid #e5edf5; text-align: left; padding: 8px; vertical-align: top; }}
     code {{ background: #f2f7ff; padding: 2px 6px; border-radius: 6px; }}
-    #log {{ white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #09111f; color: #d6e2ff; padding: 10px; border-radius: 8px; max-height: 240px; overflow: auto; }}
+    #log {{ white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #09111f; color: #d6e2ff; padding: 10px; border-radius: 8px; max-height: 220px; overflow: auto; }}
   </style>
 </head>
 <body>
-  <header>Auth 集中管理（上传 / 分配 / 巡检）</header>
+  <header>Auth 集中管理（池中 / 已分配）</header>
   <main>
     <section class="card">
       <div class="row">
         <button onclick="refreshState()">刷新状态</button>
-        <button class="alt" onclick="healthCheck()">一键巡检</button>
+        <select id="hc_mode">
+          <option value="status">快检：刷新额度（不跑完整对话）</option>
+          <option value="real">慢检：真实对话可用性（更慢）</option>
+        </select>
+        <button id="btn_health_check" onclick="healthCheck()">一键巡检</button>
+        <span class="muted">待分配池目录：<code id="pending_dir">-</code></span>
       </div>
       <div id="summary" style="margin-top:8px;color:#4b5563;"></div>
     </section>
+
     <section class="card">
-      <h3>上传 Auth</h3>
-      <div class="row">
-        <input id="up_profile" placeholder="profile 名称，例如 work_01" style="min-width: 220px;" />
-        <select id="up_provider"><option value="codex">codex</option><option value="openclaw">openclaw</option></select>
-        <input id="up_label" placeholder="label（可选）" style="min-width: 180px;" />
+      <h3>批量上传到池中</h3>
+      <div id="upload_drop" class="drop-zone">
+        拖拽多个 auth.json 到这里，或 <input id="upload_files" type="file" multiple accept=".json,.auth.json" />
       </div>
-      <div style="margin-top:8px;"><textarea id="up_auth_json" placeholder='粘贴 auth.json 内容（JSON）'></textarea></div>
-      <div style="margin-top:8px;"><textarea id="up_config_toml" placeholder='config.toml（可选）'></textarea></div>
-      <div class="row" style="margin-top:8px;"><input id="up_notes" placeholder="备注（可选）" style="min-width: 320px;" /><button onclick="uploadAuth()">上传</button></div>
-    </section>
-    <section class="card">
-      <h3>分配 / 回收</h3>
-      <div class="row">
-        <select id="assign_profile"></select>
-        <select id="assign_node"></select>
-        <input id="assign_lease" type="number" min="60" step="60" value="{AUTH_CONTROL_DEFAULT_LEASE_SEC}" />
-        <label><input id="assign_force" type="checkbox" />force 迁移</label>
-        <button onclick="assignAuth()">分配</button>
-        <button class="alt" onclick="revokeAuth()">回收</button>
+      <div class="row" style="margin-top:8px;">
+        <select id="upload_provider"><option value="codex">codex</option><option value="openclaw">openclaw</option></select>
+        <input id="upload_notes" placeholder="备注（可选）" style="min-width: 220px;" />
+        <button onclick="uploadSelectedFiles()">上传到池中</button>
       </div>
+      <div id="upload_selected" class="muted" style="margin-top:8px;">尚未选择文件</div>
     </section>
+
     <section class="card">
-      <h3>Auth 列表</h3>
-      <table>
-        <thead><tr><th>Profile</th><th>Provider</th><th>本地健康</th><th>分配状态</th><th>租约</th></tr></thead>
-        <tbody id="auth_rows"></tbody>
-      </table>
+      <h3>池中与各服务器（拖拽迁移）</h3>
+      <div id="auth_board" class="board-grid"></div>
     </section>
-    <section class="card">
-      <h3>节点巡检结果</h3>
-      <div id="node_health"></div>
-    </section>
+
     <section class="card"><h3>操作日志</h3><div id="log"></div></section>
   </main>
   <script>
@@ -3598,11 +5036,16 @@ def history_auth_control_page(
     const cfg = window.__AUTH_CONTROL_CONFIG__ || {{}};
     const q = cfg.authToken ? `?token=${{encodeURIComponent(cfg.authToken)}}` : '';
     let latestState = null;
+    let selectedFiles = [];
+    let dragProfile = '';
+    let healthCheckRunning = false;
+
     function appendLog(msg) {{
       const el = document.getElementById('log');
       const ts = new Date().toLocaleString();
       el.textContent = `[${{ts}}] ${{msg}}\\n` + el.textContent;
     }}
+
     async function api(path, method='GET', body=null) {{
       const resp = await fetch(path + q, {{
         method,
@@ -3613,84 +5056,518 @@ def history_auth_control_page(
       if (!resp.ok || data.ok === false) throw new Error(data.error || data.detail || resp.statusText);
       return data.data;
     }}
+
+    function fmtPct(v) {{
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return '-';
+      return `${{Number(v).toFixed(1)}}%`;
+    }}
+
+    function quotaText(q) {{
+      const primary = (q && q.primary) ? q.primary : {{}};
+      const secondary = (q && q.secondary) ? q.secondary : {{}};
+      const left5 = fmtPct(primary.remaining_pct);
+      const left7 = fmtPct(secondary.remaining_pct);
+      if (left5 === '-' && left7 === '-') return '5h: 未上报 · 7d: 未上报';
+      return `5h: ${{left5}} · 7d: ${{left7}}`;
+    }}
+
+    function localStatusText(local) {{
+      const l = local || {{}};
+      if (!l.exists) return '本机无';
+      if (l.check_required) return '未检测';
+      return l.status || 'unknown';
+    }}
+
+    function hasQuotaData(q) {{
+      if (!q || typeof q !== 'object') return false;
+      const p = q.primary || {{}};
+      const s = q.secondary || {{}};
+      const a = p.remaining_pct;
+      const b = s.remaining_pct;
+      return a !== null && a !== undefined || b !== null && b !== undefined;
+    }}
+
+    function quotaForEnv(auth, envId) {{
+      if (!auth) return {{}};
+      if (envId === 'local') return (auth.local && auth.local.quota) ? auth.local.quota : {{}};
+      if (envId === 'pool') {{
+        const lq = (auth.local && auth.local.quota) ? auth.local.quota : {{}};
+        if (hasQuotaData(lq)) return lq;
+        const rows = Array.isArray(auth.nodes) ? auth.nodes : [];
+        for (const row of rows) {{
+          const rq = (row && row.quota) ? row.quota : {{}};
+          if (hasQuotaData(rq)) return rq;
+        }}
+        return lq;
+      }}
+      const row = findNode(auth, envId) || {{}};
+      return (row && row.quota) ? row.quota : {{}};
+    }}
+
+    function setHealthCheckBusy(busy) {{
+      const btn = document.getElementById('btn_health_check');
+      if (!btn) return;
+      btn.disabled = !!busy;
+      btn.textContent = busy ? '巡检中...' : '一键巡检';
+    }}
+
+    const DEFAULT_LEASE_SEC = {AUTH_CONTROL_DEFAULT_LEASE_SEC};
+    const opState = {{}};
+
+    function findAuth(profile) {{
+      const auths = (latestState && Array.isArray(latestState.auths)) ? latestState.auths : [];
+      return auths.find(a => (a.profile || '') === (profile || '')) || null;
+    }}
+
+    function findNode(auth, nodeId) {{
+      const nodes = (auth && Array.isArray(auth.nodes)) ? auth.nodes : [];
+      return nodes.find(n => (n.node_id || '') === (nodeId || '')) || null;
+    }}
+
+    function setOp(profile, text, kind='running') {{
+      if (!profile) return;
+      opState[profile] = {{ text: String(text || ''), kind: String(kind || 'running'), ts: Date.now() }};
+      if (latestState) renderBoard(latestState);
+    }}
+
+    function cleanupOps() {{
+      const now = Date.now();
+      for (const k of Object.keys(opState)) {{
+        const ts = Number(opState[k]?.ts || 0);
+        if (now - ts > 180000) delete opState[k];
+      }}
+    }}
+
+    function envList(data) {{
+      return Array.isArray(data?.environments) ? data.environments : [];
+    }}
+
+    function inEnv(auth, envId) {{
+      if (!auth || !envId) return false;
+      if (envId === 'pool') return (auth.group || '') === 'pool';
+      if ((auth.group || '') === 'pool') return false;
+      const asg = String((auth.assignment || {{}}).node_id || '').trim();
+      if (envId === 'local') {{
+        if (asg && asg !== 'local') return false;
+        return !!(auth.local && auth.local.exists);
+      }}
+      if (asg) return asg === envId;
+      const n = findNode(auth, envId);
+      return !!(n && n.present);
+    }}
+
+    function remoteDupEmailMap(data) {{
+      const out = {{}};
+      const auths = Array.isArray(data?.auths) ? data.auths : [];
+      const remoteEnvs = envList(data).filter(e => (e.id || '') !== 'local');
+      for (const a of auths) {{
+        const email = String(a?.email || '').trim().toLowerCase();
+        if (!email) continue;
+        let cnt = 0;
+        for (const e of remoteEnvs) {{
+          const n = findNode(a, e.id || '');
+          if (n && n.present) cnt += 1;
+        }}
+        if (cnt > 1) out[email] = true;
+      }}
+      return out;
+    }}
+
+    async function removeFromNode(profile, nodeId) {{
+      if (!profile || !nodeId) return;
+      setOp(profile, '删除中', 'running');
+      try {{
+        await api('/history/api/auth/control/remove-remote', 'POST', {{ profile, node_id: nodeId, reason: 'manual cleanup duplicate' }});
+        await refreshState(false);
+        setOp(profile, '完成：已删除', 'ok');
+      }} catch (e) {{
+        setOp(profile, `失败：${{String(e)}}`, 'bad');
+      }}
+    }}
+
+    async function removeLocalCopy(profile) {{
+      if (!profile) return;
+      setOp(profile, '删除本机中', 'running');
+      try {{
+        await api('/history/api/auth/control/remove-local', 'POST', {{ profile, reason: 'manual remove local shadow' }});
+        await refreshState(false);
+        setOp(profile, '完成：本机已删', 'ok');
+      }} catch (e) {{
+        setOp(profile, `失败：${{String(e)}}`, 'bad');
+      }}
+    }}
+
+    async function removePoolProfile(profile) {{
+      if (!profile) return;
+      setOp(profile, '删除池中中', 'running');
+      try {{
+        await api('/history/api/auth/control/remove-pool', 'POST', {{ profile, reason: 'manual remove pool profile' }});
+        await refreshState(false);
+        setOp(profile, '完成：池中已删', 'ok');
+      }} catch (e) {{
+        setOp(profile, `失败：${{String(e)}}`, 'bad');
+      }}
+    }}
+
+    function summarizeCheckOne(data) {{
+      const payload = data || {{}};
+      const local = payload.local || {{}};
+      const pool = payload.pool || {{}};
+      const nodes = Array.isArray(payload.remote_nodes) ? payload.remote_nodes : [];
+      if (pool.exists) {{
+        return {{
+          ok: !!pool.ok,
+          text: pool.ok ? '检测通过' : (pool.status || '检测异常'),
+        }};
+      }}
+      if (local.exists) {{
+        const ok = (!local.check_required) && String(local.status || '').toLowerCase() === 'active';
+        return {{
+          ok,
+          text: ok ? '检测通过' : (String(local.status || '').trim() || '检测异常'),
+        }};
+      }}
+      const present = nodes.filter(n => !!n.present);
+      if (!present.length) {{
+        return {{ ok: false, text: '未发现可检测节点' }};
+      }}
+      const active = present.every(n => String(n.status || '').toLowerCase() === 'active');
+      return {{
+        ok: active,
+        text: active ? '检测通过' : '检测异常',
+      }};
+    }}
+
+    async function checkAuthOne(profile) {{
+      if (!profile) return;
+      const mode = (document.getElementById('hc_mode')?.value || 'status').trim();
+      setOp(profile, '检测中', 'running');
+      try {{
+        const data = await api('/history/api/auth/control/check-one', 'POST', {{ profile, mode }});
+        await refreshState(false);
+        const summary = summarizeCheckOne(data);
+        setOp(profile, `完成：${{summary.text}}`, summary.ok ? 'ok' : 'bad');
+      }} catch (e) {{
+        setOp(profile, `失败：${{String(e)}}`, 'bad');
+      }}
+    }}
+
+    async function moveAuth(profile, sourceEnv, targetEnv) {{
+      if (!profile || !targetEnv || sourceEnv === targetEnv) return;
+      const auth = findAuth(profile);
+      if (!auth) throw new Error(`未找到 auth: ${{profile}}`);
+      setOp(profile, '迁移中', 'running');
+      try {{
+        if (targetEnv === 'pool') {{
+          const asgNode = String((auth.assignment || {{}}).node_id || '').trim();
+          if (asgNode && asgNode === sourceEnv) {{
+            await api('/history/api/auth/control/revoke', 'POST', {{ profile, reason: `drag:${{sourceEnv}}->pool` }});
+          }} else if (sourceEnv === 'local') {{
+            await api('/history/api/auth/control/revoke', 'POST', {{ profile, reason: 'drag:local->pool' }});
+          }} else {{
+            await api('/history/api/auth/control/remove-remote', 'POST', {{ profile, node_id: sourceEnv, reason: 'drag_to_pool' }});
+          }}
+          setOp(profile, '检测中', 'running');
+          try {{ await api('/history/api/auth/control/health-check', 'POST', {{ profile, mode: 'status' }}); }} catch (_) {{}}
+          await refreshState(false);
+          setOp(profile, '完成：已入池', 'ok');
+          return;
+        }}
+
+        await api('/history/api/auth/control/assign', 'POST', {{
+          profile,
+          node_id: targetEnv,
+          lease_sec: DEFAULT_LEASE_SEC,
+          force: true
+        }});
+        setOp(profile, '检测中', 'running');
+        try {{ await api('/history/api/auth/health-check', 'POST', {{ profile, mode: 'status' }}); }} catch (_) {{}}
+        if (targetEnv !== 'local') {{
+          try {{ await api('/history/api/auth/control/health-check', 'POST', {{ profile, node_id: targetEnv, mode: 'status' }}); }} catch (_) {{}}
+        }}
+        await refreshState(false);
+        const fresh = findAuth(profile);
+        let ok = false;
+        if (targetEnv === 'local') {{
+          const l = (fresh && fresh.local) ? fresh.local : {{}};
+          ok = (!l.check_required) && String(l.status || '').toLowerCase() === 'active';
+        }} else {{
+          const n = findNode(fresh, targetEnv) || {{}};
+          ok = String(n.status || '').toLowerCase() === 'active';
+        }}
+        setOp(profile, ok ? '完成：检测通过' : '完成：检测异常', ok ? 'ok' : 'bad');
+      }} catch (e) {{
+        setOp(profile, `失败：${{String(e)}}`, 'bad');
+      }}
+    }}
+
+    function renderBoard(data) {{
+      const board = document.getElementById('auth_board');
+      board.innerHTML = '';
+      const auths = Array.isArray(data?.auths) ? data.auths : [];
+      const cols = [{{ id: 'pool', label: '池中' }}].concat(envList(data));
+      const dupMap = remoteDupEmailMap(data);
+
+      for (const col of cols) {{
+        const colId = String(col.id || '').trim();
+        const colLabel = String(col.label || colId || '').trim();
+        const items = auths.filter(a => inEnv(a, colId)).sort((a, b) => String(a.profile||'').localeCompare(String(b.profile||'')));
+        const wrap = document.createElement('div');
+        wrap.className = 'board-col';
+        wrap.innerHTML = `<h4>${{colLabel}} <span class="muted">(${{items.length}})</span></h4><div class="board-body"></div>`;
+        const body = wrap.querySelector('.board-body');
+
+        wrap.addEventListener('dragover', (e) => {{
+          e.preventDefault();
+          wrap.classList.add('over');
+        }});
+        wrap.addEventListener('dragleave', () => wrap.classList.remove('over'));
+        wrap.addEventListener('drop', async (e) => {{
+          e.preventDefault();
+          wrap.classList.remove('over');
+          let payload = null;
+          try {{ payload = JSON.parse(e.dataTransfer.getData('text/plain') || '{{}}'); }} catch (_) {{ payload = null; }}
+          if (!payload || !payload.profile) return;
+          await moveAuth(String(payload.profile || ''), String(payload.source || ''), colId);
+        }});
+
+        if (!items.length) {{
+          body.innerHTML = '<div class="muted">空</div>';
+          board.appendChild(wrap);
+          continue;
+        }}
+
+        for (const a of items) {{
+          const item = document.createElement('div');
+          item.className = 'auth-item';
+          item.draggable = true;
+          item.addEventListener('dragstart', (e) => {{
+            dragProfile = String(a.profile || '');
+            e.dataTransfer.setData('text/plain', JSON.stringify({{ profile: String(a.profile || ''), source: colId }}));
+          }});
+
+          const email = String(a.email || '').trim();
+          const emailKey = email.toLowerCase();
+          const dup = (colId !== 'pool' && colId !== 'local' && dupMap[emailKey]) ? '<span class="tag-dup">重复邮箱</span>' : '';
+          let statusText = '';
+          let reasonText = '';
+          if (colId === 'pool') {{
+            statusText = '待分配';
+          }} else if (colId === 'local') {{
+            const l = a.local || {{}};
+            statusText = localStatusText(l);
+            reasonText = String(l.reason || '').trim();
+          }} else {{
+            const n = findNode(a, colId) || {{}};
+            statusText = n.present ? String(n.status || (n.valid ? 'active' : 'unknown')) : '未发现';
+            reasonText = String(n.reason || n.error || '').trim();
+          }}
+          const op = opState[String(a.profile || '')] || null;
+          const opHtml = op ? `<div class="status-pill status-${{op.kind||'running'}}">${{op.text||''}}</div>` : '';
+          const quota = quotaText(quotaForEnv(a, colId));
+          item.innerHTML =
+            `<div class="auth-head"><code>${{a.profile||''}}</code>${{dup}}</div>` +
+            `<div class="muted">${{email||'无邮箱信息'}}</div>` +
+            `<div class="muted">状态：${{statusText}}</div>` +
+            `<div class="muted">额度：${{quota}}</div>` +
+            `${{reasonText ? `<div class="muted">${{reasonText}}</div>` : ''}}` +
+            opHtml;
+
+          const act = document.createElement('div');
+          act.className = 'row';
+          act.style.marginTop = '6px';
+
+          const checkBtn = document.createElement('button');
+          checkBtn.className = 'mini';
+          checkBtn.textContent = '检测';
+          checkBtn.onclick = async () => {{
+            await checkAuthOne(String(a.profile || ''));
+          }};
+          act.appendChild(checkBtn);
+
+          if (colId !== 'pool') {{
+            const backBtn = document.createElement('button');
+            backBtn.className = 'alt mini';
+            backBtn.textContent = '移到池中';
+            backBtn.onclick = async () => {{
+              await moveAuth(String(a.profile || ''), colId, 'pool');
+            }};
+            act.appendChild(backBtn);
+
+            if (colId !== 'local') {{
+              const delBtn = document.createElement('button');
+              delBtn.className = 'danger mini';
+              delBtn.textContent = '删除远程';
+              delBtn.onclick = async () => {{
+                if (!window.confirm(`确认删除远程节点[${{colLabel}}]上的账号 ${{a.profile||''}} 吗？`)) return;
+                await removeFromNode(String(a.profile || ''), colId);
+              }};
+              act.appendChild(delBtn);
+
+              if (a.local && a.local.exists) {{
+                const delLocalBtn = document.createElement('button');
+                delLocalBtn.className = 'alt mini';
+                delLocalBtn.textContent = '删除本机副本';
+                delLocalBtn.onclick = async () => {{
+                  if (!window.confirm(`确认仅删除本机副本 ${{a.profile||''}} 吗？`)) return;
+                  await removeLocalCopy(String(a.profile || ''));
+                }};
+                act.appendChild(delLocalBtn);
+              }}
+            }} else {{
+              const delLocalBtn = document.createElement('button');
+              delLocalBtn.className = 'danger mini';
+              delLocalBtn.textContent = '删除本机节点';
+              delLocalBtn.onclick = async () => {{
+                if (!window.confirm(`确认删除本机节点账号 ${{a.profile||''}} 吗？`)) return;
+                await removeLocalCopy(String(a.profile || ''));
+              }};
+              act.appendChild(delLocalBtn);
+            }}
+          }} else {{
+            const delPoolBtn = document.createElement('button');
+            delPoolBtn.className = 'danger mini';
+            delPoolBtn.textContent = '删除池中';
+            delPoolBtn.onclick = async () => {{
+              if (!window.confirm(`确认删除池中账号 ${{a.profile||''}} 吗？`)) return;
+              await removePoolProfile(String(a.profile || ''));
+            }};
+            act.appendChild(delPoolBtn);
+          }}
+          item.appendChild(act);
+          body.appendChild(item);
+        }}
+        board.appendChild(wrap);
+      }}
+    }}
+
     function renderState(data) {{
       latestState = data;
       const auths = Array.isArray(data.auths) ? data.auths : [];
+      const pool = auths.filter(a => (a.group || '') === 'pool');
+      const assigned = auths.filter(a => (a.group || '') !== 'pool');
       const nodes = Array.isArray(data.nodes) ? data.nodes : [];
-      document.getElementById('summary').textContent = `Auth: ${{auths.length}} | Nodes: ${{nodes.length}} | 更新时间: ${{new Date((data.timestamp||0)*1000).toLocaleString()}}`;
-      const tbody = document.getElementById('auth_rows');
-      tbody.innerHTML = '';
-      const pSel = document.getElementById('assign_profile');
-      pSel.innerHTML = '';
-      for (const a of auths) {{
-        const tr = document.createElement('tr');
-        const h = a.health || {{}};
-        const asg = a.assignment || {{}};
-        tr.innerHTML = `<td><code>${{a.profile||''}}</code></td><td>${{a.provider||''}}</td><td>${{h.status||''}} ${{h.valid?'(ok)':'(bad)'}}<br/>${{h.reason||''}}</td><td>${{asg.node_id||'未分配'}}<br/>v${{asg.version||0}}</td><td>${{a.lease_remaining_sec||0}}s</td>`;
-        tbody.appendChild(tr);
-        const op = document.createElement('option');
-        op.value = a.profile || '';
-        op.textContent = a.profile || '';
-        pSel.appendChild(op);
-      }}
-      const nSel = document.getElementById('assign_node');
-      nSel.innerHTML = '';
-      for (const n of nodes) {{
-        const op = document.createElement('option');
-        op.value = n.id || '';
-        op.textContent = `${{n.id||''}} - ${{n.label||''}}`;
-        nSel.appendChild(op);
-      }}
+      document.getElementById('summary').textContent =
+        `Auth总数: ${{auths.length}} | 池中: ${{pool.length}} | 已分配: ${{assigned.length}} | 节点: ${{nodes.length}} | 更新时间: ${{new Date((data.timestamp||0)*1000).toLocaleString()}}`;
+      document.getElementById('pending_dir').textContent = data.pending_dir || '-';
+      renderBoard(data);
     }}
-    async function refreshState() {{
+
+    async function refreshState(withLog=true) {{
       const data = await api('/history/api/auth/control/state');
       renderState(data);
-      appendLog('state refreshed');
+      if (withLog) appendLog('state refreshed');
     }}
-    async function uploadAuth() {{
-      const profile = document.getElementById('up_profile').value.trim();
-      const provider = document.getElementById('up_provider').value.trim();
-      const label = document.getElementById('up_label').value.trim();
-      const notes = document.getElementById('up_notes').value.trim();
-      const authRaw = document.getElementById('up_auth_json').value.trim();
-      const cfgToml = document.getElementById('up_config_toml').value;
-      if (!profile || !authRaw) throw new Error('profile 和 auth_json 不能为空');
-      let authJson;
-      try {{ authJson = JSON.parse(authRaw); }} catch (e) {{ throw new Error('auth_json 不是合法 JSON'); }}
-      await api('/history/api/auth/control/upload', 'POST', {{ profile, provider, label, notes, auth_json: authJson, config_toml: cfgToml }});
-      appendLog(`upload ok: ${{profile}}`);
-      await refreshState();
-    }}
-    async function assignAuth() {{
-      const profile = document.getElementById('assign_profile').value.trim();
-      const node_id = document.getElementById('assign_node').value.trim();
-      const lease_sec = Number(document.getElementById('assign_lease').value || 0);
-      const force = document.getElementById('assign_force').checked;
-      if (!profile || !node_id) throw new Error('请选择 profile 和 node');
-      await api('/history/api/auth/control/assign', 'POST', {{ profile, node_id, lease_sec, force }});
-      appendLog(`assign ok: ${{profile}} -> ${{node_id}}`);
-      await refreshState();
-    }}
-    async function revokeAuth() {{
-      const profile = document.getElementById('assign_profile').value.trim();
-      if (!profile) throw new Error('请选择 profile');
-      await api('/history/api/auth/control/revoke', 'POST', {{ profile, reason: 'manual' }});
-      appendLog(`revoke ok: ${{profile}}`);
-      await refreshState();
-    }}
-    async function healthCheck() {{
-      const data = await api('/history/api/auth/control/health-check', 'POST', {{ mode: 'status' }});
-      const el = document.getElementById('node_health');
-      el.innerHTML = '';
-      for (const n of (data.nodes||[])) {{
-        const d = document.createElement('div');
-        d.style.padding = '6px 0';
-        d.textContent = `node=${{n.node_id}} ok=${{n.ok}} profiles=${{(n.profiles||[]).length}} error=${{n.error||''}}`;
-        el.appendChild(d);
+
+    function addFiles(fileList) {{
+      const arr = Array.from(fileList || []);
+      for (const f of arr) {{
+        if (!selectedFiles.find(x => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) {{
+          selectedFiles.push(f);
+        }}
       }}
-      appendLog('health check finished');
+      document.getElementById('upload_selected').textContent = selectedFiles.length
+        ? `已选择 ${{selectedFiles.length}} 个文件：` + selectedFiles.map(f => f.name).join(', ')
+        : '尚未选择文件';
     }}
+
+    async function uploadSelectedFiles() {{
+      if (!selectedFiles.length) throw new Error('请先选择文件');
+      const provider = document.getElementById('upload_provider').value.trim();
+      const notes = document.getElementById('upload_notes').value.trim();
+      const items = [];
+      const failed = [];
+      for (const f of selectedFiles) {{
+        try {{
+          const txt = await f.text();
+          items.push({{ filename: f.name, auth_json: JSON.parse(txt), config_toml: '' }});
+        }} catch (e) {{
+          failed.push(`${{f.name}}: JSON 解析失败`);
+        }}
+      }}
+      if (!items.length) throw new Error('没有可上传的合法 JSON');
+      const data = await api('/history/api/auth/control/upload-batch', 'POST', {{ provider, notes, items }});
+      appendLog(`upload batch: created=${{(data.created||[]).length}} failed=${{(data.failed||[]).length + failed.length}}`);
+      if (failed.length) appendLog('upload parse failed: ' + failed.join(' | '));
+      selectedFiles = [];
+      document.getElementById('upload_files').value = '';
+      document.getElementById('upload_selected').textContent = '尚未选择文件';
+      await refreshState();
+    }}
+
+    async function healthCheck() {{
+      if (healthCheckRunning) return;
+      healthCheckRunning = true;
+      setHealthCheckBusy(true);
+      const mode = (document.getElementById('hc_mode')?.value || 'status').trim();
+      try {{
+        try {{
+          appendLog(`health check started (mode=${{mode}})`);
+          await api('/history/api/auth/health-check', 'POST', {{ mode }});
+          appendLog('local health check done');
+        }} catch (e) {{
+          appendLog(`local health check failed: ${{String(e)}}`);
+        }}
+        try {{
+          await api('/history/api/auth/control/health-check', 'POST', {{ mode }});
+          appendLog('remote health check done');
+        }} catch (e) {{
+          appendLog(`remote health check failed: ${{String(e)}}`);
+        }}
+        try {{
+          const auths = Array.isArray(latestState?.auths) ? latestState.auths : [];
+          const poolItems = auths.filter(a => (a.group || '') === 'pool');
+          for (const a of poolItems) {{
+            const profile = String(a.profile || '').trim();
+            if (!profile) continue;
+            setOp(profile, '检测中', 'running');
+            try {{
+              const one = await api('/history/api/auth/control/check-one', 'POST', {{ profile, mode }});
+              const summary = summarizeCheckOne(one);
+              setOp(profile, `完成：${{summary.text}}`, summary.ok ? 'ok' : 'bad');
+            }} catch (e) {{
+              setOp(profile, `失败：${{String(e)}}`, 'bad');
+            }}
+          }}
+          if (poolItems.length) appendLog(`pool health check done: ${{poolItems.length}}`);
+        }} catch (e) {{
+          appendLog(`pool health check failed: ${{String(e)}}`);
+        }}
+        try {{
+          await refreshState(false);
+        }} catch (e) {{
+          appendLog(`refresh failed: ${{String(e)}}`);
+        }}
+        appendLog(`health check finished (mode=${{mode}})`);
+      }} finally {{
+        healthCheckRunning = false;
+        setHealthCheckBusy(false);
+      }}
+    }}
+
+    function initUploadDrop() {{
+      const drop = document.getElementById('upload_drop');
+      const fileInput = document.getElementById('upload_files');
+      fileInput.addEventListener('change', (e) => addFiles(e.target.files));
+      drop.addEventListener('dragover', (e) => {{
+        e.preventDefault();
+        drop.classList.add('dragover');
+      }});
+      drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+      drop.addEventListener('drop', (e) => {{
+        e.preventDefault();
+        drop.classList.remove('dragover');
+        addFiles(e.dataTransfer.files);
+      }});
+    }}
+
+    setInterval(() => {{
+      cleanupOps();
+      if (latestState) renderBoard(latestState);
+    }}, 30000);
+
     (async () => {{
+      initUploadDrop();
       try {{ await refreshState(); }} catch (e) {{ appendLog(String(e)); }}
     }})();
   </script>
@@ -3715,6 +5592,9 @@ def history_page(
             _check_api_token(token=token, authorization=authorization)
         else:
             return RedirectResponse(url="/history/entry?next=/history", status_code=302)
+    auth_control_href = "/history/auth-control"
+    if str(token or "").strip():
+        auth_control_href = f"{auth_control_href}?token={urllib.parse.quote(str(token or '').strip())}"
     page_config = json.dumps(
         {
             "authToken": str(token or "").strip(),
@@ -3731,8 +5611,31 @@ def history_page(
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>FeiCodex 项目看板</title>
   <link rel="stylesheet" href="/history-static/assets/history-dashboard.css" />
+  <style>
+    #auth-control-entry {{
+      position: fixed;
+      top: 12px;
+      right: 16px;
+      z-index: 9999;
+      text-decoration: none;
+      font-size: 12px;
+      line-height: 1;
+      font-weight: 600;
+      color: #ffffff;
+      background: #0f1b2a;
+      border: 1px solid #1f2d40;
+      border-radius: 999px;
+      padding: 8px 12px;
+      box-shadow: 0 4px 14px rgba(15, 27, 42, 0.22);
+    }}
+    #auth-control-entry:hover {{
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+    }}
+  </style>
 </head>
 <body>
+  <a id="auth-control-entry" href="{auth_control_href}">Auth 管理</a>
   <div id="root"></div>
   <script>window.__HISTORY_PAGE_CONFIG__ = {page_config};</script>
   <script type="module" src="/history-static/assets/history-dashboard.js"></script>
