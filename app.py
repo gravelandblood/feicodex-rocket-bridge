@@ -20,7 +20,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
 import requests
 from dotenv import load_dotenv
@@ -315,9 +315,154 @@ class MemorySearchRequest(BaseModel):
     include_same_chat: bool = Field(default=False)
 
 
+class AgentAdapter(Protocol):
+    env: Dict[str, str]
+
+    def start(self, experimental_api: bool = True) -> Dict[str, Any]:
+        ...
+
+    def stop(self) -> None:
+        ...
+
+    def is_running(self) -> bool:
+        ...
+
+    def thread_start(self, cwd: str = "", model: str = "", permission_mode: str = "", approval_policy: str = "", profile: str = "") -> Dict[str, Any]:
+        ...
+
+    def thread_resume(
+        self,
+        thread_id: str,
+        cwd: str = "",
+        model: str = "",
+        permission_mode: str = "",
+        approval_policy: str = "",
+        profile: str = "",
+    ) -> Dict[str, Any]:
+        ...
+
+    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        ...
+
+    def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> Any:
+        ...
+
+    def get_thread_status(self, thread_id: str) -> Dict[str, Any]:
+        ...
+
+    def get_active_turn_id(self, thread_id: str) -> str:
+        ...
+
+    def get_thread_token_usage(self, thread_id: str) -> Dict[str, Any]:
+        ...
+
+    def get_account_rate_limits(self) -> Dict[str, Any]:
+        ...
+
+    def account_rate_limits_read(self) -> Dict[str, Any]:
+        ...
+
+    def get_turn_events(self, thread_id: str, turn_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        ...
+
+    def turn_steer(self, thread_id: str, expected_turn_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        ...
+
+    def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
+        ...
+
+
+class CodexAgentAdapter:
+    def __init__(self) -> None:
+        self._client = CodexAppServerClient()
+
+    @property
+    def env(self) -> Dict[str, str]:
+        return self._client.env
+
+    def start(self, experimental_api: bool = True) -> Dict[str, Any]:
+        return self._client.start(experimental_api=experimental_api)
+
+    def stop(self) -> None:
+        self._client.stop()
+
+    def is_running(self) -> bool:
+        return self._client.is_running()
+
+    def thread_start(self, cwd: str = "", model: str = "", permission_mode: str = "", approval_policy: str = "", profile: str = "") -> Dict[str, Any]:
+        return self._client.thread_start(
+            cwd=cwd,
+            model=model,
+            permission_mode=permission_mode,
+            approval_policy=approval_policy,
+            profile=profile,
+        )
+
+    def thread_resume(
+        self,
+        thread_id: str,
+        cwd: str = "",
+        model: str = "",
+        permission_mode: str = "",
+        approval_policy: str = "",
+        profile: str = "",
+    ) -> Dict[str, Any]:
+        return self._client.thread_resume(
+            thread_id=thread_id,
+            cwd=cwd,
+            model=model,
+            permission_mode=permission_mode,
+            approval_policy=approval_policy,
+            profile=profile,
+        )
+
+    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        return self._client.turn_start(thread_id=thread_id, text=text, image_paths=image_paths)
+
+    def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> Any:
+        return self._client.wait_for_turn_completion(thread_id=thread_id, turn_id=turn_id, timeout_sec=timeout_sec)
+
+    def get_thread_status(self, thread_id: str) -> Dict[str, Any]:
+        return self._client.get_thread_status(thread_id=thread_id)
+
+    def get_active_turn_id(self, thread_id: str) -> str:
+        return self._client.get_active_turn_id(thread_id=thread_id)
+
+    def get_thread_token_usage(self, thread_id: str) -> Dict[str, Any]:
+        return self._client.get_thread_token_usage(thread_id=thread_id)
+
+    def get_account_rate_limits(self) -> Dict[str, Any]:
+        return self._client.get_account_rate_limits()
+
+    def account_rate_limits_read(self) -> Dict[str, Any]:
+        return self._client.account_rate_limits_read()
+
+    def get_turn_events(self, thread_id: str, turn_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        return self._client.get_turn_events(thread_id=thread_id, turn_id=turn_id, limit=limit)
+
+    def turn_steer(self, thread_id: str, expected_turn_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        return self._client.turn_steer(
+            thread_id=thread_id,
+            expected_turn_id=expected_turn_id,
+            text=text,
+            image_paths=image_paths,
+        )
+
+    def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
+        return self._client.turn_interrupt(thread_id=thread_id, turn_id=turn_id)
+
+
+def _build_agent_adapter(provider: str) -> AgentAdapter:
+    clean = str(provider or "codex").strip().lower() or "codex"
+    if clean == "codex":
+        return CodexAgentAdapter()
+    raise ValueError(f"unsupported agent provider: {clean}")
+
+
 @dataclass
 class ChatRuntime:
     chat_id: str
+    agent_provider: str = "codex"
     thread_id: str = ""
     active_turn_id: str = ""
     cwd: str = DEFAULT_CWD
@@ -328,7 +473,7 @@ class ChatRuntime:
     auth_profile: str = ""
     last_input_at: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
-    client: CodexAppServerClient = field(default_factory=CodexAppServerClient)
+    client: AgentAdapter = field(default_factory=lambda: _build_agent_adapter("codex"))
 
     def is_client_running(self) -> bool:
         return self.client.is_running()
@@ -353,8 +498,16 @@ class BridgeRuntimeManager:
                 target_project = _runtime_project_name(clean_chat_id)
                 if legacy and (not target_project or _project_label_for_cwd(legacy_cwd) == target_project):
                     persisted = dict(legacy)
+            provider = str(persisted.get("agent_provider") or "codex").strip().lower() or "codex"
+            try:
+                adapter = _build_agent_adapter(provider)
+            except Exception as exc:
+                LOG.warning("runtime provider fallback to codex chat_id=%s provider=%s err=%s", clean_chat_id, provider, exc)
+                provider = "codex"
+                adapter = _build_agent_adapter(provider)
             runtime = ChatRuntime(
                 chat_id=clean_chat_id,
+                agent_provider=provider,
                 thread_id=str(persisted.get("thread_id") or ""),
                 active_turn_id=str(persisted.get("active_turn_id") or ""),
                 cwd=str(persisted.get("cwd") or DEFAULT_CWD),
@@ -364,6 +517,7 @@ class BridgeRuntimeManager:
                 personality=str(persisted.get("personality") or DEFAULT_PERSONALITY),
                 auth_profile=str(persisted.get("auth_profile") or ""),
                 last_input_at=int(persisted.get("last_input_at") or persisted.get("updated_at") or 0),
+                client=adapter,
             )
             _apply_runtime_auth_profile(runtime)
             self._runtimes[clean_chat_id] = runtime
@@ -770,6 +924,7 @@ def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = Non
         "runtime_id": runtime.chat_id,
         "source_chat_id": _runtime_actual_chat_id(runtime.chat_id),
         "project": _runtime_project_name(runtime.chat_id),
+        "agent_provider": str(runtime.agent_provider or "codex"),
         "thread_id": runtime.thread_id,
         "active_turn_id": runtime.active_turn_id,
         "cwd": runtime.cwd,
@@ -3428,6 +3583,27 @@ def _get_auth_profile(profile: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _provider_for_profile(profile: str) -> str:
+    clean = str(profile or "").strip()
+    if not clean:
+        return "codex"
+    local = _get_auth_profile(clean)
+    if isinstance(local, dict):
+        provider = str(local.get("provider") or "").strip().lower()
+        if provider:
+            return provider
+    try:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        item = auths.get(clean) if isinstance(auths.get(clean), dict) else {}
+        provider = str(item.get("provider") or "").strip().lower()
+        if provider:
+            return provider
+    except Exception:
+        pass
+    return "codex"
+
+
 def _list_switchable_auth_profiles() -> List[Dict[str, Any]]:
     now_ts = int(time.time())
     return [{"profile": "", "label": "default", "valid": True, "email": "", "status": "active"}] + [
@@ -3551,8 +3727,11 @@ def _apply_auth_error_policy(
 
 
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
-    target_home = _sync_runtime_home(runtime)
-    runtime.client.env["CODEX_HOME"] = str(target_home)
+    if str(runtime.agent_provider or "codex").strip().lower() == "codex":
+        target_home = _sync_runtime_home(runtime)
+        runtime.client.env["CODEX_HOME"] = str(target_home)
+    else:
+        runtime.client.env.pop("CODEX_HOME", None)
     _apply_runtime_bridge_env(runtime)
 
 
@@ -3566,14 +3745,23 @@ def _switch_runtime_auth_profile(
     meta = _get_auth_profile(target) if target else {"profile": "", "email": "", "home_dir": ""}
     if target and (not meta or ((not bool(allow_invalid)) and (not bool(meta.get("valid"))))):
         raise HTTPException(status_code=400, detail=f"invalid auth profile: {target}")
+    target_provider = _provider_for_profile(target)
+    try:
+        next_adapter = _build_agent_adapter(target_provider)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"unsupported provider for profile={target}: {target_provider}") from exc
+
     previous = str(runtime.auth_profile or "").strip()
-    runtime.auth_profile = target
-    runtime.thread_id = ""
-    runtime.active_turn_id = ""
+    previous_provider = str(runtime.agent_provider or "codex").strip().lower() or "codex"
     try:
         runtime.client.stop()
     except Exception:
         pass
+    runtime.client = next_adapter
+    runtime.agent_provider = target_provider
+    runtime.auth_profile = target
+    runtime.thread_id = ""
+    runtime.active_turn_id = ""
     _apply_runtime_auth_profile(runtime)
     _persist_runtime(
         runtime,
@@ -3587,11 +3775,15 @@ def _switch_runtime_auth_profile(
             "last_auto_auth_switch_to": target,
             "last_auto_auth_switch_reason": str(reason or ""),
             "last_auto_auth_switch_at": int(time.time()),
+            "last_auto_auth_switch_provider_from": previous_provider,
+            "last_auto_auth_switch_provider_to": target_provider,
         },
     )
     return {
         "from": previous,
         "to": target,
+        "provider_from": previous_provider,
+        "provider_to": target_provider,
         "identity": str((meta or {}).get("email") or (meta or {}).get("sub") or ""),
         "home_dir": str((meta or {}).get("home_dir") or ""),
     }
