@@ -913,6 +913,7 @@ class ChatRuntime:
     approval_policy: str = DEFAULT_APPROVAL
     personality: str = DEFAULT_PERSONALITY
     auth_profile: str = ""
+    profile_thread_ids: Dict[str, str] = field(default_factory=dict)
     last_input_at: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
     client: AgentAdapter = field(default_factory=lambda: _build_agent_adapter("codex"))
@@ -958,9 +959,13 @@ class BridgeRuntimeManager:
                 approval_policy=str(persisted.get("approval_policy") or DEFAULT_APPROVAL),
                 personality=str(persisted.get("personality") or DEFAULT_PERSONALITY),
                 auth_profile=str(persisted.get("auth_profile") or ""),
+                profile_thread_ids=_normalize_profile_thread_ids(persisted.get("profile_thread_ids")),
                 last_input_at=int(persisted.get("last_input_at") or persisted.get("updated_at") or 0),
                 client=adapter,
             )
+            if runtime.thread_id:
+                current_key = _profile_thread_map_key(runtime.agent_provider, runtime.auth_profile)
+                runtime.profile_thread_ids[current_key] = runtime.thread_id
             _sync_runtime_model_from_profile(runtime, force=False)
             _apply_runtime_auth_profile(runtime)
             self._runtimes[clean_chat_id] = runtime
@@ -1304,6 +1309,24 @@ def _runtime_id_from_chat_project(chat_id: str, project: str = "") -> str:
     return f"{base}::{proj}" if proj else base
 
 
+def _profile_thread_map_key(provider: str, profile: str) -> str:
+    clean_provider = _normalize_agent_provider(provider)
+    clean_profile = str(profile or "").strip() or "__default__"
+    return f"{clean_provider}::{clean_profile}"
+
+
+def _normalize_profile_thread_ids(raw: Any) -> Dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in raw.items():
+        clean_key = str(key or "").strip()
+        clean_value = str(value or "").strip()
+        if clean_key and clean_value:
+            out[clean_key] = clean_value
+    return out
+
+
 def _build_turn_record(
     runtime: ChatRuntime,
     turn_id: str,
@@ -1382,6 +1405,12 @@ def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
 
 
 def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    current_key = _profile_thread_map_key(runtime.agent_provider, runtime.auth_profile)
+    profile_thread_ids = _normalize_profile_thread_ids(runtime.profile_thread_ids)
+    if runtime.thread_id:
+        profile_thread_ids[current_key] = str(runtime.thread_id or "").strip()
+        runtime.profile_thread_ids = dict(profile_thread_ids)
+
     data: Dict[str, Any] = {
         "runtime_id": runtime.chat_id,
         "source_chat_id": _runtime_actual_chat_id(runtime.chat_id),
@@ -1395,6 +1424,7 @@ def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = Non
         "approval_policy": runtime.approval_policy,
         "personality": runtime.personality,
         "auth_profile": runtime.auth_profile,
+        "profile_thread_ids": profile_thread_ids,
         "last_input_at": int(runtime.last_input_at or 0),
     }
     if patch:
@@ -4401,6 +4431,15 @@ def _switch_runtime_auth_profile(
 
     previous = str(runtime.auth_profile or "").strip()
     previous_provider = _normalize_agent_provider(runtime.agent_provider)
+    previous_thread_id = str(runtime.thread_id or "").strip()
+    profile_thread_ids = _normalize_profile_thread_ids(runtime.profile_thread_ids)
+    if previous_thread_id:
+        previous_key = _profile_thread_map_key(previous_provider, previous)
+        profile_thread_ids[previous_key] = previous_thread_id
+    target_key = _profile_thread_map_key(target_provider, target)
+    # Switching profile should prioritize the current thread continuity.
+    # Fallback to target profile's pinned thread only when current thread is empty.
+    restored_thread_id = previous_thread_id or str(profile_thread_ids.get(target_key) or "").strip()
     try:
         runtime.client.stop()
     except Exception:
@@ -4408,8 +4447,9 @@ def _switch_runtime_auth_profile(
     runtime.client = next_adapter
     runtime.agent_provider = _normalize_agent_provider(target_provider)
     runtime.auth_profile = target
+    runtime.profile_thread_ids = profile_thread_ids
     _sync_runtime_model_from_profile(runtime, force=True)
-    runtime.thread_id = ""
+    runtime.thread_id = restored_thread_id
     runtime.active_turn_id = ""
     _apply_runtime_auth_profile(runtime)
     _persist_runtime(
@@ -4426,15 +4466,17 @@ def _switch_runtime_auth_profile(
             "last_auto_auth_switch_at": int(time.time()),
             "last_auto_auth_switch_provider_from": previous_provider,
             "last_auto_auth_switch_provider_to": target_provider,
+            "last_auto_auth_switch_restored_thread_id": restored_thread_id,
         },
     )
     LOG.info(
-        "runtime auth switched chat_id=%s from_profile=%s to_profile=%s provider=%s model=%s reason=%s",
+        "runtime auth switched chat_id=%s from_profile=%s to_profile=%s provider=%s model=%s restored_thread=%s reason=%s",
         runtime.chat_id,
         previous or "default",
         target or "default",
         _normalize_agent_provider(target_provider),
         str(runtime.model or ""),
+        restored_thread_id or "-",
         str(reason or ""),
     )
     return {
@@ -4444,6 +4486,7 @@ def _switch_runtime_auth_profile(
         "provider_to": target_provider,
         "identity": str((meta or {}).get("email") or (meta or {}).get("sub") or ""),
         "home_dir": str((meta or {}).get("home_dir") or ""),
+        "restored_thread_id": restored_thread_id,
     }
 
 

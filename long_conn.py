@@ -2929,11 +2929,14 @@ class AppServerBotBridge:
                 runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
                 result = self.control.update_auth_profile(chat_id=runtime_key, profile=profile)
                 data = result.get("data") if isinstance(result.get("data"), dict) else {}
-                self.control.reset(chat_id=runtime_key)
                 label = str(data.get("auth_profile") or "").strip() or "default"
                 identity = str(data.get("auth_identity") or "").strip()
                 suffix = f" ({identity})" if identity else ""
-                self.feishu.send_text(reply_chat_id, f"已切换账号: {label}{suffix}")
+                restored_thread_id = str(data.get("restored_thread_id") or "").strip()
+                if restored_thread_id:
+                    self.feishu.send_text(reply_chat_id, f"已切换账号: {label}{suffix}\n会话已延续。")
+                else:
+                    self.feishu.send_text(reply_chat_id, f"已切换账号: {label}{suffix}\n未找到可恢复会话，下一条消息会新开线程。")
             except Exception as exc:
                 self.feishu.send_text(reply_chat_id, f"切换账号失败: {exc}")
             return
