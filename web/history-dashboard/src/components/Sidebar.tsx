@@ -12,35 +12,6 @@ type SessionBag = {
   pagination: Pagination | null;
 };
 
-function fallbackDefaultProfile(previous?: AuthProfile): AuthProfile {
-  return {
-    profile: "",
-    label: "default",
-    email: "",
-    valid: true,
-    reason: "",
-    home_dir: "",
-    source_auth_json: "",
-    status: "active",
-    disabled_until: 0,
-    disabled_reason: "",
-    needs_reauth: false,
-    risk_deactivated: false,
-    last_health_check_at: Number(previous?.last_health_check_at || 0),
-    last_health_error: String(previous?.last_health_error || ""),
-    available: true,
-    disabled_remaining_sec: 0
-  };
-}
-
-function ensureDefaultProfile(items: AuthProfile[], previous?: AuthProfile): AuthProfile[] {
-  const normalized = Array.isArray(items) ? [...items] : [];
-  if (normalized.some((item) => (item.profile || "") === "")) {
-    return normalized;
-  }
-  return [fallbackDefaultProfile(previous), ...normalized];
-}
-
 function statusLabel(item: AuthProfile) {
   const status = String(item.status || "").toLowerCase();
   if (status === "active") return "可用";
@@ -111,10 +82,7 @@ export function Sidebar({
     setProfilesLoading(true);
     try {
       const response = healthCheck ? await api.healthCheckAuthProfile("") : await api.getAuthProfiles();
-      setProfiles((prev) => {
-        const previousDefault = prev.find((item) => (item.profile || "") === "");
-        return ensureDefaultProfile(response.data.profiles || [], previousDefault);
-      });
+      setProfiles(response.data.profiles || []);
       setProfilesMessage(healthCheck ? "健康检测完成" : "");
     } catch (err) {
       setProfilesError(String((err as Error).message || err));
@@ -128,19 +96,16 @@ export function Sidebar({
       setProfilesError("请先在会话列表中选中一个会话，再执行账号切换。");
       return;
     }
-    setProfilesBusy(profile || "__default__");
+    setProfilesBusy(profile);
     setProfilesMessage("");
     setProfilesError("");
     try {
       const response = await api.switchAuthProfile(selectedSession.project, selectedSession.chat_id, profile);
       const nextProfile = String(response.data.auth_profile || "");
       onSelectSession({ ...selectedSession, auth_profile: nextProfile });
-      setProfilesMessage(`已切换到账号：${nextProfile || "default"}`);
+      setProfilesMessage(`已切换到账号：${nextProfile}`);
       const refreshed = await api.getAuthProfiles();
-      setProfiles((prev) => {
-        const previousDefault = prev.find((item) => (item.profile || "") === "");
-        return ensureDefaultProfile(refreshed.data.profiles || [], previousDefault);
-      });
+      setProfiles(refreshed.data.profiles || []);
     } catch (err) {
       setProfilesError(String((err as Error).message || err));
     } finally {
@@ -149,12 +114,6 @@ export function Sidebar({
   };
 
   const healthCheckSingle = async (profile: string) => {
-    if (!profile) {
-      setProfilesError("");
-      setProfilesBusy("");
-      setProfilesMessage("default 账号仅支持全量健康检测，请使用上方“健康检测”按钮。");
-      return;
-    }
     setProfilesError("");
     setProfilesMessage("");
     setProfilesBusy(profile);
@@ -353,12 +312,13 @@ export function Sidebar({
           {profiles.map((item) => {
             const isCurrent = (selectedSession?.auth_profile || "") === (item.profile || "");
             const remaining = Number(item.disabled_remaining_sec || 0);
+            const profileKey = item.profile || "__unknown__";
             return (
-              <div key={item.profile || "__default__"} className="rounded-lg border border-gray-200 bg-white p-3">
+              <div key={profileKey} className="rounded-lg border border-gray-200 bg-white p-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-gray-900">{item.profile || "default"}</div>
-                    <div className="truncate text-[11px] text-gray-500">{item.email || item.source_auth_json || "默认账号"}</div>
+                    <div className="truncate text-sm font-medium text-gray-900">{item.profile || "-"}</div>
+                    <div className="truncate text-[11px] text-gray-500">{item.email || item.source_auth_json || "-"}</div>
                   </div>
                   <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${statusTone(item)}`}>{statusLabel(item)}</span>
                 </div>
@@ -376,18 +336,18 @@ export function Sidebar({
                 <div className="mt-2 flex items-center gap-2">
                   <button
                     onClick={() => void healthCheckSingle(item.profile)}
-                    disabled={profilesBusy === (item.profile || "__default__") || !item.profile}
+                    disabled={profilesBusy === profileKey}
                     className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-[11px] text-gray-600 hover:bg-gray-50 disabled:opacity-40"
                   >
                     <Shield size={12} />
-                    {!item.profile ? "仅全量检测" : profilesBusy === (item.profile || "__default__") ? "检测中..." : "检测"}
+                    {profilesBusy === profileKey ? "检测中..." : "检测"}
                   </button>
                   <button
                     onClick={() => void switchProfile(item.profile)}
-                    disabled={profilesBusy === (item.profile || "__default__") || !selectedSession || !item.available}
+                    disabled={profilesBusy === profileKey || !selectedSession || !item.available}
                     className="rounded border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] text-indigo-700 hover:bg-indigo-100 disabled:opacity-40"
                   >
-                    {profilesBusy === (item.profile || "__default__") ? "切换中..." : "切换到此账号"}
+                    {profilesBusy === profileKey ? "切换中..." : "切换到此账号"}
                   </button>
                 </div>
               </div>
