@@ -118,6 +118,7 @@ cp soul.md.example soul.md
 - 进行中轮次落库间隔：`BRIDGE_TURN_CHECKPOINT_INTERVAL_SEC=3`
 - 可恢复失败重试次数：`BRIDGE_TURN_RECOVERY_MAX_RETRIES=2`
 - 可恢复失败重试退避：`BRIDGE_TURN_RECOVERY_RETRY_BACKOFF_SEC=2`
+- 自动恢复是否允许隐式 reset 会话：`BRIDGE_TURN_RECOVERY_ALLOW_RESET=false`
 - 进度刷新间隔：`BRIDGE_PROGRESS_PING_INTERVAL_SEC=180`（默认每 3 分钟）
 - streaming card 刷新间隔：`BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC=5`（默认每 5 秒）
 - streaming card 打印频率：`BRIDGE_STREAMING_CARD_PRINT_FREQUENCY_MS=1`

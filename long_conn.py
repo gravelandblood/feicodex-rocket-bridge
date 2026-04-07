@@ -57,6 +57,12 @@ API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
 TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
 TURN_RECOVERY_MAX_RETRIES = max(0, int(os.getenv("BRIDGE_TURN_RECOVERY_MAX_RETRIES", "2")))
 TURN_RECOVERY_RETRY_BACKOFF_SEC = max(0, int(os.getenv("BRIDGE_TURN_RECOVERY_RETRY_BACKOFF_SEC", "2")))
+TURN_RECOVERY_ALLOW_RESET = str(os.getenv("BRIDGE_TURN_RECOVERY_ALLOW_RESET", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 PROGRESS_PING_INTERVAL_SEC = max(30, int(os.getenv("BRIDGE_PROGRESS_PING_INTERVAL_SEC", "180")))
 STREAMING_CARD_UPDATE_INTERVAL_SEC = max(2, int(os.getenv("BRIDGE_STREAMING_CARD_UPDATE_INTERVAL_SEC", "5")))
 STREAMING_CARD_PRINT_FREQUENCY_MS = max(1, int(os.getenv("BRIDGE_STREAMING_CARD_PRINT_FREQUENCY_MS", "1")))
@@ -2220,7 +2226,7 @@ class AppServerBotBridge:
                 if attempt >= (max_attempts - 1) or not self._is_recoverable_turn_error(str(exc)):
                     raise
                 LOG.warning(
-                    "turn failed with recoverable error, retry after reset runtime_key=%s attempt=%s/%s err=%s",
+                    "turn failed with recoverable error, retry with non-destructive recovery runtime_key=%s attempt=%s/%s err=%s",
                     runtime_key,
                     attempt + 1,
                     max_attempts,
@@ -2230,7 +2236,13 @@ class AppServerBotBridge:
                     self.control.interrupt(chat_id=runtime_key)
                 except Exception as interrupt_exc:
                     LOG.warning("turn recover interrupt failed runtime_key=%s err=%s", runtime_key, interrupt_exc)
-                self.control.reset(chat_id=runtime_key)
+                if TURN_RECOVERY_ALLOW_RESET:
+                    self.control.reset(chat_id=runtime_key)
+                else:
+                    try:
+                        self.control.status(chat_id=runtime_key)
+                    except Exception as status_exc:
+                        LOG.warning("turn recover status probe failed runtime_key=%s err=%s", runtime_key, status_exc)
                 if TURN_RECOVERY_RETRY_BACKOFF_SEC > 0:
                     time.sleep(TURN_RECOVERY_RETRY_BACKOFF_SEC)
         raise RuntimeError("turn failed after retry")
@@ -2259,12 +2271,19 @@ class AppServerBotBridge:
                 except Exception as exc:
                     recovery_steps.append(f"interrupt=err({exc})")
 
-                try:
-                    self.control.reset(chat_id=runtime_key)
-                    recovery_steps.append("reset=ok")
-                except Exception as exc:
-                    recovery_steps.append(f"reset=err({exc})")
-                    return f"会话命令失败: {first_err}\n自动恢复失败: {'; '.join(recovery_steps)}"
+                if TURN_RECOVERY_ALLOW_RESET:
+                    try:
+                        self.control.reset(chat_id=runtime_key)
+                        recovery_steps.append("reset=ok")
+                    except Exception as exc:
+                        recovery_steps.append(f"reset=err({exc})")
+                        return f"会话命令失败: {first_err}\n自动恢复失败: {'; '.join(recovery_steps)}"
+                else:
+                    try:
+                        self.control.status(chat_id=runtime_key)
+                        recovery_steps.append("status_probe=ok")
+                    except Exception as exc:
+                        recovery_steps.append(f"status_probe=err({exc})")
 
                 try:
                     answer = self._run_turn(runtime_key=runtime_key, text=cmd_text, image_paths=[])

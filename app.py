@@ -966,6 +966,11 @@ class BridgeRuntimeManager:
             if runtime.thread_id:
                 current_key = _profile_thread_map_key(runtime.agent_provider, runtime.auth_profile)
                 runtime.profile_thread_ids[current_key] = runtime.thread_id
+            if not str(runtime.auth_profile or "").strip():
+                try:
+                    _ensure_runtime_preferred_auth_profile(runtime, reason="runtime bootstrap prefer recent active profile")
+                except Exception as exc:
+                    LOG.warning("runtime bootstrap auth auto-pick failed chat_id=%s err=%s", clean_chat_id, exc)
             _sync_runtime_model_from_profile(runtime, force=False)
             _apply_runtime_auth_profile(runtime)
             self._runtimes[clean_chat_id] = runtime
@@ -2108,6 +2113,8 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
         if isinstance(previous_meta.get("last_rate_limits"), dict)
         else {},
         "last_rate_limits_at": int(previous_meta.get("last_rate_limits_at") or 0),
+        "last_used_at": int(previous_meta.get("last_used_at") or 0),
+        "last_used_success_at": int(previous_meta.get("last_used_success_at") or 0),
         "source_auth_sha1": source_hash,
         "updated_at": now_ts,
     }
@@ -4220,9 +4227,44 @@ def _provider_for_profile(profile: str) -> str:
 
 def _list_switchable_auth_profiles() -> List[Dict[str, Any]]:
     now_ts = int(time.time())
-    return [{"profile": "", "label": "default", "valid": True, "email": "", "status": "active"}] + [
-        item for item in _refresh_auth_profiles() if _auth_profile_available(item, now_ts=now_ts)
-    ]
+    return [item for item in _refresh_auth_profiles() if _auth_profile_available(item, now_ts=now_ts)]
+
+
+def _profile_recent_ready_ts(meta: Dict[str, Any]) -> int:
+    if not isinstance(meta, dict):
+        return 0
+    success_ts = int(meta.get("last_used_success_at") or 0)
+    status = str(meta.get("status") or "").strip().lower()
+    health_ok_ts = int(meta.get("last_health_check_at") or 0) if status == "active" else 0
+    return max(success_ts, health_ok_ts)
+
+
+def _pick_preferred_auth_profile(exclude_profile: str = "") -> Optional[Dict[str, Any]]:
+    now_ts = int(time.time())
+    excluded = str(exclude_profile or "").strip()
+    candidates: List[Dict[str, Any]] = []
+    for item in _refresh_auth_profiles():
+        profile = str(item.get("profile") or "").strip()
+        if not profile:
+            continue
+        if excluded and profile == excluded:
+            continue
+        if not _auth_profile_available(item, now_ts=now_ts):
+            continue
+        candidates.append(item)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            _profile_recent_ready_ts(item),
+            int(item.get("last_used_success_at") or 0),
+            int(item.get("last_health_check_at") or 0),
+            int(item.get("updated_at") or 0),
+            str(item.get("profile") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
 
 
 def _pick_next_auth_profile(current_profile: str) -> Optional[Dict[str, Any]]:
@@ -4510,6 +4552,19 @@ def _maybe_auto_switch_auth_profile(runtime: ChatRuntime, reason: str = "") -> O
     return info
 
 
+def _ensure_runtime_preferred_auth_profile(runtime: ChatRuntime, reason: str = "") -> Optional[Dict[str, Any]]:
+    current = str(runtime.auth_profile or "").strip()
+    if current:
+        return None
+    target = _pick_preferred_auth_profile()
+    if not target:
+        return None
+    profile = str(target.get("profile") or "").strip()
+    if not profile:
+        return None
+    return _switch_runtime_auth_profile(runtime, profile=profile, reason=reason or "bootstrap prefer recent active profile")
+
+
 def _ensure_thread_info(runtime: ChatRuntime, reset_thread: bool = False) -> Dict[str, Any]:
     prev_thread_id = str(runtime.thread_id or "").strip()
     info: Dict[str, Any] = {
@@ -4697,25 +4752,7 @@ def auth_profiles_list() -> Dict[str, Any]:
     return {
         "ok": True,
         "data": {
-            "profiles": [
-                {
-                    "profile": "",
-                    "label": "default",
-                    "email": "",
-                    "valid": True,
-                    "reason": "",
-                    "home_dir": "",
-                    "source_auth_json": "",
-                    "status": "active",
-                    "disabled_until": 0,
-                    "disabled_reason": "",
-                    "needs_reauth": False,
-                    "risk_deactivated": False,
-                    "last_health_check_at": 0,
-                    "last_health_error": "",
-                }
-            ]
-            + profiles
+            "profiles": profiles
         },
     }
 
@@ -4946,6 +4983,11 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
     with runtime.lock:
         runtime.last_input_at = int(time.time())
         _resolve_chat_config(runtime, body)
+        bootstrap_auth_switch = _ensure_runtime_preferred_auth_profile(
+            runtime, reason="turn bootstrap prefer recent active profile"
+        )
+        if isinstance(bootstrap_auth_switch, dict):
+            auto_auth_switch = dict(bootstrap_auth_switch)
         _apply_runtime_auth_profile(runtime)
         heal_info = _maybe_self_heal_disconnected_runtime(runtime)
         turn_cwd = str(runtime.cwd or DEFAULT_CWD)
@@ -5164,6 +5206,11 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     "disconnect_fail_streak": 0,
                 },
             )
+            if turn_auth_profile:
+                profile_usage_patch: Dict[str, Any] = {"last_used_at": int(time.time())}
+                if str(done.turn_status or "").strip().lower() == "completed":
+                    profile_usage_patch["last_used_success_at"] = int(time.time())
+                _patch_auth_registry_profile(turn_auth_profile, profile_usage_patch)
             if _rate_limit_exhausted(rate_limits) and not auto_auth_switch:
                 auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason="post-turn rate limit exhausted")
             done_error_text = json.dumps(done.error, ensure_ascii=False) if done.error else ""
@@ -5247,7 +5294,8 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
             active_for_record = str(runtime.client.get_active_turn_id(thread_id) or runtime.active_turn_id or "")
             if disconnected:
                 runtime.active_turn_id = ""
-                runtime.thread_id = ""
+                # Preserve thread id across bridge/app-server disconnects so restart can resume.
+                runtime.thread_id = str(runtime.thread_id or thread_id or "")
                 try:
                     runtime.client.stop()
                 except Exception:
@@ -5590,26 +5638,7 @@ def history_auth_profiles_api(
     _history_access_guard(request, token=token, authorization=authorization, require_session=False)
     now_ts = int(time.time())
     profiles = _refresh_auth_profiles()
-    data_items: List[Dict[str, Any]] = [
-        {
-            "profile": "",
-            "label": "default",
-            "email": "",
-            "valid": True,
-            "reason": "",
-            "home_dir": str(DEFAULT_CODEX_HOME),
-            "source_auth_json": "",
-            "status": "active",
-            "disabled_until": 0,
-            "disabled_reason": "",
-            "needs_reauth": False,
-            "risk_deactivated": False,
-            "last_health_check_at": 0,
-            "last_health_error": "",
-            "available": True,
-            "disabled_remaining_sec": 0,
-        }
-    ]
+    data_items: List[Dict[str, Any]] = []
     for item in profiles:
         profile_item = dict(item)
         disabled_until = int(profile_item.get("disabled_until") or 0)
