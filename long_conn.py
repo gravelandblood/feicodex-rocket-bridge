@@ -2018,7 +2018,20 @@ class AppServerBotBridge:
         inherited_profile = str((source or {}).get("auth_profile") or "").strip()
         current_profile = str((current or {}).get("auth_profile") or "").strip()
         if inherited_profile and current_profile != inherited_profile:
-            self.control.update_auth_profile(runtime_key, inherited_profile)
+            try:
+                self.control.update_auth_profile(runtime_key, inherited_profile)
+            except Exception as exc:
+                message = str(exc or "").strip().lower()
+                if "invalid auth profile" in message:
+                    LOG.warning(
+                        "skip inheriting invalid auth profile runtime=%s source=%s profile=%s err=%s",
+                        runtime_key,
+                        source_runtime_key,
+                        inherited_profile,
+                        exc,
+                    )
+                else:
+                    raise
         return runtime_key
 
     def _status_data(self, chat_id: str) -> Dict[str, Any]:
