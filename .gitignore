@@ -23,6 +23,8 @@ data/*
 tmp/*
 !tmp/.gitkeep
 soul.md
+AGENTS.md
+agents.md
 
 # Local design references
 reference/
