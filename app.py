@@ -1977,6 +1977,11 @@ def _classify_auth_error(message: str) -> str:
     if not lower:
         return ""
 
+    # account/rateLimits/read may return token_expired even when session is still usable.
+    # Treat it as a probe/read failure first, and let follow-up checks decide.
+    if "account/ratelimits/read" in lower and "token_expired" in lower:
+        return ""
+
     if re.search(r"(disactivat|deactivat|suspend|account.+disabled|account.+banned|risk)", lower):
         return "deactivated"
 
