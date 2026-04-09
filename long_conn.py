@@ -1561,7 +1561,10 @@ class AppServerBotBridge:
                 val = str(self._user_chat_map.get(key) or "")
                 if val:
                     return val
-            if SINGLE_CHAT_ONLY:
+            # Only fallback when caller provides no identity at all.
+            # If a user identity is present but unmapped, returning an arbitrary chat can
+            # misroute cards to another user in single-chat mode.
+            if SINGLE_CHAT_ONLY and not candidates:
                 for k, v in self._user_chat_map.items():
                     if str(k).startswith("legacy_owner_identity:"):
                         continue
