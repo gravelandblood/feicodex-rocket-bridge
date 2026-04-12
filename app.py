@@ -6989,8 +6989,27 @@ def history_auth_control_page(
               currentDeviceAuth.profile = finalProfile || authProfile;
               currentDeviceAuth.statusText = '授权完成';
               renderDeviceCodePanel();
-              setOp(finalProfile || authProfile || '__device_login__', '完成：已更新账号', 'ok');
-              appendLog(`reauth success: profile=${{finalProfile || authProfile}}`);
+              const resolvedProfile = finalProfile || authProfile;
+              setOp(resolvedProfile || '__device_login__', '完成：已更新账号，自动检测中', 'running');
+              appendLog(`reauth success: profile=${{resolvedProfile}}`);
+              try {{
+                const one = await api('/history/api/auth/control/check-one', 'POST', {{
+                  profile: resolvedProfile,
+                  mode: 'status',
+                }});
+                const summary = summarizeCheckOne(one);
+                setOp(
+                  resolvedProfile || '__device_login__',
+                  `完成：${{summary.text}}`,
+                  summary.ok ? 'ok' : 'bad'
+                );
+                appendLog(
+                  `reauth auto-check: profile=${{resolvedProfile}} result=${{summary.ok ? 'ok' : 'bad'}} detail=${{summary.text}}`
+                );
+              }} catch (e) {{
+                setOp(resolvedProfile || '__device_login__', '完成：已更新账号（自动检测失败）', 'bad');
+                appendLog(`reauth auto-check failed: profile=${{resolvedProfile}} err=${{String(e)}}`);
+              }}
             }} else if (status === 'cancelled') {{
               currentDeviceAuth.statusText = '已取消';
               renderDeviceCodePanel();
