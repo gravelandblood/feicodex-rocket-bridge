@@ -160,6 +160,10 @@ FEISHU_OAUTH_USERINFO_URL = str(
 
 _AUTH_DISPATCH_FENCE_LOCK = threading.Lock()
 _AUTH_CONTROL_LOCK = threading.Lock()
+_AUTH_REAUTH_LOCK = threading.Lock()
+_AUTH_REAUTH_REQUESTS: Dict[str, Dict[str, Any]] = {}
+AUTH_REAUTH_START_WAIT_SEC = max(5, min(30, int(os.environ.get("BRIDGE_AUTH_REAUTH_START_WAIT_SEC", "15"))))
+AUTH_REAUTH_REQUEST_TTL_SEC = max(300, min(86400, int(os.environ.get("BRIDGE_AUTH_REAUTH_REQUEST_TTL_SEC", "3600"))))
 
 
 class TurnRequest(BaseModel):
@@ -247,7 +251,7 @@ class AuthApiHealthCheckRequest(BaseModel):
 
 
 class AuthControlUploadRequest(BaseModel):
-    profile: str = Field(min_length=1)
+    profile: str = Field(default="")
     provider: str = Field(default="codex")
     auth_json: Any = Field(default_factory=dict)
     config_toml: str = Field(default="")
@@ -309,6 +313,21 @@ class AuthControlCheckOneRequest(BaseModel):
     mode: str = Field(default="status")
     prompt: str = Field(default="")
     timeout_sec: int = Field(default=0, ge=0, le=1800)
+
+
+class AuthControlReauthStartRequest(BaseModel):
+    profile: str = Field(default="")
+    node_id: str = Field(default="")
+
+
+class AuthControlReauthStatusRequest(BaseModel):
+    request_id: str = Field(min_length=1)
+    node_id: str = Field(default="")
+
+
+class AuthControlReauthCancelRequest(BaseModel):
+    request_id: str = Field(min_length=1)
+    node_id: str = Field(default="")
 
 
 class MemorySearchRequest(BaseModel):
@@ -2565,6 +2584,78 @@ def _auto_profile_alias(email: str = "", filename: str = "", used: Optional[set[
     raise HTTPException(status_code=500, detail="failed to generate unique profile alias")
 
 
+def _auto_device_pending_profile(used: Optional[set[str]] = None) -> str:
+    used_set = set(used or _collect_known_profile_names())
+    base = f"device_login_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        candidate = _sanitize_auth_profile_name(base)
+    except Exception:
+        candidate = f"device_login_{int(time.time())}"
+    if candidate not in used_set:
+        return candidate
+    seq = 2
+    while seq < 100000:
+        suffix = f"_{seq}"
+        name = (candidate[: max(1, 64 - len(suffix))] + suffix).rstrip("._-")
+        try:
+            name = _sanitize_auth_profile_name(name)
+        except Exception:
+            seq += 1
+            continue
+        if name not in used_set:
+            return name
+        seq += 1
+    raise HTTPException(status_code=500, detail="failed to generate pending profile name for device login")
+
+
+def _merge_registry_profile_alias(source_profile: str, target_profile: str) -> None:
+    src = str(source_profile or "").strip()
+    dst = str(target_profile or "").strip()
+    if (not src) or (not dst) or src == dst:
+        return
+    now_ts = int(time.time())
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
+
+        src_auth = auths.get(src) if isinstance(auths.get(src), dict) else {}
+        dst_auth = auths.get(dst) if isinstance(auths.get(dst), dict) else {}
+        merged = dict(dst_auth)
+        if src_auth:
+            if not merged:
+                merged.update(src_auth)
+            for key in ("provider", "label", "notes", "fingerprint", "email", "sub"):
+                if (not str(merged.get(key) or "").strip()) and str(src_auth.get(key) or "").strip():
+                    merged[key] = src_auth.get(key)
+            merged["created_at"] = int(dst_auth.get("created_at") or src_auth.get("created_at") or now_ts)
+        if merged:
+            merged["profile"] = dst
+            merged["updated_at"] = now_ts
+            auths[dst] = merged
+        auths.pop(src, None)
+
+        src_asg = assignments.get(src) if isinstance(assignments.get(src), dict) else {}
+        dst_asg = assignments.get(dst) if isinstance(assignments.get(dst), dict) else {}
+        if src_asg and (not dst_asg):
+            moved = dict(src_asg)
+            moved["profile"] = dst
+            moved["updated_at"] = now_ts
+            assignments[dst] = moved
+        assignments.pop(src, None)
+
+        registry["auths"] = auths
+        registry["assignments"] = assignments
+        _audit_auth_control(
+            registry,
+            action="merge_profile_alias",
+            profile=dst,
+            ok=True,
+            message=f"{src} -> {dst}",
+        )
+        _save_auth_control_registry(registry)
+
+
 def _save_pending_profile(profile: str, auth_json: Any, config_toml: str = "") -> Dict[str, Any]:
     name = _sanitize_auth_profile_name(profile)
     src, cfg = _pending_auth_paths(name)
@@ -2642,6 +2733,494 @@ def _mark_auth_profile_unchecked(profile: str, reason: str = "未检测") -> Non
     )
 
 
+def _profile_name_rank(name: str) -> tuple[int, int, str]:
+    clean = str(name or "").strip()
+    has_seq_suffix = bool(re.search(r"_\d+$", clean))
+    return (1 if has_seq_suffix else 0, len(clean), clean)
+
+
+def _strip_ansi(text: str) -> str:
+    raw = str(text or "")
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+
+
+def _cleanup_reauth_requests(now_ts: Optional[int] = None) -> None:
+    current = int(now_ts or time.time())
+    stale: List[str] = []
+    for rid, item in list(_AUTH_REAUTH_REQUESTS.items()):
+        if not isinstance(item, dict):
+            stale.append(str(rid))
+            continue
+        started_at = int(item.get("started_at") or 0)
+        completed_at = int(item.get("completed_at") or 0)
+        deadline = max(started_at, completed_at) + AUTH_REAUTH_REQUEST_TTL_SEC
+        if deadline > 0 and deadline < current:
+            proc = item.get("proc")
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            stale.append(str(rid))
+    for rid in stale:
+        _AUTH_REAUTH_REQUESTS.pop(rid, None)
+
+
+def _extract_device_auth_url_and_code(text: str) -> Dict[str, str]:
+    clean = _strip_ansi(text)
+    url_match = re.search(r"https://auth\.openai\.com/codex/device", clean)
+    code_match = re.search(r"\b[A-Z0-9]{4,8}-[A-Z0-9]{4,8}\b", clean)
+    return {
+        "verification_uri": str(url_match.group(0)) if url_match else "",
+        "user_code": str(code_match.group(0)) if code_match else "",
+    }
+
+
+def _collect_identity_candidates() -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    local_by_profile: Dict[str, Dict[str, Any]] = {}
+    for item in _refresh_auth_profiles():
+        if not isinstance(item, dict):
+            continue
+        profile = str(item.get("profile") or "").strip()
+        if not profile:
+            continue
+        local_by_profile[profile] = dict(item)
+    for item in _list_pending_auth_profiles():
+        if not isinstance(item, dict):
+            continue
+        profile = str(item.get("profile") or "").strip()
+        if not profile:
+            continue
+        pending = dict(item)
+        if profile not in local_by_profile:
+            local_by_profile[profile] = pending
+    remote_by_profile: Dict[str, Dict[str, Any]] = {}
+    try:
+        nodes = _parse_auth_control_nodes()
+        for snap in _collect_auth_control_node_snapshots(nodes):
+            for item in list(snap.get("profiles") or []):
+                if not isinstance(item, dict):
+                    continue
+                profile = str(item.get("profile") or "").strip()
+                if not profile:
+                    continue
+                current = remote_by_profile.get(profile) if isinstance(remote_by_profile.get(profile), dict) else {}
+                merged = dict(current)
+                if not str(merged.get("email") or "").strip():
+                    merged["email"] = str(item.get("email") or "").strip()
+                if not str(merged.get("sub") or "").strip():
+                    merged["sub"] = str(item.get("sub") or "").strip()
+                remote_by_profile[profile] = merged
+    except Exception:
+        remote_by_profile = {}
+    with _AUTH_CONTROL_LOCK:
+        registry = _load_auth_control_registry()
+        auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+    for profile, raw in auths.items():
+        clean_profile = str(profile or "").strip()
+        if not clean_profile:
+            continue
+        item = raw if isinstance(raw, dict) else {}
+        current = local_by_profile.get(clean_profile, {})
+        out.append(
+            {
+                "profile": clean_profile,
+                "email": str(current.get("email") or item.get("email") or remote_by_profile.get(clean_profile, {}).get("email") or "").strip().lower(),
+                "sub": str(current.get("sub") or item.get("sub") or remote_by_profile.get(clean_profile, {}).get("sub") or "").strip(),
+            }
+        )
+    seen_profiles = {str(row.get("profile") or "").strip() for row in out}
+    for profile, item in local_by_profile.items():
+        clean_profile = str(profile or "").strip()
+        if (not clean_profile) or clean_profile in seen_profiles:
+            continue
+        out.append(
+            {
+                "profile": clean_profile,
+                "email": str(item.get("email") or "").strip().lower(),
+                "sub": str(item.get("sub") or "").strip(),
+            }
+        )
+    for profile, item in remote_by_profile.items():
+        clean_profile = str(profile or "").strip()
+        if (not clean_profile) or clean_profile in seen_profiles:
+            continue
+        out.append(
+            {
+                "profile": clean_profile,
+                "email": str(item.get("email") or "").strip().lower(),
+                "sub": str(item.get("sub") or "").strip(),
+            }
+        )
+    return out
+
+
+def _find_existing_profile_for_identity(email: str = "", sub: str = "") -> str:
+    clean_email = str(email or "").strip().lower()
+    clean_sub = str(sub or "").strip()
+    if (not clean_email) and (not clean_sub):
+        return ""
+    candidates = _collect_identity_candidates()
+    by_sub: List[str] = []
+    by_email: List[str] = []
+    for item in candidates:
+        profile = str(item.get("profile") or "").strip()
+        if not profile:
+            continue
+        item_sub = str(item.get("sub") or "").strip()
+        item_email = str(item.get("email") or "").strip().lower()
+        if clean_sub and item_sub and item_sub == clean_sub:
+            by_sub.append(profile)
+        if clean_email and item_email and item_email == clean_email:
+            by_email.append(profile)
+    if by_sub:
+        return sorted(set(by_sub), key=_profile_name_rank)[0]
+    if by_email:
+        return sorted(set(by_email), key=_profile_name_rank)[0]
+    return ""
+
+
+def _watch_reauth_request(request_id: str) -> None:
+    rid = str(request_id or "").strip()
+    if not rid:
+        return
+    with _AUTH_REAUTH_LOCK:
+        job = _AUTH_REAUTH_REQUESTS.get(rid) if isinstance(_AUTH_REAUTH_REQUESTS.get(rid), dict) else None
+        if not job:
+            return
+        proc = job.get("proc")
+        ready_event = job.get("ready_event")
+    if not proc:
+        return
+
+    lines: List[str] = []
+    try:
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                clean_line = _strip_ansi(str(line or "").rstrip("\n"))
+                if clean_line:
+                    lines.append(clean_line)
+                joined = "\n".join(lines[-120:])
+                parsed = _extract_device_auth_url_and_code(joined)
+                with _AUTH_REAUTH_LOCK:
+                    current = _AUTH_REAUTH_REQUESTS.get(rid) if isinstance(_AUTH_REAUTH_REQUESTS.get(rid), dict) else None
+                    if not current:
+                        return
+                    if parsed.get("verification_uri") and not str(current.get("verification_uri") or "").strip():
+                        current["verification_uri"] = str(parsed.get("verification_uri") or "").strip()
+                    if parsed.get("user_code") and not str(current.get("user_code") or "").strip():
+                        current["user_code"] = str(parsed.get("user_code") or "").strip()
+                    current["output_tail"] = "\n".join(lines[-40:])[-4000:]
+                    if current.get("verification_uri") and current.get("user_code"):
+                        current["expires_at"] = int(current.get("started_at") or int(time.time())) + 900
+                    if ready_event and (not ready_event.is_set()) and current.get("verification_uri") and current.get("user_code"):
+                        ready_event.set()
+        rc = int(proc.wait(timeout=1800))
+    except subprocess.TimeoutExpired:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        rc = -9
+        lines.append("device auth timeout")
+    except Exception as exc:
+        rc = -1
+        lines.append(f"watch error: {exc}")
+
+    with _AUTH_REAUTH_LOCK:
+        current = _AUTH_REAUTH_REQUESTS.get(rid) if isinstance(_AUTH_REAUTH_REQUESTS.get(rid), dict) else None
+        if not current:
+            return
+        current["exit_code"] = rc
+        current["completed_at"] = int(time.time())
+        current["output_tail"] = "\n".join(lines[-40:])[-4000:]
+        if ready_event and (not ready_event.is_set()):
+            ready_event.set()
+        if str(current.get("status") or "").strip() in {"cancelled"}:
+            current["error"] = str(current.get("error") or "cancelled").strip() or "cancelled"
+            return
+        if rc != 0:
+            current["status"] = "failed"
+            current["error"] = str(current.get("output_tail") or f"codex login exited with code {rc}")[-1000:]
+            return
+
+        profile = str(current.get("profile") or "").strip()
+        if not profile:
+            current["status"] = "failed"
+            current["error"] = "missing profile"
+            return
+        home_auth = _profile_home_dir(profile) / "auth.json"
+        if not home_auth.exists() or (not home_auth.is_file()):
+            current["status"] = "failed"
+            current["error"] = "login completed but auth.json not found in profile home"
+            return
+        try:
+            payload = json.loads(home_auth.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise RuntimeError("auth.json must be object")
+            ident = _auth_identity_from_auth_json(payload)
+            matched_profile = _find_existing_profile_for_identity(
+                email=str(ident.get("email") or "").strip(),
+                sub=str(ident.get("sub") or "").strip(),
+            )
+            auto_profile = bool(current.get("auto_profile"))
+            profile_preexisted = bool(current.get("profile_preexisted"))
+            final_profile = profile
+            if auto_profile:
+                if matched_profile:
+                    final_profile = matched_profile
+                else:
+                    used = _collect_known_profile_names()
+                    used.discard(profile)
+                    final_profile = _auto_profile_alias(
+                        email=str(ident.get("email") or "").strip(),
+                        filename=f"{profile}.auth.json",
+                        used=used,
+                    )
+            elif (not profile_preexisted) and matched_profile and matched_profile != profile:
+                final_profile = matched_profile
+
+            src = AUTH_PROFILES_DIR / f"{final_profile}.auth.json"
+            if src.exists() and src.is_file():
+                backup_name = f"{final_profile}.auth.json.{datetime.now().strftime('%Y%m%d_%H%M%S')}.reauth.bak"
+                AUTH_BACKUP_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, AUTH_BACKUP_PROFILES_DIR / backup_name)
+            shutil.copy2(home_auth, src)
+            if final_profile != profile:
+                _remove_pending_profile_artifacts(profile)
+                _remove_backup_profile_artifacts(profile)
+                _remove_auth_profile_artifacts(profile)
+                _merge_registry_profile_alias(profile, final_profile)
+            _refresh_auth_profiles()
+            current["profile"] = final_profile
+            current["resolved_profile"] = final_profile
+            current["status"] = "success"
+            current["error"] = ""
+        except Exception as exc:
+            current["status"] = "failed"
+            current["error"] = f"sync auth.json failed: {exc}"
+
+
+def _auth_control_reauth_start(profile: str, node_id: str = "") -> Dict[str, Any]:
+    requested_profile = str(profile or "").strip()
+    auto_profile = not requested_profile
+    if requested_profile:
+        name = _sanitize_auth_profile_name(requested_profile)
+    else:
+        name = _auto_device_pending_profile(used=_collect_known_profile_names())
+    target_node = str(node_id or "").strip()
+    if target_node and target_node != "local":
+        nodes = _auth_control_nodes_map()
+        node = nodes.get(target_node)
+        if not node:
+            raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node}")
+        try:
+            payload = _call_node_api(node, "POST", "/auth/control/reauth/start", {"profile": name})
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"remote reauth start failed on {target_node}: {exc}") from exc
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return {
+            **dict(data),
+            "node_id": target_node,
+        }
+
+    item = _get_auth_profile(name)
+    profile_preexisted = bool(item)
+    if item:
+        provider = _normalize_agent_provider(str(item.get("provider") or "codex"))
+        if provider != "codex":
+            raise HTTPException(status_code=400, detail=f"profile provider not supported for device auth: {provider}")
+    else:
+        # Allow creating new codex profile via device-auth without pre-uploaded auth.json.
+        now_ts = int(time.time())
+        with _AUTH_CONTROL_LOCK:
+            registry = _load_auth_control_registry()
+            auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+            existing = auths.get(name) if isinstance(auths.get(name), dict) else {}
+            auths[name] = {
+                **existing,
+                "profile": name,
+                "provider": "codex",
+                "label": str(existing.get("label") or name).strip()[:120],
+                "notes": str(existing.get("notes") or "").strip()[:500],
+                "updated_at": now_ts,
+                "created_at": int(existing.get("created_at") or now_ts),
+            }
+            registry["auths"] = auths
+            _audit_auth_control(registry, action="reauth_start", profile=name, node_id="local", ok=True, message="device auth start")
+            _save_auth_control_registry(registry)
+
+    with _AUTH_REAUTH_LOCK:
+        _cleanup_reauth_requests(now_ts=int(time.time()))
+        for rid, existing in list(_AUTH_REAUTH_REQUESTS.items()):
+            if not isinstance(existing, dict):
+                continue
+            if str(existing.get("profile") or "").strip() != name:
+                continue
+            if str(existing.get("status") or "").strip() != "pending":
+                continue
+            return {
+                "request_id": str(rid),
+                "profile": name,
+                "status": "pending",
+                "verification_uri": str(existing.get("verification_uri") or "").strip(),
+                "user_code": str(existing.get("user_code") or "").strip(),
+                "expires_at": int(existing.get("expires_at") or int(time.time()) + 900),
+            }
+
+    home_dir = _profile_home_dir(name)
+    home_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home_dir)
+    try:
+        proc = subprocess.Popen(
+            ["codex", "login", "--device-auth"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"start device auth failed: {exc}") from exc
+
+    now_ts = int(time.time())
+    ready_event = threading.Event()
+    request_id = str(uuid.uuid4())
+    with _AUTH_REAUTH_LOCK:
+        _cleanup_reauth_requests(now_ts=now_ts)
+        job = {
+            "request_id": request_id,
+            "profile": name,
+            "requested_profile": requested_profile,
+            "auto_profile": bool(auto_profile),
+            "profile_preexisted": bool(profile_preexisted),
+            "status": "pending",
+            "verification_uri": "",
+            "user_code": "",
+            "started_at": now_ts,
+            "expires_at": now_ts + 900,
+            "completed_at": 0,
+            "error": "",
+            "output_tail": "",
+            "exit_code": None,
+            "pid": int(proc.pid or 0),
+            "home_dir": str(home_dir),
+            "proc": proc,
+            "ready_event": ready_event,
+        }
+        _AUTH_REAUTH_REQUESTS[request_id] = job
+
+    threading.Thread(target=_watch_reauth_request, args=(request_id,), daemon=True, name=f"reauth-{request_id[:8]}").start()
+    ready_event.wait(timeout=AUTH_REAUTH_START_WAIT_SEC)
+    with _AUTH_REAUTH_LOCK:
+        current = _AUTH_REAUTH_REQUESTS.get(request_id) if isinstance(_AUTH_REAUTH_REQUESTS.get(request_id), dict) else {}
+        status = str(current.get("status") or "").strip()
+        if status == "failed":
+            raise HTTPException(status_code=500, detail=str(current.get("error") or "start device auth failed"))
+        verification_uri = str(current.get("verification_uri") or "").strip()
+        user_code = str(current.get("user_code") or "").strip()
+        if (not verification_uri) or (not user_code):
+            raise HTTPException(status_code=504, detail="device auth code not ready, retry")
+        return {
+            "request_id": request_id,
+            "profile": name,
+            "status": str(current.get("status") or "pending"),
+            "verification_uri": verification_uri,
+            "user_code": user_code,
+            "expires_at": int(current.get("expires_at") or now_ts + 900),
+            "node_id": "local",
+        }
+
+
+def _auth_control_reauth_status(request_id: str, node_id: str = "") -> Dict[str, Any]:
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    target_node = str(node_id or "").strip()
+    if target_node and target_node != "local":
+        nodes = _auth_control_nodes_map()
+        node = nodes.get(target_node)
+        if not node:
+            raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node}")
+        try:
+            payload = _call_node_api(node, "POST", "/auth/control/reauth/status", {"request_id": rid})
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"remote reauth status failed on {target_node}: {exc}") from exc
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return {
+            **dict(data),
+            "node_id": target_node,
+        }
+    now_ts = int(time.time())
+    with _AUTH_REAUTH_LOCK:
+        _cleanup_reauth_requests(now_ts=now_ts)
+        current = _AUTH_REAUTH_REQUESTS.get(rid) if isinstance(_AUTH_REAUTH_REQUESTS.get(rid), dict) else None
+        if not current:
+            raise HTTPException(status_code=404, detail=f"reauth request not found: {rid}")
+        proc = current.get("proc")
+        if proc and proc.poll() is not None and str(current.get("status") or "").strip() == "pending":
+            current["status"] = "failed"
+            current["exit_code"] = int(proc.returncode or 0)
+            current["completed_at"] = int(time.time())
+            current["error"] = str(current.get("output_tail") or f"codex login exited with code {proc.returncode}")[-1000:]
+        return {
+            "request_id": rid,
+            "profile": str(current.get("profile") or "").strip(),
+            "status": str(current.get("status") or "").strip() or "pending",
+            "verification_uri": str(current.get("verification_uri") or "").strip(),
+            "user_code": str(current.get("user_code") or "").strip(),
+            "started_at": int(current.get("started_at") or 0),
+            "expires_at": int(current.get("expires_at") or 0),
+            "completed_at": int(current.get("completed_at") or 0),
+            "error": str(current.get("error") or "").strip(),
+            "exit_code": current.get("exit_code"),
+            "node_id": "local",
+        }
+
+
+def _auth_control_reauth_cancel(request_id: str, node_id: str = "") -> Dict[str, Any]:
+    rid = str(request_id or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    target_node = str(node_id or "").strip()
+    if target_node and target_node != "local":
+        nodes = _auth_control_nodes_map()
+        node = nodes.get(target_node)
+        if not node:
+            raise HTTPException(status_code=404, detail=f"node not found or disabled: {target_node}")
+        try:
+            payload = _call_node_api(node, "POST", "/auth/control/reauth/cancel", {"request_id": rid})
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"remote reauth cancel failed on {target_node}: {exc}") from exc
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return {
+            **dict(data),
+            "node_id": target_node,
+        }
+    with _AUTH_REAUTH_LOCK:
+        current = _AUTH_REAUTH_REQUESTS.get(rid) if isinstance(_AUTH_REAUTH_REQUESTS.get(rid), dict) else None
+        if not current:
+            raise HTTPException(status_code=404, detail=f"reauth request not found: {rid}")
+        proc = current.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        current["status"] = "cancelled"
+        current["completed_at"] = int(time.time())
+        current["error"] = str(current.get("error") or "cancelled by user").strip()
+        return {
+            "request_id": rid,
+            "profile": str(current.get("profile") or "").strip(),
+            "status": "cancelled",
+            "completed_at": int(current.get("completed_at") or 0),
+            "node_id": "local",
+        }
+
+
 def _auth_control_batch_upload(provider: str, items: List[AuthControlBatchUploadItem], notes: str = "") -> Dict[str, Any]:
     clean_provider = _normalize_agent_provider(provider)
     uploads = [item for item in list(items or []) if isinstance(item, AuthControlBatchUploadItem)]
@@ -2659,7 +3238,12 @@ def _auth_control_batch_upload(provider: str, items: List[AuthControlBatchUpload
                 auth_text = _normalize_auth_json_text(raw.auth_json)
                 parsed = json.loads(auth_text)
                 ident = _auth_identity_from_auth_json(parsed if isinstance(parsed, dict) else {})
-                alias = _auto_profile_alias(email=str(ident.get("email") or ""), filename=filename, used=used)
+                alias = _find_existing_profile_for_identity(
+                    email=str(ident.get("email") or "").strip(),
+                    sub=str(ident.get("sub") or "").strip(),
+                )
+                if not alias:
+                    alias = _auto_profile_alias(email=str(ident.get("email") or ""), filename=filename, used=used)
                 item = _save_pending_profile(alias, parsed if isinstance(parsed, dict) else {}, config_toml=raw.config_toml)
                 used.add(alias)
                 now_ts = int(time.time())
@@ -3279,17 +3863,48 @@ def _auth_control_upload(
     label: str = "",
     notes: str = "",
 ) -> Dict[str, Any]:
+    clean_provider = _normalize_agent_provider(provider)
+    requested_profile = str(profile or "").strip()
+    resolved_profile = requested_profile
+    auth_text = _normalize_auth_json_text(auth_json)
+    try:
+        parsed_auth = json.loads(auth_text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"auth_json is not valid json: {exc}") from exc
+    if not isinstance(parsed_auth, dict):
+        raise HTTPException(status_code=400, detail="auth_json must be a JSON object")
+
+    if clean_provider == "codex":
+        ident = _auth_identity_from_auth_json(parsed_auth)
+        existing = _find_existing_profile_for_identity(
+            email=str(ident.get("email") or "").strip(),
+            sub=str(ident.get("sub") or "").strip(),
+        )
+        if existing:
+            resolved_profile = existing
+        elif not resolved_profile:
+            resolved_profile = _auto_profile_alias(
+                email=str(ident.get("email") or "").strip(),
+                filename="auth.json",
+                used=_collect_known_profile_names(),
+            )
+    elif not resolved_profile:
+        raise HTTPException(status_code=400, detail="profile is required for non-codex provider")
+
+    if not resolved_profile:
+        raise HTTPException(status_code=400, detail="profile is required")
+
     item = _install_auth_profile(
-        profile=profile,
-        provider=provider,
-        auth_json=auth_json,
+        profile=resolved_profile,
+        provider=clean_provider,
+        auth_json=parsed_auth,
         config_toml=config_toml,
         assignment_version=0,
         assignment_token="",
         assigned_server_id="",
         notes=notes,
     )
-    meta = _merge_auth_control_auth_meta(item, provider=provider, label=label, notes=notes)
+    meta = _merge_auth_control_auth_meta(item, provider=clean_provider, label=label, notes=notes)
     name = str(meta.get("profile") or "")
     with _AUTH_CONTROL_LOCK:
         registry = _load_auth_control_registry()
@@ -3301,9 +3916,21 @@ def _auth_control_upload(
         merged["created_at"] = created_at
         auths[name] = merged
         registry["auths"] = auths
-        _audit_auth_control(registry, action="upload", profile=name, ok=True, message="profile uploaded/updated")
+        _audit_auth_control(
+            registry,
+            action="upload",
+            profile=name,
+            ok=True,
+            message=f"profile uploaded/updated requested={requested_profile or '-'} resolved={name}",
+        )
         _save_auth_control_registry(registry)
-    return {"profile": name, "meta": meta, "health": item}
+    return {
+        "profile": name,
+        "requested_profile": requested_profile,
+        "resolved_profile": name,
+        "meta": meta,
+        "health": item,
+    }
 
 
 def _auth_control_assign(
@@ -4901,6 +5528,24 @@ def auth_control_check_one(body: AuthControlCheckOneRequest) -> Dict[str, Any]:
     return {"ok": True, "data": data}
 
 
+@ROUTER.post("/auth/control/reauth/start", dependencies=[Depends(require_api_token)])
+def auth_control_reauth_start(body: AuthControlReauthStartRequest) -> Dict[str, Any]:
+    data = _auth_control_reauth_start(profile=body.profile, node_id=body.node_id)
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/reauth/status", dependencies=[Depends(require_api_token)])
+def auth_control_reauth_status(body: AuthControlReauthStatusRequest) -> Dict[str, Any]:
+    data = _auth_control_reauth_status(request_id=body.request_id, node_id=body.node_id)
+    return {"ok": True, "data": data}
+
+
+@ROUTER.post("/auth/control/reauth/cancel", dependencies=[Depends(require_api_token)])
+def auth_control_reauth_cancel(body: AuthControlReauthCancelRequest) -> Dict[str, Any]:
+    data = _auth_control_reauth_cancel(request_id=body.request_id, node_id=body.node_id)
+    return {"ok": True, "data": data}
+
+
 @ROUTER.post("/chat/{chat_id}/config", dependencies=[Depends(require_api_token)])
 def chat_config_update(chat_id: str, body: UpdateChatConfigRequest) -> Dict[str, Any]:
     runtime = RUNTIMES.get(chat_id)
@@ -5864,6 +6509,42 @@ def history_auth_control_check_one_api(
     return JSONResponse({"ok": True, "data": data})
 
 
+@APP.post("/history/api/auth/control/reauth/start")
+def history_auth_control_reauth_start_api(
+    body: AuthControlReauthStartRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_reauth_start(profile=body.profile, node_id=body.node_id)
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/reauth/status")
+def history_auth_control_reauth_status_api(
+    body: AuthControlReauthStatusRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_reauth_status(request_id=body.request_id, node_id=body.node_id)
+    return JSONResponse({"ok": True, "data": data})
+
+
+@APP.post("/history/api/auth/control/reauth/cancel")
+def history_auth_control_reauth_cancel_api(
+    body: AuthControlReauthCancelRequest,
+    request: Request,
+    token: str = Query(default=""),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    _history_access_guard(request, token=token, authorization=authorization, require_session=False)
+    data = _auth_control_reauth_cancel(request_id=body.request_id, node_id=body.node_id)
+    return JSONResponse({"ok": True, "data": data})
+
+
 @APP.get("/history/auth-control", response_class=HTMLResponse)
 def history_auth_control_page(
     request: Request,
@@ -5940,6 +6621,11 @@ def history_auth_control_page(
     th, td {{ border-bottom: 1px solid #e5edf5; text-align: left; padding: 8px; vertical-align: top; }}
     code {{ background: #f2f7ff; padding: 2px 6px; border-radius: 6px; }}
     #log {{ white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #09111f; color: #d6e2ff; padding: 10px; border-radius: 8px; max-height: 220px; overflow: auto; }}
+    .flow-grid {{ display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+    .flow-field {{ display: grid; gap: 6px; }}
+    .flow-field label {{ font-size: 12px; color: #475569; }}
+    .device-code-panel {{ margin-top: 10px; border: 1px solid #cfe0ff; background: #f5f9ff; border-radius: 10px; padding: 10px; }}
+    .device-code-value {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 18px; font-weight: 700; letter-spacing: 1px; color: #0f172a; }}
   </style>
 </head>
 <body>
@@ -5959,31 +6645,75 @@ def history_auth_control_page(
     </section>
 
     <section class="card">
-      <h3>批量上传到池中</h3>
-      <div id="upload_drop" class="drop-zone">
-        拖拽多个 auth.json 到这里，或 <input id="upload_files" type="file" multiple accept=".json,.auth.json" />
+      <h3>账号接入流程（统一新增 / 重新登录）</h3>
+      <div class="flow-grid">
+        <div class="flow-field">
+          <label for="flow_mode">目标操作</label>
+          <select id="flow_mode" onchange="updateAuthFlowForm()">
+            <option value="new">新增账号</option>
+            <option value="existing">重新登录（更新已有账号）</option>
+          </select>
+        </div>
+        <div class="flow-field">
+          <label for="flow_method">授权方式</label>
+          <select id="flow_method" onchange="updateAuthFlowForm()">
+            <option value="device">设备码授权登录</option>
+            <option value="upload">上传 auth.json</option>
+            <option value="claude">Claude Code 配置</option>
+          </select>
+        </div>
+        <div class="flow-field" id="flow_existing_wrap" style="display:none;">
+          <label for="flow_target_profile">选择已有账号</label>
+          <select id="flow_target_profile" onchange="updateAuthFlowForm()"></select>
+        </div>
+        <div class="flow-field" id="flow_new_profile_wrap">
+          <label for="flow_new_profile">新账号 profile（可选）</label>
+          <input id="flow_new_profile" placeholder="留空自动命名；若与已有账号同身份会自动覆盖已有账号" />
+        </div>
+        <div class="flow-field" id="flow_env_wrap">
+          <label for="flow_env">登录执行环境</label>
+          <select id="flow_env"></select>
+          <div id="flow_env_auto" class="muted" style="display:none;">自动关联设备：-</div>
+        </div>
+        <div class="flow-field" id="flow_claude_wrap" style="display:none;">
+          <label for="flow_claude_api_key">ANTHROPIC_API_KEY</label>
+          <input id="flow_claude_api_key" type="password" placeholder="必填" />
+          <label for="flow_claude_base_url">ANTHROPIC_BASE_URL（可选）</label>
+          <input id="flow_claude_base_url" placeholder="可选" />
+          <label for="flow_claude_model">默认模型（可选）</label>
+          <input id="flow_claude_model" placeholder="可选，例如 claude-sonnet-4-20250514" />
+          <label for="flow_claude_notes">备注（可选）</label>
+          <input id="flow_claude_notes" placeholder="可选" />
+        </div>
+        <div class="flow-field" id="flow_upload_wrap" style="display:none;">
+          <label for="flow_upload_file">auth.json 文件</label>
+          <input id="flow_upload_file" type="file" accept=".json,.auth.json" />
+          <label for="flow_upload_provider">Provider（可选）</label>
+          <select id="flow_upload_provider">
+            <option value="codex">codex</option>
+            <option value="openclaw">openclaw</option>
+            <option value="claude_code">claude code</option>
+          </select>
+          <label for="flow_upload_notes">备注（可选）</label>
+          <input id="flow_upload_notes" placeholder="可选" />
+        </div>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <select id="upload_provider"><option value="codex">codex</option><option value="openclaw">openclaw</option><option value="claude_code">claude code</option></select>
-        <input id="upload_notes" placeholder="备注（可选）" style="min-width: 220px;" />
-        <button onclick="uploadSelectedFiles()">上传到池中</button>
+      <div class="row" style="margin-top:10px;">
+        <button onclick="submitAuthFlow()">提交</button>
       </div>
-      <div id="upload_selected" class="muted" style="margin-top:8px;">尚未选择文件</div>
-    </section>
-
-    <section class="card">
-      <h3>手工新增 Claude Code 账号</h3>
-      <div class="row">
-        <input id="cc_profile" placeholder="profile（必填，例如 claude_team_a）" style="min-width: 240px;" />
-        <input id="cc_api_key" type="password" placeholder="ANTHROPIC_API_KEY（必填）" style="min-width: 320px;" />
+      <div class="muted" style="margin-top:8px;">新增与重登统一走同一流程；旧账号重登会自动关联到原设备环境。</div>
+      <div id="device_code_panel" class="device-code-panel" style="display:none;">
+        <div class="row" style="justify-content:space-between;">
+          <strong>设备码</strong>
+          <span id="device_code_status" class="muted"></span>
+        </div>
+        <div id="device_code_value" class="device-code-value">-</div>
+        <div class="row" style="margin-top:8px;">
+          <button class="alt mini" onclick="copyCurrentDeviceCode()">复制设备码</button>
+          <button class="mini" onclick="openCurrentVerificationUri()">打开验证页面</button>
+        </div>
+        <div id="device_code_meta" class="muted" style="margin-top:6px;"></div>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <input id="cc_base_url" placeholder="ANTHROPIC_BASE_URL（可选）" style="min-width: 320px;" />
-        <input id="cc_model" placeholder="默认模型（可选）" style="min-width: 220px;" />
-        <input id="cc_notes" placeholder="备注（可选）" style="min-width: 220px;" />
-        <button onclick="uploadClaudeCodeProfile()">保存到池中</button>
-      </div>
-      <div class="muted" style="margin-top:8px;">不需要填写 email，按 profile 管理与切换。</div>
     </section>
 
     <section class="card">
@@ -5998,9 +6728,10 @@ def history_auth_control_page(
     const cfg = window.__AUTH_CONTROL_CONFIG__ || {{}};
     const q = cfg.authToken ? `?token=${{encodeURIComponent(cfg.authToken)}}` : '';
     let latestState = null;
-    let selectedFiles = [];
     let dragProfile = '';
     let healthCheckRunning = false;
+    const reauthPollers = {{}};
+    let currentDeviceAuth = {{ requestId: '', profile: '', userCode: '', verificationUri: '', nodeId: 'local' }};
 
     function appendLog(msg) {{
       const el = document.getElementById('log');
@@ -6024,13 +6755,41 @@ def history_auth_control_page(
       return `${{Number(v).toFixed(1)}}%`;
     }}
 
+    function fmtResetAt(ts) {{
+      const n = Number(ts || 0);
+      if (!n) return '-';
+      try {{
+        return new Date(n * 1000).toLocaleString();
+      }} catch (_) {{
+        return '-';
+      }}
+    }}
+
+    function fmtWindowMins(mins) {{
+      const m = Number(mins || 0);
+      if (!m || Number.isNaN(m)) return '';
+      if (m % 1440 === 0) return `${{Math.round(m / 1440)}}d`;
+      if (m % 60 === 0) return `${{Math.round(m / 60)}}h`;
+      return `${{m}}m`;
+    }}
+
+    function quotaPiece(node, fallbackLabel) {{
+      const n = node || {{}};
+      const rem = fmtPct(n.remaining_pct);
+      const label = fmtWindowMins(n.window_mins) || String(fallbackLabel || '').trim() || '窗口';
+      const reset = fmtResetAt(n.resets_at);
+      if (rem === '-' && reset === '-') return '';
+      return `${{label}}剩余:${{rem}} 刷新:${{reset}}`;
+    }}
+
     function quotaText(q) {{
       const primary = (q && q.primary) ? q.primary : {{}};
       const secondary = (q && q.secondary) ? q.secondary : {{}};
-      const left5 = fmtPct(primary.remaining_pct);
-      const left7 = fmtPct(secondary.remaining_pct);
-      if (left5 === '-' && left7 === '-') return '5h: 未上报 · 7d: 未上报';
-      return `5h: ${{left5}} · 7d: ${{left7}}`;
+      const p1 = quotaPiece(primary, '主窗口');
+      const p2 = quotaPiece(secondary, '副窗口');
+      if (!p1 && !p2) return '额度: 未上报';
+      if (p1 && p2) return `${{p1}} · ${{p2}}`;
+      return p1 || p2;
     }}
 
     function localStatusText(local) {{
@@ -6100,8 +6859,174 @@ def history_auth_control_page(
       }}
     }}
 
+    function reauthKey(profile, nodeId='local') {{
+      return `${{String(profile || '').trim()}}@@${{String(nodeId || 'local').trim() || 'local'}}`;
+    }}
+
+    function clearReauthPoller(profile, nodeId='local') {{
+      const key = reauthKey(profile, nodeId);
+      if (!key) return;
+      const timer = reauthPollers[key];
+      if (timer) {{
+        clearInterval(timer);
+        delete reauthPollers[key];
+      }}
+    }}
+
+    async function copyText(text) {{
+      const raw = String(text || '').trim();
+      if (!raw) return false;
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        try {{
+          await navigator.clipboard.writeText(raw);
+          return true;
+        }} catch (_) {{}}
+      }}
+      try {{
+        const ta = document.createElement('textarea');
+        ta.value = raw;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return !!ok;
+      }} catch (_) {{
+        return false;
+      }}
+    }}
+
+    function renderDeviceCodePanel() {{
+      const panel = document.getElementById('device_code_panel');
+      if (!panel) return;
+      if (!currentDeviceAuth.requestId) {{
+        panel.style.display = 'none';
+        return;
+      }}
+      panel.style.display = 'block';
+      const code = String(currentDeviceAuth.userCode || '').trim();
+      const uri = String(currentDeviceAuth.verificationUri || '').trim();
+      const profile = String(currentDeviceAuth.profile || '').trim();
+      const node = String(currentDeviceAuth.nodeId || 'local').trim() || 'local';
+      const status = String(currentDeviceAuth.statusText || '').trim();
+      document.getElementById('device_code_value').textContent = code || '-';
+      document.getElementById('device_code_status').textContent = status || '等待确认';
+      document.getElementById('device_code_meta').textContent = `账号：${{profile || '-'}} | 节点：${{node}} | 验证地址：${{uri || '-'}}`;
+    }}
+
+    async function copyCurrentDeviceCode() {{
+      const code = String(currentDeviceAuth.userCode || '').trim();
+      if (!code) return;
+      const ok = await copyText(code);
+      appendLog(ok ? '设备码已复制到剪贴板' : '设备码复制失败，请手动复制');
+    }}
+
+    function openCurrentVerificationUri() {{
+      const url = String(currentDeviceAuth.verificationUri || '').trim();
+      if (!url) return;
+      window.open(url, '_blank', 'noopener');
+    }}
+
+    function clearDeviceCodePanel() {{
+      currentDeviceAuth = {{ requestId: '', profile: '', userCode: '', verificationUri: '', nodeId: 'local', statusText: '' }};
+      renderDeviceCodePanel();
+    }}
+
+    async function startReauth(profile, nodeId='local') {{
+      const p = String(profile || '').trim();
+      const nid = String(nodeId || '').trim() || 'local';
+      setOp(p || '__device_login__', '发起重登中', 'running');
+      try {{
+        const started = await api('/history/api/auth/control/reauth/start', 'POST', {{
+          profile: p,
+          node_id: nid === 'local' ? '' : nid,
+        }});
+        const authProfile = String(started.profile || p || '').trim();
+        const url = String(started.verification_uri || '').trim();
+        const code = String(started.user_code || '').trim();
+        const rid = String(started.request_id || '').trim();
+        currentDeviceAuth = {{
+          requestId: rid,
+          profile: authProfile,
+          userCode: code,
+          verificationUri: url,
+          nodeId: nid,
+          statusText: '等待确认',
+        }};
+        renderDeviceCodePanel();
+        const copied = code ? await copyText(code) : false;
+        appendLog(`reauth started: profile=${{authProfile}} code=${{code}} request=${{rid}}`);
+        if (code) appendLog(copied ? `device code copied: ${{code}}` : `device code copy failed: ${{code}}`);
+        setOp(authProfile || '__device_login__', '等待网页确认', 'running');
+        clearReauthPoller(authProfile || p, nid);
+        let rounds = 0;
+        const pollKey = reauthKey(authProfile || p, nid);
+        reauthPollers[pollKey] = setInterval(async () => {{
+          rounds += 1;
+          try {{
+            const st = await api('/history/api/auth/control/reauth/status', 'POST', {{
+              request_id: rid,
+              node_id: nid === 'local' ? '' : nid,
+            }});
+            const status = String(st.status || '').trim();
+            if (status === 'pending') {{
+              currentDeviceAuth.statusText = '等待确认';
+              renderDeviceCodePanel();
+              setOp(authProfile || '__device_login__', '等待网页确认', 'running');
+              if (rounds >= 300) {{
+                clearReauthPoller(authProfile || p, nid);
+                currentDeviceAuth.statusText = '已超时';
+                renderDeviceCodePanel();
+                setOp(authProfile || '__device_login__', '超时：请重试', 'bad');
+              }}
+              return;
+            }}
+            clearReauthPoller(authProfile || p, nid);
+            if (status === 'success') {{
+              const finalProfile = String(st.profile || authProfile || '').trim();
+              currentDeviceAuth.profile = finalProfile || authProfile;
+              currentDeviceAuth.statusText = '授权完成';
+              renderDeviceCodePanel();
+              setOp(finalProfile || authProfile || '__device_login__', '完成：已更新账号', 'ok');
+              appendLog(`reauth success: profile=${{finalProfile || authProfile}}`);
+            }} else if (status === 'cancelled') {{
+              currentDeviceAuth.statusText = '已取消';
+              renderDeviceCodePanel();
+              setOp(authProfile || '__device_login__', '已取消', 'bad');
+              appendLog(`reauth cancelled: profile=${{authProfile}}`);
+            }} else {{
+              const err = String(st.error || '重登失败').trim();
+              currentDeviceAuth.statusText = `失败：${{err}}`;
+              renderDeviceCodePanel();
+              setOp(authProfile || '__device_login__', `失败：${{err}}`, 'bad');
+              appendLog(`reauth failed: profile=${{authProfile}} error=${{err}}`);
+            }}
+            try {{ await refreshState(false); }} catch (_) {{}}
+          }} catch (e) {{
+            clearReauthPoller(authProfile || p, nid);
+            currentDeviceAuth.statusText = `失败：${{String(e)}}`;
+            renderDeviceCodePanel();
+            setOp(authProfile || '__device_login__', `失败：${{String(e)}}`, 'bad');
+          }}
+        }}, 2000);
+      }} catch (e) {{
+        clearDeviceCodePanel();
+        setOp(p || '__device_login__', `失败：${{String(e)}}`, 'bad');
+      }}
+    }}
+
     function envList(data) {{
       return Array.isArray(data?.environments) ? data.environments : [];
+    }}
+
+    function envLabelById(envId) {{
+      const id = String(envId || '').trim() || 'local';
+      if (id === 'local') return '本机';
+      const envs = envList(latestState || {{}});
+      const found = envs.find(e => String(e?.id || '').trim() === id);
+      return String(found?.label || id).trim() || id;
     }}
 
     function inEnv(auth, envId) {{
@@ -6133,6 +7058,21 @@ def history_auth_control_page(
         if (cnt > 1) out[email] = true;
       }}
       return out;
+    }}
+
+    function resolveExistingProfileNode(profile) {{
+      const p = String(profile || '').trim();
+      if (!p) return 'local';
+      const auth = findAuth(p);
+      if (!auth) return 'local';
+      const assigned = String((auth.assignment || {{}}).node_id || '').trim();
+      if (assigned) return assigned;
+      if (auth.local && auth.local.exists) return 'local';
+      const rows = Array.isArray(auth.nodes) ? auth.nodes : [];
+      const present = rows.filter(r => !!r?.present && String(r?.node_id || '').trim());
+      if (!present.length) return 'local';
+      const active = present.find(r => String(r.status || '').trim().toLowerCase() === 'active');
+      return String((active || present[0]).node_id || 'local').trim() || 'local';
     }}
 
     async function removeFromNode(profile, nodeId) {{
@@ -6360,6 +7300,23 @@ def history_auth_control_page(
           act.appendChild(checkBtn);
 
           if (colId !== 'pool') {{
+            const provider = String(a.provider || 'codex').trim().toLowerCase();
+            let needReauth = false;
+            if (colId === 'local') {{
+              needReauth = String((a.local || {{}}).status || '').trim().toLowerCase() === 'needs_reauth';
+            }} else {{
+              needReauth = String((findNode(a, colId) || {{}}).status || '').trim().toLowerCase() === 'needs_reauth';
+            }}
+            if (provider === 'codex' && needReauth) {{
+              const reloginBtn = document.createElement('button');
+              reloginBtn.className = 'mini';
+              reloginBtn.textContent = '重新登录';
+              reloginBtn.onclick = async () => {{
+                await startReauth(String(a.profile || ''), colId);
+              }};
+              act.appendChild(reloginBtn);
+            }}
+
             const backBtn = document.createElement('button');
             backBtn.className = 'alt mini';
             backBtn.textContent = '移到池中';
@@ -6424,6 +7381,18 @@ def history_auth_control_page(
       document.getElementById('summary').textContent =
         `Auth总数: ${{auths.length}} | 池中: ${{pool.length}} | 已分配: ${{assigned.length}} | 节点: ${{nodes.length}} | 更新时间: ${{new Date((data.timestamp||0)*1000).toLocaleString()}}`;
       document.getElementById('pending_dir').textContent = data.pending_dir || '-';
+      const envSel = document.getElementById('flow_env');
+      if (envSel) {{
+        const envs = envList(data);
+        const options = [{{ id: 'local', label: '本机' }}].concat(envs.filter(e => (e.id || '') !== 'local'));
+        const prev = String(envSel.value || 'local').trim() || 'local';
+        envSel.innerHTML = options
+          .map(e => `<option value="${{String(e.id || '').trim()}}">${{String(e.label || e.id || '').trim()}}</option>`)
+          .join('');
+        envSel.value = options.some(e => String(e.id||'') === prev) ? prev : 'local';
+      }}
+      renderFlowTargets(data);
+      updateAuthFlowForm();
       renderBoard(data);
     }}
 
@@ -6433,56 +7402,111 @@ def history_auth_control_page(
       if (withLog) appendLog('state refreshed');
     }}
 
-    function addFiles(fileList) {{
-      const arr = Array.from(fileList || []);
-      for (const f of arr) {{
-        if (!selectedFiles.find(x => x.name === f.name && x.size === f.size && x.lastModified === f.lastModified)) {{
-          selectedFiles.push(f);
+    function updateAuthFlowForm() {{
+      const mode = String(document.getElementById('flow_mode')?.value || 'new').trim();
+      const method = String(document.getElementById('flow_method')?.value || 'device').trim();
+      const existingWrap = document.getElementById('flow_existing_wrap');
+      const newWrap = document.getElementById('flow_new_profile_wrap');
+      const envWrap = document.getElementById('flow_env_wrap');
+      const envAuto = document.getElementById('flow_env_auto');
+      const claudeWrap = document.getElementById('flow_claude_wrap');
+      const uploadWrap = document.getElementById('flow_upload_wrap');
+      const selectedExisting = String(document.getElementById('flow_target_profile')?.value || '').trim();
+      const autoNode = resolveExistingProfileNode(selectedExisting);
+      if (existingWrap) existingWrap.style.display = mode === 'existing' ? '' : 'none';
+      if (newWrap) newWrap.style.display = mode === 'new' ? '' : 'none';
+      if (envWrap) envWrap.style.display = method === 'device' ? '' : 'none';
+      if (envAuto) {{
+        if (method === 'device' && mode === 'existing') {{
+          envAuto.style.display = '';
+          envAuto.textContent = `自动关联设备：${{envLabelById(autoNode)}}`;
+        }} else {{
+          envAuto.style.display = 'none';
         }}
       }}
-      document.getElementById('upload_selected').textContent = selectedFiles.length
-        ? `已选择 ${{selectedFiles.length}} 个文件：` + selectedFiles.map(f => f.name).join(', ')
-        : '尚未选择文件';
+      const envSel = document.getElementById('flow_env');
+      if (envSel) envSel.disabled = method === 'device' && mode === 'existing';
+      if (claudeWrap) claudeWrap.style.display = method === 'claude' ? '' : 'none';
+      if (uploadWrap) uploadWrap.style.display = method === 'upload' ? '' : 'none';
     }}
 
-    async function uploadSelectedFiles() {{
-      if (!selectedFiles.length) throw new Error('请先选择文件');
-      const provider = document.getElementById('upload_provider').value.trim();
-      const notes = document.getElementById('upload_notes').value.trim();
-      const items = [];
-      const failed = [];
-      for (const f of selectedFiles) {{
+    function renderFlowTargets(data) {{
+      const sel = document.getElementById('flow_target_profile');
+      if (!sel) return;
+      const auths = Array.isArray(data?.auths) ? data.auths : [];
+      const options = auths
+        .map(a => String(a?.profile || '').trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+      const prev = String(sel.value || '').trim();
+      sel.innerHTML = options.map(p => `<option value="${{p}}">${{p}}</option>`).join('');
+      if (options.includes(prev)) {{
+        sel.value = prev;
+      }} else if (options.length) {{
+        sel.value = options[0];
+      }}
+    }}
+
+    async function submitAuthFlow() {{
+      const mode = String(document.getElementById('flow_mode')?.value || 'new').trim();
+      const method = String(document.getElementById('flow_method')?.value || 'device').trim();
+      const existingProfile = String(document.getElementById('flow_target_profile')?.value || '').trim();
+      const newProfile = String(document.getElementById('flow_new_profile')?.value || '').trim();
+      const profile = mode === 'existing' ? existingProfile : newProfile;
+
+      if (mode === 'existing' && !existingProfile) {{
+        throw new Error('请选择要更新的已有账号');
+      }}
+
+      if (method === 'device') {{
+        const env =
+          mode === 'existing'
+            ? resolveExistingProfileNode(existingProfile)
+            : (String(document.getElementById('flow_env')?.value || 'local').trim() || 'local');
+        await startReauth(profile, env);
+        appendLog(`device auth started: mode=${{mode}} profile=${{profile || '(auto)'}} env=${{env}} (${{
+          envLabelById(env)
+        }})`);
+        return;
+      }}
+      if (method === 'upload') {{
+        const input = document.getElementById('flow_upload_file');
+        const file = input && input.files ? input.files[0] : null;
+        if (!file) throw new Error('请先选择 auth.json 文件');
+        let parsed = null;
         try {{
-          const txt = await f.text();
-          items.push({{ filename: f.name, auth_json: JSON.parse(txt), config_toml: '' }});
+          parsed = JSON.parse(await file.text());
         }} catch (e) {{
-          failed.push(`${{f.name}}: JSON 解析失败`);
+          throw new Error(`auth.json 解析失败: ${{String(e)}}`);
         }}
+        const provider = String(document.getElementById('flow_upload_provider')?.value || 'codex').trim() || 'codex';
+        const notes = String(document.getElementById('flow_upload_notes')?.value || '').trim();
+        const result = await api('/history/api/auth/control/upload', 'POST', {{
+          profile,
+          provider,
+          auth_json: parsed,
+          config_toml: '',
+          label: profile,
+          notes,
+        }});
+        const resolved = String(result.profile || result.resolved_profile || profile || '').trim();
+        setOp(resolved || '__upload__', '完成：已更新账号', 'ok');
+        appendLog(`auth uploaded: mode=${{mode}} provider=${{provider}} requested=${{profile || '(auto)'}} resolved=${{resolved}}`);
+        if (input) input.value = '';
+        await refreshState(false);
+        return;
       }}
-      if (!items.length) throw new Error('没有可上传的合法 JSON');
-      const data = await api('/history/api/auth/control/upload-batch', 'POST', {{ provider, notes, items }});
-      appendLog(`upload batch: created=${{(data.created||[]).length}} failed=${{(data.failed||[]).length + failed.length}}`);
-      if (failed.length) appendLog('upload parse failed: ' + failed.join(' | '));
-      selectedFiles = [];
-      document.getElementById('upload_files').value = '';
-      document.getElementById('upload_selected').textContent = '尚未选择文件';
-      await refreshState();
-    }}
-
-    async function uploadClaudeCodeProfile() {{
-      const profile = String(document.getElementById('cc_profile')?.value || '').trim();
-      const apiKey = String(document.getElementById('cc_api_key')?.value || '').trim();
-      const baseUrl = String(document.getElementById('cc_base_url')?.value || '').trim();
-      const model = String(document.getElementById('cc_model')?.value || '').trim();
-      const notes = String(document.getElementById('cc_notes')?.value || '').trim();
-      if (!profile) throw new Error('profile 不能为空');
+      if (method !== 'claude') throw new Error(`不支持的授权方式: ${{method}}`);
+      if (!profile) throw new Error('Claude Code 配置需要填写 profile');
+      const apiKey = String(document.getElementById('flow_claude_api_key')?.value || '').trim();
+      const baseUrl = String(document.getElementById('flow_claude_base_url')?.value || '').trim();
+      const model = String(document.getElementById('flow_claude_model')?.value || '').trim();
+      const notes = String(document.getElementById('flow_claude_notes')?.value || '').trim();
       if (!apiKey) throw new Error('ANTHROPIC_API_KEY 不能为空');
-      const authJson = {{
-        api_key: apiKey,
-      }};
+      const authJson = {{ api_key: apiKey }};
       if (baseUrl) authJson.base_url = baseUrl;
       if (model) authJson.model = model;
-      await api('/history/api/auth/control/upload', 'POST', {{
+      const result = await api('/history/api/auth/control/upload', 'POST', {{
         profile,
         provider: 'claude_code',
         auth_json: authJson,
@@ -6490,9 +7514,12 @@ def history_auth_control_page(
         label: profile,
         notes,
       }});
-      appendLog(`upload claude_code profile=${{profile}}`);
-      document.getElementById('cc_api_key').value = '';
-      await refreshState();
+      const resolved = String(result.profile || result.resolved_profile || profile || '').trim();
+      setOp(resolved || '__upload__', '完成：已更新账号', 'ok');
+      appendLog(`claude profile updated: mode=${{mode}} requested=${{profile}} resolved=${{resolved}}`);
+      const keyInput = document.getElementById('flow_claude_api_key');
+      if (keyInput) keyInput.value = '';
+      await refreshState(false);
     }}
 
     async function healthCheck() {{
@@ -6545,29 +7572,13 @@ def history_auth_control_page(
       }}
     }}
 
-    function initUploadDrop() {{
-      const drop = document.getElementById('upload_drop');
-      const fileInput = document.getElementById('upload_files');
-      fileInput.addEventListener('change', (e) => addFiles(e.target.files));
-      drop.addEventListener('dragover', (e) => {{
-        e.preventDefault();
-        drop.classList.add('dragover');
-      }});
-      drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
-      drop.addEventListener('drop', (e) => {{
-        e.preventDefault();
-        drop.classList.remove('dragover');
-        addFiles(e.dataTransfer.files);
-      }});
-    }}
-
     setInterval(() => {{
       cleanupOps();
       if (latestState) renderBoard(latestState);
     }}, 30000);
 
     (async () => {{
-      initUploadDrop();
+      updateAuthFlowForm();
       try {{ await refreshState(); }} catch (e) {{ appendLog(String(e)); }}
     }})();
   </script>
