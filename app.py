@@ -7321,11 +7321,10 @@ def history_auth_control_page(
           if (colId !== 'pool') {{
             const provider = String(a.provider || 'codex').trim().toLowerCase();
             let needReauth = false;
-            const reauthStatuses = new Set(['needs_reauth', 'temp_disabled']);
             if (colId === 'local') {{
-              needReauth = reauthStatuses.has(String((a.local || {{}}).status || '').trim().toLowerCase());
+              needReauth = String((a.local || {{}}).status || '').trim().toLowerCase() === 'needs_reauth';
             }} else {{
-              needReauth = reauthStatuses.has(String((findNode(a, colId) || {{}}).status || '').trim().toLowerCase());
+              needReauth = String((findNode(a, colId) || {{}}).status || '').trim().toLowerCase() === 'needs_reauth';
             }}
             if (provider === 'codex' && needReauth) {{
               const reloginBtn = document.createElement('button');
