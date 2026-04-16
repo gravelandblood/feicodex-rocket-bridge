@@ -4861,7 +4861,16 @@ def _provider_for_profile(profile: str) -> str:
 
 def _list_switchable_auth_profiles() -> List[Dict[str, Any]]:
     now_ts = int(time.time())
-    return [item for item in _refresh_auth_profiles() if _auth_profile_available(item, now_ts=now_ts)]
+    items = [item for item in _refresh_auth_profiles() if _auth_profile_available(item, now_ts=now_ts)]
+    if not items:
+        return []
+    with_headroom = []
+    for item in items:
+        limits = item.get("last_rate_limits") if isinstance(item.get("last_rate_limits"), dict) else {}
+        if not _rate_limit_exhausted(limits):
+            with_headroom.append(item)
+    # Prefer accounts with remaining quota; fallback to general available list.
+    return with_headroom or items
 
 
 def _profile_recent_ready_ts(meta: Dict[str, Any]) -> int:
@@ -4874,18 +4883,10 @@ def _profile_recent_ready_ts(meta: Dict[str, Any]) -> int:
 
 
 def _pick_preferred_auth_profile(exclude_profile: str = "") -> Optional[Dict[str, Any]]:
-    now_ts = int(time.time())
     excluded = str(exclude_profile or "").strip()
-    candidates: List[Dict[str, Any]] = []
-    for item in _refresh_auth_profiles():
-        profile = str(item.get("profile") or "").strip()
-        if not profile:
-            continue
-        if excluded and profile == excluded:
-            continue
-        if not _auth_profile_available(item, now_ts=now_ts):
-            continue
-        candidates.append(item)
+    candidates = [item for item in _list_switchable_auth_profiles() if str(item.get("profile") or "").strip()]
+    if excluded:
+        candidates = [item for item in candidates if str(item.get("profile") or "").strip() != excluded]
     if not candidates:
         return None
     candidates.sort(

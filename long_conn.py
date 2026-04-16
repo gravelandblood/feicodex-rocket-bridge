@@ -2001,7 +2001,11 @@ class AppServerBotBridge:
         source_chat_id = str(chat_id or "").strip()
         if USER_SESSION_ISOLATION:
             base_chat_id = self._base_chat_id(source_chat_id)
-            if base_chat_id and base_chat_id != source_chat_id:
+            scoped_identity = self._chat_scope_identity(source_chat_id)
+            # For isolated users (chat id like "<base>@@open:<id>"), never inherit
+            # auth profile from legacy non-scoped runtime ids. Otherwise a stale
+            # legacy chat can overwrite the user's current account choice.
+            if base_chat_id and base_chat_id != source_chat_id and not scoped_identity:
                 if self._claim_legacy_chat_owner(base_chat_id=base_chat_id, runtime_chat_id=source_chat_id):
                     source_chat_id = base_chat_id
         source_runtime_key = self._runtime_key(source_chat_id, project) if project else source_chat_id
