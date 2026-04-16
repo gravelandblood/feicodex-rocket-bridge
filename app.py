@@ -4464,8 +4464,10 @@ def _auth_control_check_one(profile: str, mode: str = "status", prompt: str = ""
         }
     else:
         pending_src, _ = _pending_auth_paths(name)
-        backup_src, _ = _backup_auth_paths(name)
-        if (pending_src.exists() and pending_src.is_file()) or (backup_src.exists() and backup_src.is_file()):
+        # Do not probe backup copies in check-one:
+        # backup may be stale and can produce false "failed" results that
+        # override healthy remote-node status in UI summaries.
+        if pending_src.exists() and pending_src.is_file():
             non_local = _probe_from_non_local_store(name, mode=clean_mode, prompt=probe_prompt, timeout_sec=probe_timeout)
             probe = non_local.get("probe") if isinstance(non_local.get("probe"), dict) else {}
             summary = _probe_status_from_probe(probe if isinstance(probe, dict) else {})
