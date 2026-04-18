@@ -3661,6 +3661,7 @@ def _collect_auth_control_node_snapshots(nodes: List[Dict[str, Any]]) -> List[Di
                         "valid": bool(raw.get("valid")),
                         "status": str(raw.get("status") or "").strip(),
                         "reason": str(raw.get("reason") or "").strip(),
+                        "check_required": bool(raw.get("check_required")),
                         "last_health_check_at": int(raw.get("last_health_check_at") or 0),
                         "quota": _quota_view_from_profile_item(raw),
                     }
@@ -3811,6 +3812,7 @@ def _auth_control_registry_state() -> Dict[str, Any]:
                         "valid": bool(remote_item.get("valid")),
                         "status": str(remote_item.get("status") or "").strip(),
                         "reason": str(remote_item.get("reason") or "").strip(),
+                        "check_required": bool(remote_item.get("check_required")),
                         "last_health_check_at": int(remote_item.get("last_health_check_at") or 0),
                         "quota": dict(remote_item.get("quota") or {}),
                     }
@@ -4353,6 +4355,7 @@ def _auth_control_health_check(profile: str = "", node_id: str = "", mode: str =
                         "valid": bool(item.get("valid")),
                         "status": str(item.get("status") or "").strip(),
                         "reason": str(item.get("reason") or "").strip(),
+                        "check_required": bool(item.get("check_required")),
                         "last_health_check_at": int(item.get("last_health_check_at") or 0),
                         "quota": _quota_view_from_profile_item(item),
                     }
@@ -4517,6 +4520,7 @@ def _auth_control_check_one(profile: str, mode: str = "status", prompt: str = ""
             "ok": False,
             "status": "",
             "reason": "",
+            "check_required": False,
             "quota": _quota_view_from_rate_limits({}, updated_at=0),
             "email": "",
         }
@@ -4529,9 +4533,14 @@ def _auth_control_check_one(profile: str, mode: str = "status", prompt: str = ""
             row["present"] = True
             row["status"] = str(item.get("status") or "").strip()
             row["reason"] = str(item.get("reason") or "").strip()
+            row["check_required"] = bool(item.get("check_required"))
             row["email"] = str(item.get("email") or "").strip()
             row["quota"] = dict(item.get("quota") or {})
-            row["ok"] = bool(node.get("ok")) and str(item.get("status") or "").strip().lower() == "active"
+            row["ok"] = (
+                bool(node.get("ok"))
+                and (not bool(item.get("check_required")))
+                and str(item.get("status") or "").strip().lower() == "active"
+            )
             break
         remote_nodes.append(row)
 
@@ -4801,17 +4810,23 @@ def _apply_quick_probe_result(profile: str, probe: Dict[str, Any], previous: Dic
         patch["last_rate_limits_at"] = now_ts
 
     if bool(probe.get("ok")):
-        patch["check_required"] = False
+        has_quota = isinstance(probe_limits, dict) and bool(probe_limits)
+        patch["check_required"] = not has_quota
         if (not bool(prior.get("needs_reauth"))) and (not bool(prior.get("risk_deactivated"))):
             patch["valid"] = True
             patch["status"] = "active"
-            patch["reason"] = ""
+            patch["reason"] = "" if has_quota else "快检未刷新到额度，请稍后重试或改用慢检。"
             patch["disabled_until"] = 0
             patch["disabled_reason"] = ""
-            patch["last_health_error"] = ""
+            patch["last_health_error"] = "" if has_quota else "quick_quota probe returned no rate_limits payload"
     else:
         message = str(probe.get("error") or "").strip()
+        prior_status = str(prior.get("status") or "").strip().lower()
+        patch["check_required"] = True
+        if prior_status not in {"needs_reauth", "deactivated", "temp_disabled"}:
+            patch["status"] = "unknown"
         if message:
+            patch["reason"] = message[:1200]
             patch["last_health_error"] = message[:1200]
 
     _patch_auth_registry_profile(clean, patch)
