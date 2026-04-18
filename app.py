@@ -4836,11 +4836,50 @@ def _apply_quick_probe_result(profile: str, probe: Dict[str, Any], previous: Dic
     return payload
 
 
+def _quick_probe_should_escalate_to_real(probe: Dict[str, Any], previous: Dict[str, Any]) -> bool:
+    payload = probe if isinstance(probe, dict) else {}
+    prior = previous if isinstance(previous, dict) else {}
+    message = str(payload.get("error") or "").strip().lower()
+    has_limits = isinstance(payload.get("rate_limits"), dict) and bool(payload.get("rate_limits"))
+    probe_ok = bool(payload.get("ok"))
+
+    if probe_ok and (not has_limits):
+        return True
+
+    if (not probe_ok) and message:
+        if (
+            "token_expired" in message
+            or "unauthorized" in message
+            or "401" in message
+            or "invalid_grant" in message
+            or "refresh token has expired" in message
+            or "refresh token was already used" in message
+            or "access token could not be refreshed" in message
+            or "login required" in message
+            or "reauth" in message
+        ):
+            return True
+        if _classify_auth_error(message) in {"needs_reauth", "deactivated"}:
+            return True
+
+    prior_status = str(prior.get("status") or "").strip().lower()
+    if prior_status in {"needs_reauth", "deactivated"}:
+        return False
+    return False
+
+
 def _health_check_auth_profile_item(item: Dict[str, Any], mode: str, prompt: str = "", timeout_sec: int = 0) -> Dict[str, Any]:
     profile = str((item or {}).get("profile") or "").strip()
     if not _is_real_turn_health_mode(mode):
         probe = _quick_quota_probe_auth_profile(profile=profile)
-        return _apply_quick_probe_result(profile, probe, item if isinstance(item, dict) else {})
+        previous = item if isinstance(item, dict) else {}
+        if _quick_probe_should_escalate_to_real(probe, previous):
+            real_probe = _real_turn_probe_auth_profile(profile=profile, prompt=prompt, timeout_sec=timeout_sec)
+            result = _apply_health_probe_result(profile, real_probe)
+            result["quick_probe"] = probe
+            result["escalated_from_quick"] = True
+            return result
+        return _apply_quick_probe_result(profile, probe, previous)
     probe = _real_turn_probe_auth_profile(profile=profile, prompt=prompt, timeout_sec=timeout_sec)
     return _apply_health_probe_result(profile, probe)
 
