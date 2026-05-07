@@ -2150,16 +2150,9 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
         meta["last_health_error"] = ""
         meta["status"] = "unknown"
 
-    if bool(meta.get("needs_reauth")) and (not file_changed):
-        meta["status"] = "needs_reauth"
-        meta["valid"] = False
-        meta["reason"] = "auth.json 登录态已失效，请重新获取并替换该文件。"
-        return meta
-    if bool(meta.get("risk_deactivated")) and (not file_changed):
-        meta["status"] = "deactivated"
-        meta["valid"] = False
-        meta["reason"] = "账号疑似被风控/停用，已禁止继续使用。"
-        return meta
+    # Do not hard-stick to historical needs_reauth/deactivated flags here.
+    # We still run the current auth payload validation and `codex login status`
+    # so a successful re-login can recover immediately without requiring file hash change.
 
     try:
         data = json.loads(source.read_text(encoding="utf-8"))
@@ -2197,15 +2190,11 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
             meta["last_health_error"] = meta["reason"]
-        elif bool(meta.get("check_required")):
-            meta["valid"] = False
-            meta["status"] = "unchecked"
-            meta["reason"] = "未检测"
-            meta["last_health_error"] = ""
         else:
             meta["valid"] = True
             meta["reason"] = ""
             meta["status"] = "active"
+            meta["check_required"] = False
             meta["disabled_until"] = 0
             meta["disabled_reason"] = ""
             meta["needs_reauth"] = False
@@ -2252,15 +2241,11 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
             meta["last_health_error"] = meta["reason"]
-        elif bool(meta.get("check_required")):
-            meta["valid"] = False
-            meta["status"] = "unchecked"
-            meta["reason"] = "未检测"
-            meta["last_health_error"] = ""
         else:
             meta["valid"] = True
             meta["reason"] = ""
             meta["status"] = "active"
+            meta["check_required"] = False
             meta["disabled_until"] = 0
             meta["disabled_reason"] = ""
             meta["needs_reauth"] = False
