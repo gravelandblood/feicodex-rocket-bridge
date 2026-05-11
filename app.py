@@ -2048,6 +2048,47 @@ def _codex_home_for_profile(profile: str) -> Path:
     return _profile_home_dir(clean) if clean else DEFAULT_CODEX_HOME
 
 
+def _build_codex_custom_provider_toml(base_url: str, model: str = "") -> str:
+    clean_base = str(base_url or "").strip().rstrip("/")
+    clean_model = str(model or "").strip() or str(DEFAULT_MODEL or "gpt-5.3-codex")
+    return (
+        'model_provider = "custom"\n'
+        f'model = "{clean_model}"\n'
+        'model_reasoning_effort = "high"\n'
+        "disable_response_storage = true\n\n"
+        '[model_providers.custom]\n'
+        'name = "custom"\n'
+        'wire_api = "responses"\n'
+        "requires_openai_auth = true\n"
+        f'base_url = "{clean_base}"\n'
+    )
+
+
+def _sync_profile_home_files(
+    profile: str,
+    source_auth_path: Path,
+    source_cfg_path: Optional[Path] = None,
+    fallback_cfg_text: str = "",
+) -> None:
+    name = str(profile or "").strip()
+    if not name:
+        return
+    home_dir = _profile_home_dir(name)
+    home_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_auth_path, home_dir / "auth.json")
+    cfg_src = source_cfg_path if isinstance(source_cfg_path, Path) else None
+    if cfg_src and cfg_src.exists() and cfg_src.is_file():
+        shutil.copy2(cfg_src, home_dir / "config.toml")
+    else:
+        fallback = str(fallback_cfg_text or "").strip()
+        if fallback:
+            (home_dir / "config.toml").write_text(
+                fallback + ("\n" if not fallback.endswith("\n") else ""),
+                encoding="utf-8",
+            )
+    _ensure_bridge_mcp_server_installed(home_dir)
+
+
 def _runtime_home_name(runtime_id: str) -> str:
     raw = str(runtime_id or "").strip() or "runtime"
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._") or "runtime"
@@ -2442,6 +2483,13 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
     disabled_until = int(meta.get("disabled_until") or 0)
     codex_api_env = _extract_codex_profile_env(data if isinstance(data, dict) else {})
     if provider == "codex" and codex_api_env.get("OPENAI_API_KEY"):
+        custom_cfg = ""
+        if str(codex_api_env.get("OPENAI_BASE_URL") or "").strip():
+            custom_cfg = _build_codex_custom_provider_toml(
+                base_url=str(codex_api_env.get("OPENAI_BASE_URL") or "").strip(),
+                model=str(codex_api_env.get("BRIDGE_CODEX_DEFAULT_MODEL") or "").strip(),
+            )
+        _sync_profile_home_files(profile=profile, source_auth_path=source, source_cfg_path=cfg, fallback_cfg_text=custom_cfg)
         meta["last_health_check_at"] = now_ts
         if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
             meta["valid"] = False
@@ -3675,16 +3723,35 @@ def _install_auth_profile(
     )
     AUTH_PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     auth_text = _normalize_auth_json_text(auth_json)
+    parsed_auth: Dict[str, Any] = {}
+    try:
+        loaded = json.loads(auth_text)
+        if isinstance(loaded, dict):
+            parsed_auth = dict(loaded)
+    except Exception:
+        parsed_auth = {}
     src = AUTH_PROFILES_DIR / f"{name}.auth.json"
     tmp = AUTH_PROFILES_DIR / f".{name}.auth.json.tmp"
     tmp.write_text(auth_text, encoding="utf-8")
     tmp.replace(src)
     cfg_text = str(config_toml or "").strip()
+    codex_api_env = _extract_codex_profile_env(parsed_auth)
+    if (
+        _normalize_agent_provider(provider) == "codex"
+        and (not cfg_text)
+        and codex_api_env.get("OPENAI_API_KEY")
+        and str(codex_api_env.get("OPENAI_BASE_URL") or "").strip()
+    ):
+        cfg_text = _build_codex_custom_provider_toml(
+            base_url=str(codex_api_env.get("OPENAI_BASE_URL") or "").strip(),
+            model=str(codex_api_env.get("BRIDGE_CODEX_DEFAULT_MODEL") or "").strip(),
+        )
     cfg = AUTH_PROFILES_DIR / f"{name}.config.toml"
     if cfg_text:
         cfg.write_text(cfg_text + ("\n" if not cfg_text.endswith("\n") else ""), encoding="utf-8")
     elif cfg.exists():
         cfg.unlink()
+    _sync_profile_home_files(profile=name, source_auth_path=src, source_cfg_path=cfg if cfg.exists() and cfg.is_file() else None, fallback_cfg_text=cfg_text)
 
     meta = _get_auth_profile(name)
     if not meta:
@@ -5242,10 +5309,6 @@ def _provider_for_profile(profile: str) -> str:
     local = _get_auth_profile(clean)
     if isinstance(local, dict):
         provider = _normalize_agent_provider(str(local.get("provider") or ""))
-        if provider == "codex":
-            payload = _load_profile_auth_json(clean)
-            if _is_codex_api_payload(payload) and (not _is_codex_auth_payload(payload)):
-                return "codex_api"
         if provider:
             return provider
     try:
@@ -5253,10 +5316,6 @@ def _provider_for_profile(profile: str) -> str:
         auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
         item = auths.get(clean) if isinstance(auths.get(clean), dict) else {}
         provider = _normalize_agent_provider(str(item.get("provider") or ""))
-        if provider == "codex":
-            payload = _load_profile_auth_json(clean)
-            if _is_codex_api_payload(payload) and (not _is_codex_auth_payload(payload)):
-                return "codex_api"
         if provider:
             return provider
     except Exception:
@@ -5496,13 +5555,10 @@ def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     runtime.client.env.pop("ANTHROPIC_API_KEY", None)
     runtime.client.env.pop("ANTHROPIC_BASE_URL", None)
     runtime.client.env.pop("BRIDGE_CLAUDE_DEFAULT_MODEL", None)
-    if provider in {"codex", "codex_api"}:
+    if provider == "codex":
         codex_env = _codex_runtime_env_for_profile(runtime.auth_profile)
-        auth_payload = _load_profile_auth_json(runtime.auth_profile)
-        api_only_mode = _is_codex_api_payload(auth_payload) and (not _is_codex_auth_payload(auth_payload))
-        if provider == "codex" and (not api_only_mode):
-            target_home = _sync_runtime_home(runtime)
-            runtime.client.env["CODEX_HOME"] = str(target_home)
+        target_home = _sync_runtime_home(runtime)
+        runtime.client.env["CODEX_HOME"] = str(target_home)
         for key, value in codex_env.items():
             clean = str(value or "").strip()
             if clean:
