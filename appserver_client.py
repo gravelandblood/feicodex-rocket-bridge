@@ -83,7 +83,7 @@ class CodexAppServerClient:
         self._turn_events_by_thread: Dict[str, List[Dict[str, Any]]] = {}
         self._last_status_type_by_thread: Dict[str, str] = {}
 
-    def start(self, experimental_api: bool = False) -> Dict[str, Any]:
+    def start(self, experimental_api: bool = True) -> Dict[str, Any]:
         if self.proc and self.proc.poll() is None and self._ready:
             return {"userAgent": "already-running"}
 
