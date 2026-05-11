@@ -414,7 +414,11 @@ class CodexAgentAdapter:
         return self._client.env
 
     def start(self, experimental_api: bool = True) -> Dict[str, Any]:
-        return self._client.start(experimental_api=experimental_api)
+        use_experimental = bool(experimental_api)
+        base_url = str(self._client.env.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip().lower()
+        if base_url and ("api.openai.com" not in base_url):
+            use_experimental = False
+        return self._client.start(experimental_api=use_experimental)
 
     def stop(self) -> None:
         self._client.stop()
@@ -492,6 +496,261 @@ class CodexAgentAdapter:
 
     def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
         return self._client.turn_interrupt(thread_id=thread_id, turn_id=turn_id)
+
+
+class OpenAIApiAgentAdapter:
+    def __init__(self) -> None:
+        self.env: Dict[str, str] = {}
+        self._running = False
+        self._lock = threading.Lock()
+        self._threads: Dict[str, Dict[str, Any]] = {}
+        self._thread_status: Dict[str, Dict[str, Any]] = {}
+        self._active_turn_by_thread: Dict[str, str] = {}
+        self._turn_results: Dict[str, TurnRunResult] = {}
+        self._token_usage_by_thread: Dict[str, Dict[str, Any]] = {}
+        self._turn_events_by_thread: Dict[str, List[Dict[str, Any]]] = {}
+        self._turn_preview_by_thread: Dict[str, str] = {}
+        self._account_rate_limits: Dict[str, Any] = {}
+
+    def _api_key(self) -> str:
+        key = str(self.env.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
+        if not key:
+            raise AppServerError("openai api adapter requires OPENAI_API_KEY")
+        return key
+
+    def _base_url(self) -> str:
+        return str(self.env.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
+
+    def _default_model(self) -> str:
+        model = str(self.env.get("BRIDGE_CODEX_DEFAULT_MODEL") or os.environ.get("BRIDGE_CODEX_DEFAULT_MODEL") or "").strip()
+        if model:
+            return model
+        return str(DEFAULT_MODEL or "gpt-5.3-codex")
+
+    def start(self, experimental_api: bool = True) -> Dict[str, Any]:
+        self._api_key()
+        self._running = True
+        return {"userAgent": "openai-api-adapter"}
+
+    def stop(self) -> None:
+        self._running = False
+
+    def is_running(self) -> bool:
+        return bool(self._running)
+
+    def thread_start(
+        self,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
+        if not self.is_running():
+            self.start()
+        thread_id = str(uuid.uuid4())
+        with self._lock:
+            self._threads[thread_id] = {
+                "messages": [],
+                "model": str(model or self._default_model()).strip() or self._default_model(),
+                "cwd": str(cwd or DEFAULT_CWD),
+            }
+            self._thread_status[thread_id] = {"type": "idle"}
+            self._turn_events_by_thread[thread_id] = []
+            self._turn_preview_by_thread[thread_id] = ""
+            self._token_usage_by_thread[thread_id] = {}
+            self._active_turn_by_thread[thread_id] = ""
+        return {"thread": {"id": thread_id}}
+
+    def thread_resume(
+        self,
+        thread_id: str,
+        cwd: str = "",
+        model: str = "",
+        sandbox: str = "",
+        approval_policy: str = "",
+        personality: str = "",
+    ) -> Dict[str, Any]:
+        if not self.is_running():
+            self.start()
+        clean = str(thread_id or "").strip()
+        if not clean:
+            return self.thread_start(cwd=cwd, model=model, sandbox=sandbox, approval_policy=approval_policy, personality=personality)
+        with self._lock:
+            if clean not in self._threads:
+                self._threads[clean] = {
+                    "messages": [],
+                    "model": str(model or self._default_model()).strip() or self._default_model(),
+                    "cwd": str(cwd or DEFAULT_CWD),
+                }
+            else:
+                if model:
+                    self._threads[clean]["model"] = str(model).strip()
+                if cwd:
+                    self._threads[clean]["cwd"] = str(cwd).strip()
+            self._thread_status[clean] = {"type": "idle"}
+            self._turn_events_by_thread.setdefault(clean, [])
+            self._turn_preview_by_thread.setdefault(clean, "")
+            self._token_usage_by_thread.setdefault(clean, {})
+            self._active_turn_by_thread.setdefault(clean, "")
+        return {"thread": {"id": clean}}
+
+    def _append_event(self, thread_id: str, text: str) -> None:
+        with self._lock:
+            events = self._turn_events_by_thread.setdefault(thread_id, [])
+            events.append({"at": int(time.time()), "text": str(text or "")[:800]})
+            if len(events) > 200:
+                del events[:-200]
+
+    def _call_responses_api(self, model: str, user_text: str) -> Dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {self._api_key()}",
+            "Content-Type": "application/json",
+        }
+        payload = {"model": str(model or self._default_model()), "input": str(user_text or "")}
+        url = f"{self._base_url()}/responses"
+        with requests.Session() as session:
+            # Keep proxy env behavior consistent with local curl checks.
+            session.trust_env = True
+            resp = session.post(url, headers=headers, json=payload, timeout=180)
+        if resp.status_code >= 400:
+            detail = str(resp.text or "").strip()[:1500]
+            raise AppServerError(f"unexpected status {resp.status_code} {resp.reason}: {detail}, url: {url}")
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise AppServerError(f"responses api invalid json: {exc}") from exc
+        rate_limits = _extract_rate_limits_payload(dict(resp.headers))
+        with self._lock:
+            self._account_rate_limits = dict(rate_limits or {})
+        return data if isinstance(data, dict) else {}
+
+    def _extract_text(self, payload: Dict[str, Any]) -> str:
+        out = payload.get("output") if isinstance(payload.get("output"), list) else []
+        texts: List[str] = []
+        for item in out:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content") if isinstance(item.get("content"), list) else []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if str(part.get("type") or "") == "output_text":
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        texts.append(text)
+        return "\n".join(texts).strip()
+
+    def _run_turn(self, thread_id: str, turn_id: str, user_text: str) -> None:
+        with self._lock:
+            thread = dict(self._threads.get(thread_id) or {})
+            model = str(thread.get("model") or self._default_model()).strip() or self._default_model()
+        try:
+            data = self._call_responses_api(model=model, user_text=user_text)
+            text = self._extract_text(data)
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            with self._lock:
+                self._turn_results[turn_id] = TurnRunResult(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    turn_status="completed",
+                    text=text,
+                    error=None,
+                )
+                self._thread_status[thread_id] = {"type": "idle"}
+                self._active_turn_by_thread[thread_id] = ""
+                if usage:
+                    self._token_usage_by_thread[thread_id] = dict(usage)
+            self._append_event(thread_id, f"assistant: {text[:200]}")
+        except Exception as exc:
+            err = {"message": str(exc), "codexErrorInfo": "other", "additionalDetails": None}
+            with self._lock:
+                self._turn_results[turn_id] = TurnRunResult(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    turn_status="failed",
+                    text="",
+                    error=err,
+                )
+                self._thread_status[thread_id] = {"type": "idle"}
+                self._active_turn_by_thread[thread_id] = ""
+            self._append_event(thread_id, f"error: {str(exc)[:200]}")
+
+    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not self.is_running():
+            self.start()
+        clean_thread_id = str(thread_id or "").strip()
+        if not clean_thread_id:
+            raise AppServerError("thread_id is required")
+        turn_id = str(uuid.uuid4())
+        user_text = str(text or "").strip()
+        with self._lock:
+            if clean_thread_id not in self._threads:
+                self._threads[clean_thread_id] = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD}
+            self._thread_status[clean_thread_id] = {"type": "running"}
+            self._active_turn_by_thread[clean_thread_id] = turn_id
+            self._turn_preview_by_thread[clean_thread_id] = user_text[:200]
+        self._append_event(clean_thread_id, f"user: {user_text[:200]}")
+        worker = threading.Thread(target=self._run_turn, args=(clean_thread_id, turn_id, user_text), daemon=True)
+        worker.start()
+        return {"turn": {"id": turn_id}}
+
+    def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> TurnRunResult:
+        deadline = time.time() + max(1, int(timeout_sec or 600))
+        while time.time() < deadline:
+            with self._lock:
+                result = self._turn_results.get(str(turn_id))
+            if isinstance(result, TurnRunResult):
+                return result
+            time.sleep(0.2)
+        raise AppServerTimeout(f"openai api adapter turn timeout: {turn_id}")
+
+    def get_thread_status(self, thread_id: str) -> Dict[str, Any]:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            return dict(self._thread_status.get(clean) or {"type": "idle"})
+
+    def get_active_turn_id(self, thread_id: str) -> str:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            return str(self._active_turn_by_thread.get(clean) or "")
+
+    def get_thread_token_usage(self, thread_id: str) -> Dict[str, Any]:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            return dict(self._token_usage_by_thread.get(clean) or {})
+
+    def get_turn_progress(self, thread_id: str) -> Dict[str, Any]:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            status = str((self._thread_status.get(clean) or {}).get("type") or "idle")
+            preview = str(self._turn_preview_by_thread.get(clean) or "")
+        return {"status": status, "preview": preview}
+
+    def get_account_rate_limits(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._account_rate_limits or {})
+
+    def account_rate_limits_read(self) -> Dict[str, Any]:
+        return self.get_account_rate_limits()
+
+    def get_turn_events(self, thread_id: str, turn_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            events = list(self._turn_events_by_thread.get(clean) or [])
+        keep = max(1, int(limit or 20))
+        return events[-keep:]
+
+    def turn_steer(self, thread_id: str, expected_turn_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        return self.turn_start(thread_id=thread_id, text=text, image_paths=image_paths)
+
+    def turn_interrupt(self, thread_id: str, turn_id: str) -> Dict[str, Any]:
+        clean = str(thread_id or "").strip()
+        with self._lock:
+            if str(self._active_turn_by_thread.get(clean) or "") == str(turn_id or ""):
+                self._active_turn_by_thread[clean] = ""
+                self._thread_status[clean] = {"type": "idle"}
+        return {"ok": True}
 
 
 class ClaudeAgentAdapter:
@@ -901,6 +1160,8 @@ def _normalize_agent_provider(value: str) -> str:
     raw = raw.replace(" ", "_")
     aliases = {
         "codex": "codex",
+        "codex_api": "codex_api",
+        "openai_api": "codex_api",
         "openai": "codex",
         "claude": "claude",
         "claude_code": "claude_code",
@@ -915,6 +1176,8 @@ def _build_agent_adapter(provider: str) -> AgentAdapter:
     clean = _normalize_agent_provider(provider)
     if clean == "codex":
         return CodexAgentAdapter()
+    if clean == "codex_api":
+        return OpenAIApiAgentAdapter()
     if clean in {"claude", "claude_code", "openclaw"}:
         return ClaudeAgentAdapter(provider=clean)
     raise ValueError(f"unsupported agent provider: {clean}")
@@ -4979,6 +5242,10 @@ def _provider_for_profile(profile: str) -> str:
     local = _get_auth_profile(clean)
     if isinstance(local, dict):
         provider = _normalize_agent_provider(str(local.get("provider") or ""))
+        if provider == "codex":
+            payload = _load_profile_auth_json(clean)
+            if _is_codex_api_payload(payload) and (not _is_codex_auth_payload(payload)):
+                return "codex_api"
         if provider:
             return provider
     try:
@@ -4986,6 +5253,10 @@ def _provider_for_profile(profile: str) -> str:
         auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
         item = auths.get(clean) if isinstance(auths.get(clean), dict) else {}
         provider = _normalize_agent_provider(str(item.get("provider") or ""))
+        if provider == "codex":
+            payload = _load_profile_auth_json(clean)
+            if _is_codex_api_payload(payload) and (not _is_codex_auth_payload(payload)):
+                return "codex_api"
         if provider:
             return provider
     except Exception:
@@ -5163,7 +5434,7 @@ def _codex_runtime_env_for_profile(profile: str) -> Dict[str, str]:
 
 def _profile_default_model(profile: str, provider: str) -> str:
     clean_provider = _normalize_agent_provider(provider)
-    if clean_provider == "codex":
+    if clean_provider in {"codex", "codex_api"}:
         return str(_codex_runtime_env_for_profile(profile).get("BRIDGE_CODEX_DEFAULT_MODEL") or "").strip()
     if clean_provider in {"claude", "claude_code", "openclaw"}:
         return str(_claude_runtime_env_for_profile(profile).get("BRIDGE_CLAUDE_DEFAULT_MODEL") or "").strip()
@@ -5198,7 +5469,7 @@ def _looks_like_claude_model(model: str) -> bool:
 
 def _sync_runtime_model_from_profile(runtime: ChatRuntime, force: bool = False) -> None:
     provider = _normalize_agent_provider(runtime.agent_provider)
-    if provider == "codex":
+    if provider in {"codex", "codex_api"}:
         profile_model = _profile_default_model(runtime.auth_profile, provider)
         if not profile_model:
             profile_model = str(DEFAULT_MODEL or "").strip() or "gpt-5.3-codex"
@@ -5225,10 +5496,13 @@ def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     runtime.client.env.pop("ANTHROPIC_API_KEY", None)
     runtime.client.env.pop("ANTHROPIC_BASE_URL", None)
     runtime.client.env.pop("BRIDGE_CLAUDE_DEFAULT_MODEL", None)
-    if provider == "codex":
-        target_home = _sync_runtime_home(runtime)
-        runtime.client.env["CODEX_HOME"] = str(target_home)
+    if provider in {"codex", "codex_api"}:
         codex_env = _codex_runtime_env_for_profile(runtime.auth_profile)
+        auth_payload = _load_profile_auth_json(runtime.auth_profile)
+        api_only_mode = _is_codex_api_payload(auth_payload) and (not _is_codex_auth_payload(auth_payload))
+        if provider == "codex" and (not api_only_mode):
+            target_home = _sync_runtime_home(runtime)
+            runtime.client.env["CODEX_HOME"] = str(target_home)
         for key, value in codex_env.items():
             clean = str(value or "").strip()
             if clean:
