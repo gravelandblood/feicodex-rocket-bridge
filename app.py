@@ -2177,6 +2177,25 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
         meta["source_config_toml"] = str(cfg)
 
     disabled_until = int(meta.get("disabled_until") or 0)
+    codex_api_env = _extract_codex_profile_env(data if isinstance(data, dict) else {})
+    if provider == "codex" and codex_api_env.get("OPENAI_API_KEY"):
+        meta["last_health_check_at"] = now_ts
+        if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
+            meta["valid"] = False
+            meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
+            meta["last_health_error"] = meta["reason"]
+        else:
+            meta["valid"] = True
+            meta["reason"] = ""
+            meta["status"] = "active"
+            meta["check_required"] = False
+            meta["disabled_until"] = 0
+            meta["disabled_reason"] = ""
+            meta["needs_reauth"] = False
+            meta["risk_deactivated"] = False
+            meta["last_health_error"] = ""
+        return meta
+
     if provider != "codex":
         claude_env = _extract_claude_profile_env(data if isinstance(data, dict) else {})
         if not claude_env.get("ANTHROPIC_API_KEY"):
@@ -2204,7 +2223,7 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
 
     if not _is_codex_auth_payload(data if isinstance(data, dict) else {}):
         meta["status"] = "invalid"
-        meta["reason"] = "missing auth_mode/tokens"
+        meta["reason"] = "missing auth_mode/tokens or OPENAI_API_KEY/api_key"
         meta["last_health_check_at"] = now_ts
         meta["last_health_error"] = meta["reason"]
         return meta
@@ -2342,6 +2361,37 @@ def _extract_claude_profile_env(payload: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
+def _extract_codex_profile_env(payload: Dict[str, Any]) -> Dict[str, str]:
+    data = payload if isinstance(payload, dict) else {}
+    env_node = data.get("env") if isinstance(data.get("env"), dict) else {}
+    openai_node = data.get("openai") if isinstance(data.get("openai"), dict) else {}
+
+    def _pick(*keys: str) -> str:
+        for key in keys:
+            val = ""
+            if isinstance(data.get(key), str):
+                val = str(data.get(key) or "").strip()
+            if (not val) and isinstance(env_node.get(key), str):
+                val = str(env_node.get(key) or "").strip()
+            if (not val) and isinstance(openai_node.get(key), str):
+                val = str(openai_node.get(key) or "").strip()
+            if val:
+                return val
+        return ""
+
+    api_key = _pick("OPENAI_API_KEY", "openai_api_key", "api_key", "key")
+    base_url = _pick("OPENAI_BASE_URL", "openai_base_url", "base_url")
+    model = _pick("OPENAI_MODEL", "openai_model", "model")
+    out: Dict[str, str] = {}
+    if api_key:
+        out["OPENAI_API_KEY"] = api_key
+    if base_url:
+        out["OPENAI_BASE_URL"] = base_url.rstrip("/")
+    if model:
+        out["BRIDGE_CODEX_DEFAULT_MODEL"] = model
+    return out
+
+
 def _is_codex_auth_payload(payload: Dict[str, Any]) -> bool:
     data = payload if isinstance(payload, dict) else {}
     auth_mode = str(data.get("auth_mode") or "").strip()
@@ -2349,9 +2399,14 @@ def _is_codex_auth_payload(payload: Dict[str, Any]) -> bool:
     return bool(auth_mode and isinstance(tokens, dict))
 
 
+def _is_codex_api_payload(payload: Dict[str, Any]) -> bool:
+    env = _extract_codex_profile_env(payload if isinstance(payload, dict) else {})
+    return bool(str(env.get("OPENAI_API_KEY") or "").strip())
+
+
 def _infer_provider_from_auth_payload(payload: Dict[str, Any], fallback: str = "codex") -> str:
     fallback_provider = _normalize_agent_provider(fallback)
-    if _is_codex_auth_payload(payload):
+    if _is_codex_auth_payload(payload) or _is_codex_api_payload(payload):
         return "codex"
     claude_env = _extract_claude_profile_env(payload)
     if claude_env.get("ANTHROPIC_API_KEY"):
@@ -2485,12 +2540,12 @@ def _pending_profile_item_from_file(path: Path) -> Dict[str, Any]:
     provider = _infer_provider_from_auth_payload(parsed, fallback="codex")
     item["provider"] = provider
     if provider == "codex":
-        if _is_codex_auth_payload(parsed):
+        if _is_codex_auth_payload(parsed) or _is_codex_api_payload(parsed):
             item["valid"] = True
             item["status"] = "pending"
         else:
             item["status"] = "invalid"
-            item["reason"] = "missing auth_mode/tokens"
+            item["reason"] = "missing auth_mode/tokens or OPENAI_API_KEY/api_key"
     else:
         if _extract_claude_profile_env(parsed).get("ANTHROPIC_API_KEY"):
             item["valid"] = True
@@ -5061,8 +5116,15 @@ def _claude_runtime_env_for_profile(profile: str) -> Dict[str, str]:
     return _extract_claude_profile_env(payload if isinstance(payload, dict) else {})
 
 
+def _codex_runtime_env_for_profile(profile: str) -> Dict[str, str]:
+    payload = _load_profile_auth_json(profile)
+    return _extract_codex_profile_env(payload if isinstance(payload, dict) else {})
+
+
 def _profile_default_model(profile: str, provider: str) -> str:
     clean_provider = _normalize_agent_provider(provider)
+    if clean_provider == "codex":
+        return str(_codex_runtime_env_for_profile(profile).get("BRIDGE_CODEX_DEFAULT_MODEL") or "").strip()
     if clean_provider in {"claude", "claude_code", "openclaw"}:
         return str(_claude_runtime_env_for_profile(profile).get("BRIDGE_CLAUDE_DEFAULT_MODEL") or "").strip()
     return ""
@@ -5097,8 +5159,11 @@ def _looks_like_claude_model(model: str) -> bool:
 def _sync_runtime_model_from_profile(runtime: ChatRuntime, force: bool = False) -> None:
     provider = _normalize_agent_provider(runtime.agent_provider)
     if provider == "codex":
+        profile_model = _profile_default_model(runtime.auth_profile, provider)
+        if not profile_model:
+            profile_model = str(DEFAULT_MODEL or "").strip() or "gpt-5.3-codex"
         if force or _looks_like_claude_model(runtime.model):
-            runtime.model = str(DEFAULT_MODEL or "").strip() or "gpt-5.3-codex"
+            runtime.model = profile_model
         return
     if provider not in {"claude", "claude_code", "openclaw"}:
         return
@@ -5114,12 +5179,20 @@ def _sync_runtime_model_from_profile(runtime: ChatRuntime, force: bool = False) 
 def _apply_runtime_auth_profile(runtime: ChatRuntime) -> None:
     provider = _normalize_agent_provider(runtime.agent_provider)
     runtime.client.env.pop("CODEX_HOME", None)
+    runtime.client.env.pop("OPENAI_API_KEY", None)
+    runtime.client.env.pop("OPENAI_BASE_URL", None)
+    runtime.client.env.pop("BRIDGE_CODEX_DEFAULT_MODEL", None)
     runtime.client.env.pop("ANTHROPIC_API_KEY", None)
     runtime.client.env.pop("ANTHROPIC_BASE_URL", None)
     runtime.client.env.pop("BRIDGE_CLAUDE_DEFAULT_MODEL", None)
     if provider == "codex":
         target_home = _sync_runtime_home(runtime)
         runtime.client.env["CODEX_HOME"] = str(target_home)
+        codex_env = _codex_runtime_env_for_profile(runtime.auth_profile)
+        for key, value in codex_env.items():
+            clean = str(value or "").strip()
+            if clean:
+                runtime.client.env[key] = clean
     elif provider in {"claude", "claude_code", "openclaw"}:
         claude_env = _claude_runtime_env_for_profile(runtime.auth_profile)
         for key, value in claude_env.items():
@@ -6701,6 +6774,7 @@ def history_auth_control_page(
           <select id="flow_method" onchange="updateAuthFlowForm()">
             <option value="device">设备码授权登录</option>
             <option value="upload">上传 auth.json</option>
+            <option value="codex_api">Codex API（base_url + key）</option>
             <option value="claude">Claude Code 配置</option>
           </select>
         </div>
@@ -6738,6 +6812,16 @@ def history_auth_control_page(
           </select>
           <label for="flow_upload_notes">备注（可选）</label>
           <input id="flow_upload_notes" placeholder="可选" />
+        </div>
+        <div class="flow-field" id="flow_codex_api_wrap" style="display:none;">
+          <label for="flow_codex_api_key">OPENAI_API_KEY</label>
+          <input id="flow_codex_api_key" type="password" placeholder="必填" />
+          <label for="flow_codex_base_url">OPENAI_BASE_URL（可选）</label>
+          <input id="flow_codex_base_url" placeholder="可选，例如 https://api.openai.com/v1" />
+          <label for="flow_codex_model">默认模型（可选）</label>
+          <input id="flow_codex_model" placeholder="可选，例如 gpt-5.3-codex" />
+          <label for="flow_codex_notes">备注（可选）</label>
+          <input id="flow_codex_notes" placeholder="可选" />
         </div>
       </div>
       <div class="row" style="margin-top:10px;">
@@ -7472,6 +7556,7 @@ def history_auth_control_page(
       const envAuto = document.getElementById('flow_env_auto');
       const claudeWrap = document.getElementById('flow_claude_wrap');
       const uploadWrap = document.getElementById('flow_upload_wrap');
+      const codexApiWrap = document.getElementById('flow_codex_api_wrap');
       const selectedExisting = String(document.getElementById('flow_target_profile')?.value || '').trim();
       const autoNode = resolveExistingProfileNode(selectedExisting);
       if (existingWrap) existingWrap.style.display = mode === 'existing' ? '' : 'none';
@@ -7489,6 +7574,7 @@ def history_auth_control_page(
       if (envSel) envSel.disabled = method === 'device' && mode === 'existing';
       if (claudeWrap) claudeWrap.style.display = method === 'claude' ? '' : 'none';
       if (uploadWrap) uploadWrap.style.display = method === 'upload' ? '' : 'none';
+      if (codexApiWrap) codexApiWrap.style.display = method === 'codex_api' ? '' : 'none';
     }}
 
     function renderFlowTargets(data) {{
@@ -7554,6 +7640,32 @@ def history_auth_control_page(
         setOp(resolved || '__upload__', '完成：已更新账号', 'ok');
         appendLog(`auth uploaded: mode=${{mode}} provider=${{provider}} requested=${{profile || '(auto)'}} resolved=${{resolved}}`);
         if (input) input.value = '';
+        await refreshState(false);
+        return;
+      }}
+      if (method === 'codex_api') {{
+        if (!profile) throw new Error('Codex API 配置需要填写 profile');
+        const apiKey = String(document.getElementById('flow_codex_api_key')?.value || '').trim();
+        const baseUrl = String(document.getElementById('flow_codex_base_url')?.value || '').trim();
+        const model = String(document.getElementById('flow_codex_model')?.value || '').trim();
+        const notes = String(document.getElementById('flow_codex_notes')?.value || '').trim();
+        if (!apiKey) throw new Error('OPENAI_API_KEY 不能为空');
+        const authJson = {{ api_key: apiKey }};
+        if (baseUrl) authJson.base_url = baseUrl;
+        if (model) authJson.model = model;
+        const result = await api('/history/api/auth/control/upload', 'POST', {{
+          profile,
+          provider: 'codex',
+          auth_json: authJson,
+          config_toml: '',
+          label: profile,
+          notes,
+        }});
+        const resolved = String(result.profile || result.resolved_profile || profile || '').trim();
+        setOp(resolved || '__upload__', '完成：已更新账号', 'ok');
+        appendLog(`codex api profile updated: mode=${{mode}} requested=${{profile}} resolved=${{resolved}}`);
+        const keyInput = document.getElementById('flow_codex_api_key');
+        if (keyInput) keyInput.value = '';
         await refreshState(false);
         return;
       }}
