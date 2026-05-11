@@ -2209,6 +2209,7 @@ class AppServerBotBridge:
             "stream disconnected before completion",
             "app-server is not running",
             "failed writing to app-server stdin",
+            "Token data is not available",
         )
         return any(p in text for p in patterns)
 

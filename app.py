@@ -1790,17 +1790,37 @@ def _codex_home_for_profile(profile: str) -> Path:
 def _build_codex_custom_provider_toml(base_url: str, model: str = "") -> str:
     clean_base = str(base_url or "").strip().rstrip("/")
     clean_model = str(model or "").strip() or str(DEFAULT_MODEL or "gpt-5.3-codex")
+    model_json = json.dumps(clean_model, ensure_ascii=False)
+    base_json = json.dumps(clean_base, ensure_ascii=False)
     return (
         'model_provider = "custom"\n'
-        f'model = "{clean_model}"\n'
+        f"model = {model_json}\n"
         'model_reasoning_effort = "high"\n'
         "disable_response_storage = true\n\n"
         '[model_providers.custom]\n'
         'name = "custom"\n'
         'wire_api = "responses"\n'
         "requires_openai_auth = true\n"
-        f'base_url = "{clean_base}"\n'
+        f"base_url = {base_json}\n"
     )
+
+
+def _codex_home_auth_json_text(source_auth_path: Path) -> Optional[str]:
+    try:
+        data = json.loads(source_auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    env = _extract_codex_profile_env(data)
+    api_key = str(env.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return None
+    canonical = dict(data)
+    canonical["OPENAI_API_KEY"] = api_key
+    canonical.pop("api_key", None)
+    canonical.pop("key", None)
+    return json.dumps(canonical, ensure_ascii=False, indent=2)
 
 
 def _sync_profile_home_files(
@@ -1814,7 +1834,11 @@ def _sync_profile_home_files(
         return
     home_dir = _profile_home_dir(name)
     home_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_auth_path, home_dir / "auth.json")
+    auth_text = _codex_home_auth_json_text(source_auth_path)
+    if auth_text:
+        (home_dir / "auth.json").write_text(auth_text + "\n", encoding="utf-8")
+    else:
+        shutil.copy2(source_auth_path, home_dir / "auth.json")
     cfg_src = source_cfg_path if isinstance(source_cfg_path, Path) else None
     if cfg_src and cfg_src.exists() and cfg_src.is_file():
         shutil.copy2(cfg_src, home_dir / "config.toml")
