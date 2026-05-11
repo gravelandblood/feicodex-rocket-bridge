@@ -4494,15 +4494,35 @@ def _auth_control_check_one(profile: str, mode: str = "status", prompt: str = ""
     if isinstance(local_item, dict):
         checked = _health_check_auth_profile_item(item=local_item, mode=clean_mode, prompt=probe_prompt, timeout_sec=probe_timeout)
         local_status = str(checked.get("status") or "").strip().lower()
+        local_reason = str(checked.get("reason") or checked.get("last_health_error") or "").strip()
+        local_check_required = bool(checked.get("check_required"))
+        local_ok = (not local_check_required) and (local_status == "active")
+        # Codex API-key profiles can fail quick quota endpoint while still being usable for turns.
+        # Avoid surfacing this as "unknown" in check-one summary.
+        if (
+            local_status == "unknown"
+            and local_check_required
+            and (
+                "authentication required to read rate limits" in local_reason.lower()
+                or "account/ratelimits/read" in local_reason.lower()
+            )
+        ):
+            codex_env = _codex_runtime_env_for_profile(name)
+            if str(codex_env.get("OPENAI_API_KEY") or "").strip():
+                local_status = "active"
+                local_check_required = False
+                local_ok = True
+                if not local_reason:
+                    local_reason = "API key 模式下额度接口不可用，已按可用账号处理。"
         local_view = {
             "exists": True,
             "email": str(checked.get("email") or "").strip(),
-            "status": str(checked.get("status") or "").strip(),
-            "reason": str(checked.get("reason") or checked.get("last_health_error") or "").strip(),
-            "check_required": bool(checked.get("check_required")),
+            "status": local_status,
+            "reason": local_reason,
+            "check_required": local_check_required,
             "last_health_check_at": int(checked.get("last_health_check_at") or 0),
             "quota": _quota_view_from_profile_item(checked if isinstance(checked, dict) else {}),
-            "ok": (not bool(checked.get("check_required"))) and (local_status == "active"),
+            "ok": local_ok,
             "source": "local",
         }
     else:
@@ -4613,6 +4633,7 @@ def _quick_quota_probe_auth_profile(profile: str) -> Dict[str, Any]:
     runtime = RUNTIMES.get(runtime_id)
     done_error = ""
     done_rate_limits: Dict[str, Any] = {}
+    needs_real_probe_fallback = False
     try:
         with runtime.lock:
             runtime.last_input_at = int(time.time())
@@ -4634,6 +4655,12 @@ def _quick_quota_probe_auth_profile(profile: str) -> Dict[str, Any]:
                 done_rate_limits = _extract_rate_limits_payload(runtime.client.account_rate_limits_read())
         except Exception as exc:
             done_error = str(exc)
+            msg = done_error.lower()
+            if (
+                "authentication required to read rate limits" in msg
+                or "account/ratelimits/read" in msg
+            ):
+                needs_real_probe_fallback = True
             done_rate_limits = {}
     except HTTPException as exc:
         done_error = str(exc.detail or exc)
@@ -4658,6 +4685,12 @@ def _quick_quota_probe_auth_profile(profile: str) -> Dict[str, Any]:
                     "last_error": done_error[:1200] if done_error else "",
                 },
             )
+    if needs_real_probe_fallback:
+        return _real_turn_probe_auth_profile(
+            profile=clean,
+            prompt="只回复OK",
+            timeout_sec=min(45, AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC),
+        )
     ok = not bool(done_error)
     return {
         "ok": ok,
@@ -4887,6 +4920,13 @@ def _quick_probe_should_escalate_to_real(probe: Dict[str, Any], previous: Dict[s
         return True
 
     if (not probe_ok) and message:
+        # API-key based Codex profiles may not support rate-limits endpoint in quick probe.
+        # In that case we should escalate to a real turn probe instead of keeping "unknown".
+        if (
+            "authentication required to read rate limits" in message
+            or "account/ratelimits/read" in message
+        ):
+            return True
         if (
             "token_expired" in message
             or "unauthorized" in message
@@ -7268,6 +7308,17 @@ def history_auth_control_page(
         }};
       }}
       if (local.exists) {{
+        const status = String(local.status || '').trim().toLowerCase();
+        const reason = String(local.reason || '').trim().toLowerCase();
+        if (
+          status === 'unknown' &&
+          (reason.includes('authentication required to read rate limits') || reason.includes('account/ratelimits/read'))
+        ) {{
+          return {{
+            ok: true,
+            text: '检测通过（API key 模式）',
+          }};
+        }}
         const ok = (!local.check_required) && String(local.status || '').toLowerCase() === 'active';
         return {{
           ok,
