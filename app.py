@@ -277,6 +277,8 @@ class AuthControlAssignRequest(BaseModel):
     lease_sec: int = Field(default=AUTH_CONTROL_DEFAULT_LEASE_SEC, ge=60, le=604800)
     force: bool = Field(default=False)
     notes: str = Field(default="")
+    chat_id: str = Field(default="")
+    project: str = Field(default="")
 
 
 class AuthControlRevokeRequest(BaseModel):
@@ -6608,6 +6610,27 @@ def history_auth_control_assign_api(
         force=bool(body.force),
         notes=body.notes,
     )
+    switched: Dict[str, Any] = {}
+    chat_id = str(body.chat_id or "").strip()
+    project = str(body.project or "").strip()
+    target_node = str(body.node_id or "").strip()
+    assigned_profile = str(data.get("profile") or body.profile or "").strip()
+    # Keep chat runtime continuity when assigning a profile to local node from auth-control.
+    if chat_id and target_node == "local" and assigned_profile:
+        runtime_id = _runtime_id_from_chat_project(chat_id=chat_id, project=project)
+        runtime = RUNTIMES.get(runtime_id)
+        with runtime.lock:
+            info = _switch_runtime_auth_profile(runtime, profile=assigned_profile, reason="auth-control local assign")
+            switched = {
+                "chat_id": chat_id,
+                "runtime_id": runtime_id,
+                "project": project,
+                "auth_profile": str(info.get("to") or "").strip(),
+                "auth_identity": str(info.get("identity") or "").strip(),
+            }
+    if switched:
+        data = dict(data)
+        data["runtime_switch"] = switched
     return JSONResponse({"ok": True, "data": data})
 
 
@@ -6743,7 +6766,14 @@ def history_auth_control_page(
             _check_api_token(token=token, authorization=authorization)
         else:
             return RedirectResponse(url="/history/entry?next=/history/auth-control", status_code=302)
-    page_config = json.dumps({"authToken": str(token or "").strip()}, ensure_ascii=False)
+    page_config = json.dumps(
+        {
+            "authToken": str(token or "").strip(),
+            "chatId": str(request.query_params.get("chat_id") or request.query_params.get("chatId") or "").strip(),
+            "project": str(request.query_params.get("project") or "").strip(),
+        },
+        ensure_ascii=False,
+    )
     html_page = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -6923,6 +6953,8 @@ def history_auth_control_page(
     window.__AUTH_CONTROL_CONFIG__ = {page_config};
     const cfg = window.__AUTH_CONTROL_CONFIG__ || {{}};
     const q = cfg.authToken ? `?token=${{encodeURIComponent(cfg.authToken)}}` : '';
+    const activeChatId = String(cfg.chatId || '').trim();
+    const activeProject = String(cfg.project || '').trim();
     let latestState = null;
     let dragProfile = '';
     let healthCheckRunning = false;
@@ -7395,7 +7427,9 @@ def history_auth_control_page(
           profile,
           node_id: targetEnv,
           lease_sec: DEFAULT_LEASE_SEC,
-          force: true
+          force: true,
+          chat_id: activeChatId,
+          project: activeProject
         }});
         setOp(profile, '检测中', 'running');
         try {{ await api('/history/api/auth/health-check', 'POST', {{ profile, mode: 'status' }}); }} catch (_) {{}}
