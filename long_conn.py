@@ -10,6 +10,7 @@ Interaction model:
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -2319,7 +2320,7 @@ class AppServerBotBridge:
             lock.release()
 
     def _normalize_text_session_command(self, text: str) -> str:
-        raw = str(text or "")
+        raw = html.unescape(str(text or ""))
         cleaned = (
             raw.replace("\ufeff", " ")
             .replace("\u200b", " ")
@@ -2328,8 +2329,10 @@ class AppServerBotBridge:
             .replace("\u2060", " ")
             .replace("／", "/")
         )
+        cleaned = re.sub(r"<at\b[^>]*>.*?</at>", " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         cleaned = re.sub(r"^(?:@\S+\s*)+", "", cleaned).strip()
+        cleaned = re.sub(r"^[：:]+\s*", "", cleaned).strip()
         cleaned = cleaned.strip("`").strip()
         if not cleaned or not cleaned.startswith("/"):
             return ""
@@ -2357,6 +2360,14 @@ class AppServerBotBridge:
     ) -> bool:
         cmd = self._normalize_text_session_command(text)
         if not cmd:
+            raw = str(text or "")
+            if "/" in raw or "／" in raw or "<at" in raw.lower() or "@" in raw:
+                LOG.info(
+                    "text session command miss chat_id=%s runtime_chat_id=%s raw=%r",
+                    chat_id,
+                    runtime_chat_id,
+                    raw[:300],
+                )
             return False
 
         LOG.info("text session command matched chat_id=%s runtime_chat_id=%s cmd=%s raw=%r", chat_id, runtime_chat_id, cmd, str(text or "")[:300])
@@ -2767,6 +2778,8 @@ class AppServerBotBridge:
         if msg_type == "text":
             text = str(content.get("text") or "").strip()
             message_id = str(message.get("message_id") or "").strip()
+            if "/" in text or "／" in text or "<at" in text.lower() or "@" in text:
+                LOG.info("text message received chat_id=%s runtime_chat_id=%s message_id=%s raw=%r", chat_id, runtime_chat_id, message_id or "<none>", text[:300])
             self._handle_text(chat_id, text, runtime_chat_id=runtime_chat_id, message_id=message_id)
             return
 
