@@ -2318,6 +2318,53 @@ class AppServerBotBridge:
         finally:
             lock.release()
 
+    def _normalize_text_session_command(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw or not raw.startswith("/"):
+            return ""
+        if "\n" in raw or "\r" in raw:
+            return ""
+        compact = re.sub(r"\s+", " ", raw).strip()
+        lower = compact.lower()
+        if lower in {"/status", "/approvals", "/permissions", "/interrupt"}:
+            return lower
+        if lower in {"/model", "/model list"}:
+            return "/model list"
+        if lower.startswith("/model use "):
+            model = compact[len("/model use ") :].strip()
+            return f"/model use {model}" if model else ""
+        if lower.startswith("/effort "):
+            effort = lower[len("/effort ") :].strip()
+            if effort in SUPPORTED_EFFORTS:
+                return f"/effort {effort}"
+            return ""
+        return ""
+
+    def _handle_text_session_command(
+        self,
+        chat_id: str,
+        runtime_chat_id: str,
+        project_name: Optional[str],
+        text: str,
+    ) -> bool:
+        cmd = self._normalize_text_session_command(text)
+        if not cmd:
+            return False
+
+        scoped_runtime_chat_id = self._runtime_key(runtime_chat_id, project_name) if project_name else runtime_chat_id
+        if cmd == "/status":
+            answer = self._status_text(scoped_runtime_chat_id)
+        elif cmd == "/interrupt":
+            try:
+                result = self.control.interrupt(scoped_runtime_chat_id)
+                answer = _trim(f"中断结果:\n{json.dumps(result, ensure_ascii=False)}", 900)
+            except Exception as exc:
+                answer = f"中断失败: {exc}"
+        else:
+            answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=cmd)
+        self.feishu.smart_send(chat_id, _trim(answer, 3000), title=f"Codex {cmd}")
+        return True
+
     def _card_header(self, title: str) -> Dict[str, Any]:
         return {
             "title": {"tag": "plain_text", "content": title},
@@ -2560,6 +2607,13 @@ class AppServerBotBridge:
 
         active_project = self._ensure_active_project(worker_chat_id)
         runtime_key = self._ensure_project_runtime(worker_chat_id, active_project) if active_project else worker_chat_id
+        if self._handle_text_session_command(
+            chat_id=chat_id,
+            runtime_chat_id=worker_chat_id,
+            project_name=active_project,
+            text=raw,
+        ):
+            return
         pending_files = self._consume_pending_files(runtime_key)
         prompt, image_paths = self._build_prompt_with_files(raw, pending_files)
         typing_reaction_id = ""
