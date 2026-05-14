@@ -2319,19 +2319,27 @@ class AppServerBotBridge:
             lock.release()
 
     def _normalize_text_session_command(self, text: str) -> str:
-        raw = str(text or "").strip()
-        if not raw or not raw.startswith("/"):
+        raw = str(text or "")
+        cleaned = (
+            raw.replace("\ufeff", " ")
+            .replace("\u200b", " ")
+            .replace("\u200c", " ")
+            .replace("\u200d", " ")
+            .replace("\u2060", " ")
+            .replace("／", "/")
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"^(?:@\S+\s*)+", "", cleaned).strip()
+        cleaned = cleaned.strip("`").strip()
+        if not cleaned or not cleaned.startswith("/"):
             return ""
-        if "\n" in raw or "\r" in raw:
-            return ""
-        compact = re.sub(r"\s+", " ", raw).strip()
-        lower = compact.lower()
+        lower = cleaned.lower()
         if lower in {"/status", "/approvals", "/permissions", "/interrupt"}:
             return lower
         if lower in {"/model", "/model list"}:
             return "/model list"
         if lower.startswith("/model use "):
-            model = compact[len("/model use ") :].strip()
+            model = cleaned[len("/model use ") :].strip()
             return f"/model use {model}" if model else ""
         if lower.startswith("/effort "):
             effort = lower[len("/effort ") :].strip()
@@ -2351,6 +2359,7 @@ class AppServerBotBridge:
         if not cmd:
             return False
 
+        LOG.info("text session command matched chat_id=%s runtime_chat_id=%s cmd=%s raw=%r", chat_id, runtime_chat_id, cmd, str(text or "")[:300])
         scoped_runtime_chat_id = self._runtime_key(runtime_chat_id, project_name) if project_name else runtime_chat_id
         if cmd == "/status":
             answer = self._status_text(scoped_runtime_chat_id)
