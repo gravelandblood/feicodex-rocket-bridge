@@ -7387,6 +7387,14 @@ def history_auth_control_page(
       const local = payload.local || {{}};
       const pool = payload.pool || {{}};
       const nodes = Array.isArray(payload.remote_nodes) ? payload.remote_nodes : [];
+      const present = nodes.filter(n => !!n.present);
+      const activeRemote = present.filter(n => String(n.status || '').toLowerCase() === 'active' && !n.check_required);
+      if (activeRemote.length) {{
+        return {{
+          ok: true,
+          text: '检测通过',
+        }};
+      }}
       if (pool.exists) {{
         return {{
           ok: !!pool.ok,
@@ -7400,11 +7408,10 @@ def history_auth_control_page(
           text: ok ? '检测通过' : (String(local.status || '').trim() || '检测异常'),
         }};
       }}
-      const present = nodes.filter(n => !!n.present);
       if (!present.length) {{
         return {{ ok: false, text: '未发现可检测节点' }};
       }}
-      const active = present.every(n => String(n.status || '').toLowerCase() === 'active');
+      const active = present.every(n => String(n.status || '').toLowerCase() === 'active' && !n.check_required);
       return {{
         ok: active,
         text: active ? '检测通过' : '检测异常',
@@ -7456,8 +7463,9 @@ def history_auth_control_page(
           project: activeProject
         }});
         setOp(profile, '检测中', 'running');
-        try {{ await api('/history/api/auth/health-check', 'POST', {{ profile, mode: 'status' }}); }} catch (_) {{}}
-        if (targetEnv !== 'local') {{
+        if (targetEnv === 'local') {{
+          try {{ await api('/history/api/auth/health-check', 'POST', {{ profile, mode: 'status' }}); }} catch (_) {{}}
+        }} else {{
           try {{ await api('/history/api/auth/control/health-check', 'POST', {{ profile, node_id: targetEnv, mode: 'status' }}); }} catch (_) {{}}
         }}
         await refreshState(false);
@@ -7468,7 +7476,7 @@ def history_auth_control_page(
           ok = (!l.check_required) && String(l.status || '').toLowerCase() === 'active';
         }} else {{
           const n = findNode(fresh, targetEnv) || {{}};
-          ok = String(n.status || '').toLowerCase() === 'active';
+          ok = String(n.status || '').toLowerCase() === 'active' && !n.check_required;
         }}
         setOp(profile, ok ? '完成：检测通过' : '完成：检测异常', ok ? 'ok' : 'bad');
       }} catch (e) {{
