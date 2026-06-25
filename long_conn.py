@@ -11,6 +11,7 @@ Interaction model:
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import logging
 import os
@@ -34,6 +35,13 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env", override=False)
+
+
+def _resolve_env_path(raw: str) -> Path:
+    p = Path(str(raw or "")).expanduser()
+    if not p.is_absolute():
+        p = APP_DIR / p
+    return p.resolve()
 
 LOG = logging.getLogger("feicodex_rocket_long_conn")
 logging.basicConfig(
@@ -98,6 +106,7 @@ REPLY_CONTEXT_PATH = Path(os.getenv("BRIDGE_MCP_REPLY_CONTEXT_PATH", str(APP_DIR
 if not REPLY_CONTEXT_PATH.is_absolute():
     REPLY_CONTEXT_PATH = APP_DIR / REPLY_CONTEXT_PATH
 REPLY_CONTEXT_PATH = REPLY_CONTEXT_PATH.resolve()
+RUNTIME_HOMES_DIR = _resolve_env_path(os.getenv("BRIDGE_RUNTIME_HOMES_DIR", str(APP_DIR / "data" / "runtime_homes")))
 CARD_AUTO_DELETE_ON_ACTION = str(os.getenv("BRIDGE_CARD_AUTO_DELETE_ON_ACTION", "true")).strip().lower() in {
     "1",
     "true",
@@ -610,6 +619,39 @@ def _parse_model_candidates(text: str) -> List[str]:
         if "effective" in line and "=" in line:
             _add(line.split("=", 1)[1])
 
+    return out
+
+
+def _runtime_home_name(runtime_id: str) -> str:
+    raw = str(runtime_id or "").strip() or "runtime"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._") or "runtime"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{safe[:64]}-{digest}"
+
+
+def _runtime_models_cache_candidates(runtime_id: str, current_model: str = "") -> List[str]:
+    out: List[str] = []
+
+    def _add(value: str) -> None:
+        clean = str(value or "").strip().strip("`")
+        if clean and clean not in out:
+            out.append(clean)
+
+    cache_path = RUNTIME_HOMES_DIR / _runtime_home_name(runtime_id) / "models_cache.json"
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    models = payload.get("models") if isinstance(payload, dict) else []
+    if isinstance(models, list):
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            visibility = str(item.get("visibility") or "list").strip().lower()
+            if visibility == "hide":
+                continue
+            _add(str(item.get("slug") or item.get("id") or item.get("name") or ""))
+    _add(current_model)
     return out
 
 
@@ -2562,7 +2604,7 @@ class AppServerBotBridge:
         rows: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
-                "content": "步骤 1/3：选择模型\n\n请选择要切换的模型。",
+                "content": "请选择要切换的模型。\n\n选择后会直接更新当前会话配置。",
             }
         ]
         buttons = [
@@ -2576,7 +2618,7 @@ class AppServerBotBridge:
         )
         return {
             "config": {"wide_screen_mode": True},
-            "header": self._card_header("切换模型 / Step1"),
+            "header": self._card_header("切换模型"),
             "elements": rows,
         }
 
@@ -3016,8 +3058,16 @@ class AppServerBotBridge:
             return
 
         if op == "session_model_start":
-            answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/model list")
-            models = _parse_model_candidates(answer)
+            status = self._status_data(scoped_runtime_chat_id)
+            runtime_id = str(status.get("runtime_id") or scoped_runtime_chat_id).strip()
+            current_model = str(status.get("model") or "").strip()
+            models = _runtime_models_cache_candidates(runtime_id, current_model=current_model)
+            answer = ""
+            if not models:
+                answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/model list")
+                models = _parse_model_candidates(answer)
+            if not models and current_model:
+                models = [current_model]
             if not models:
                 self.feishu.send_text(reply_chat_id, f"未解析到可用模型，原始返回：\n{_trim(answer, 2000)}")
                 return
@@ -3062,7 +3112,14 @@ class AppServerBotBridge:
             if not model:
                 self.feishu.send_text(reply_chat_id, "未选择模型")
                 return
-            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model, project_name=target_project))
+            try:
+                runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
+                result = self.control.update_config(chat_id=runtime_key, model=model)
+                data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                applied = str(data.get("model") or model).strip() or model
+                self.feishu.send_text(reply_chat_id, f"已切换模型: {applied}")
+            except Exception as exc:
+                self.feishu.send_text(reply_chat_id, f"切换模型失败: {exc}")
             return
 
         if op == "session_model_apply":
@@ -3072,29 +3129,25 @@ class AppServerBotBridge:
                 self.feishu.send_text(reply_chat_id, "模型或推理强度参数无效")
                 return
 
-            result_model = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=f"/model use {model}")
-            result_effort = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text=f"/effort {effort}")
-            verify = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/status")
-            synced_model = _extract_status_value(verify, "effective_model") or _extract_status_value(verify, "model") or model
-            sync_note = ""
             try:
-                self.control.update_config(
-                    chat_id=self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id),
-                    model=synced_model,
+                runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
+                result = self.control.update_config(chat_id=runtime_key, model=model)
+                data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                applied = str(data.get("model") or model).strip() or model
+                self.feishu.smart_send(
+                    reply_chat_id,
+                    text=_trim(
+                        "模型切换完成。\n\n"
+                        f"model = {applied}\n"
+                        f"selected_effort = {effort}\n\n"
+                        "说明：新版 Codex 已不再可靠支持桥接器通过会话文本命令下发 `/model`/`/effort`，"
+                        "当前桥接器改为直接更新会话模型配置。",
+                        3500,
+                    ),
+                    title="模型切换结果",
                 )
             except Exception as exc:
-                sync_note = f"\n\nconfig_sync_failed: {exc}"
-            self.feishu.smart_send(
-                reply_chat_id,
-                text=_trim(
-                    "模型切换完成。\n\n"
-                    f"/model use {model}\n{result_model}\n\n"
-                    f"/effort {effort}\n{result_effort}\n\n"
-                    f"verify:\n{verify}{sync_note}",
-                    3500,
-                ),
-                title="模型切换结果",
-            )
+                self.feishu.send_text(reply_chat_id, f"切换模型失败: {exc}")
             return
 
         self.feishu.send_text(reply_chat_id, f"未支持的卡片动作: {op}")
