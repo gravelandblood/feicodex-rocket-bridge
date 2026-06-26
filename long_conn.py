@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -683,6 +684,51 @@ def _profile_models_cache_candidates(profile: str, current_model: str = "") -> L
             if visibility == "hide":
                 continue
             _add(str(item.get("slug") or item.get("id") or item.get("name") or ""))
+    _add(current_model)
+    return out
+
+
+def _profile_live_api_models(profile: str, current_model: str = "") -> List[str]:
+    out: List[str] = []
+
+    def _add(value: str) -> None:
+        clean = str(value or "").strip().strip("`")
+        if clean and clean not in out:
+            out.append(clean)
+
+    clean_profile = str(profile or "").strip()
+    if not clean_profile:
+        _add(current_model)
+        return out
+
+    auth_path = AUTH_HOMES_DIR / clean_profile / "auth.json"
+    try:
+        auth_payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        auth_payload = {}
+
+    base_url = str(auth_payload.get("base_url") or auth_payload.get("OPENAI_BASE_URL") or "").strip().rstrip("/")
+    api_key = str(auth_payload.get("OPENAI_API_KEY") or auth_payload.get("api_key") or "").strip()
+    if not base_url or not api_key:
+        _add(current_model)
+        return out
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        payload = {}
+
+    models = payload.get("data") if isinstance(payload, dict) else []
+    if isinstance(models, list):
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            _add(str(item.get("id") or item.get("slug") or item.get("name") or ""))
     _add(current_model)
     return out
 
@@ -3095,6 +3141,10 @@ class AppServerBotBridge:
             current_model = str(status.get("model") or "").strip()
             auth_profile = str(status.get("auth_profile") or "").strip()
             models = _profile_models_cache_candidates(auth_profile, current_model=current_model)
+            if len(models) <= 1:
+                live_models = _profile_live_api_models(auth_profile, current_model=current_model)
+                if len(live_models) > len(models):
+                    models = live_models
             if not models:
                 models = _runtime_models_cache_candidates(runtime_id, current_model=current_model)
             answer = ""
