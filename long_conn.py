@@ -107,6 +107,7 @@ if not REPLY_CONTEXT_PATH.is_absolute():
     REPLY_CONTEXT_PATH = APP_DIR / REPLY_CONTEXT_PATH
 REPLY_CONTEXT_PATH = REPLY_CONTEXT_PATH.resolve()
 RUNTIME_HOMES_DIR = _resolve_env_path(os.getenv("BRIDGE_RUNTIME_HOMES_DIR", str(APP_DIR / "data" / "runtime_homes")))
+AUTH_HOMES_DIR = _resolve_env_path(os.getenv("BRIDGE_AUTH_HOMES_DIR", str(APP_DIR / "data" / "auth_homes")))
 CARD_AUTO_DELETE_ON_ACTION = str(os.getenv("BRIDGE_CARD_AUTO_DELETE_ON_ACTION", "true")).strip().lower() in {
     "1",
     "true",
@@ -638,6 +639,37 @@ def _runtime_models_cache_candidates(runtime_id: str, current_model: str = "") -
             out.append(clean)
 
     cache_path = RUNTIME_HOMES_DIR / _runtime_home_name(runtime_id) / "models_cache.json"
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    models = payload.get("models") if isinstance(payload, dict) else []
+    if isinstance(models, list):
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            visibility = str(item.get("visibility") or "list").strip().lower()
+            if visibility == "hide":
+                continue
+            _add(str(item.get("slug") or item.get("id") or item.get("name") or ""))
+    _add(current_model)
+    return out
+
+
+def _profile_models_cache_candidates(profile: str, current_model: str = "") -> List[str]:
+    out: List[str] = []
+
+    def _add(value: str) -> None:
+        clean = str(value or "").strip().strip("`")
+        if clean and clean not in out:
+            out.append(clean)
+
+    clean_profile = str(profile or "").strip()
+    if not clean_profile:
+        _add(current_model)
+        return out
+
+    cache_path = AUTH_HOMES_DIR / clean_profile / "models_cache.json"
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception:
@@ -3061,7 +3093,10 @@ class AppServerBotBridge:
             status = self._status_data(scoped_runtime_chat_id)
             runtime_id = str(status.get("runtime_id") or scoped_runtime_chat_id).strip()
             current_model = str(status.get("model") or "").strip()
-            models = _runtime_models_cache_candidates(runtime_id, current_model=current_model)
+            auth_profile = str(status.get("auth_profile") or "").strip()
+            models = _profile_models_cache_candidates(auth_profile, current_model=current_model)
+            if not models:
+                models = _runtime_models_cache_candidates(runtime_id, current_model=current_model)
             answer = ""
             if not models:
                 answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/model list")
