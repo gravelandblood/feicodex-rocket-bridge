@@ -733,6 +733,37 @@ def _profile_live_api_models(profile: str, current_model: str = "") -> List[str]
     return out
 
 
+def _is_bridge_visible_gpt_model(model: str) -> bool:
+    clean = str(model or "").strip().lower()
+    if not clean:
+        return False
+    if not clean.startswith("gpt-"):
+        return False
+    if clean.startswith("gpt-image-"):
+        return False
+    return True
+
+
+def _merge_model_candidates(*groups: List[str]) -> List[str]:
+    out: List[str] = []
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for item in group:
+            clean = str(item or "").strip().strip("`")
+            if clean and clean not in out:
+                out.append(clean)
+    return out
+
+
+def _visible_bridge_model_candidates(models: List[str], current_model: str = "") -> List[str]:
+    merged = _merge_model_candidates(models, [current_model] if current_model else [])
+    visible = [item for item in merged if _is_bridge_visible_gpt_model(item)]
+    if visible:
+        return visible
+    return merged
+
+
 def _extract_status_value(text: str, key: str) -> str:
     pattern = re.compile(rf"(?mi)^\s*{re.escape(str(key or '').strip())}\s*=\s*(.+?)\s*$")
     m = pattern.search(str(text or ""))
@@ -2687,7 +2718,7 @@ class AppServerBotBridge:
         ]
         buttons = [
             self._action_button(m, {"op": "session_model_pick", "model": m}, btn_type="primary", project_name=project_name)
-            for m in models[:12]
+            for m in models
         ]
         for idx in range(0, len(buttons), 3):
             rows.append({"tag": "action", "actions": buttons[idx : idx + 3]})
@@ -3140,17 +3171,15 @@ class AppServerBotBridge:
             runtime_id = str(status.get("runtime_id") or scoped_runtime_chat_id).strip()
             current_model = str(status.get("model") or "").strip()
             auth_profile = str(status.get("auth_profile") or "").strip()
-            models = _profile_models_cache_candidates(auth_profile, current_model=current_model)
-            if len(models) <= 1:
-                live_models = _profile_live_api_models(auth_profile, current_model=current_model)
-                if len(live_models) > len(models):
-                    models = live_models
-            if not models:
-                models = _runtime_models_cache_candidates(runtime_id, current_model=current_model)
+            profile_cache_models = _profile_models_cache_candidates(auth_profile, current_model=current_model)
+            live_models = _profile_live_api_models(auth_profile, current_model=current_model)
+            runtime_cache_models = _runtime_models_cache_candidates(runtime_id, current_model=current_model)
+            models = _merge_model_candidates(live_models, profile_cache_models, runtime_cache_models)
             answer = ""
             if not models:
                 answer = self._run_session_command(chat_id=scoped_runtime_chat_id, cmd_text="/model list")
                 models = _parse_model_candidates(answer)
+            models = _visible_bridge_model_candidates(models, current_model=current_model)
             if not models and current_model:
                 models = [current_model]
             if not models:
