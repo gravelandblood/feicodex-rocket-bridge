@@ -59,6 +59,12 @@ AUTO_AUTH_SWITCH_ENABLED = str(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_ENABLED",
     "on",
 }
 AUTO_AUTH_SWITCH_THRESHOLD_PCT = max(1, min(100, int(os.environ.get("BRIDGE_AUTO_AUTH_SWITCH_THRESHOLD_PCT", "100"))))
+AUTH_AUTO_DISABLE_ENABLED = str(os.environ.get("BRIDGE_AUTH_AUTO_DISABLE_ENABLED", "false")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 AUTH_HEALTH_CHECK_DEFAULT_MODE = str(os.environ.get("BRIDGE_AUTH_HEALTH_CHECK_DEFAULT_MODE", "real_turn")).strip().lower() or "real_turn"
 AUTH_REAL_HEALTH_CHECK_PROMPT = str(os.environ.get("BRIDGE_AUTH_REAL_HEALTH_CHECK_PROMPT", "只回复OK")).strip() or "只回复OK"
 AUTH_REAL_HEALTH_CHECK_TIMEOUT_SEC = max(
@@ -2091,6 +2097,8 @@ def _auth_profile_available(meta: Dict[str, Any], now_ts: Optional[int] = None) 
     now = int(now_ts if now_ts is not None else time.time())
     if not bool(meta.get("valid")):
         return False
+    if not AUTH_AUTO_DISABLE_ENABLED:
+        return True
     status = str(meta.get("status") or "").strip().lower()
     if status in {"needs_reauth", "deactivated"}:
         return False
@@ -2254,7 +2262,7 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
             )
         _sync_profile_home_files(profile=profile, source_auth_path=source, source_cfg_path=cfg, fallback_cfg_text=custom_cfg)
         meta["last_health_check_at"] = now_ts
-        if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
+        if AUTH_AUTO_DISABLE_ENABLED and str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
             meta["last_health_error"] = meta["reason"]
@@ -2279,7 +2287,7 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
             meta["last_health_error"] = meta["reason"]
             return meta
         meta["last_health_check_at"] = now_ts
-        if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
+        if AUTH_AUTO_DISABLE_ENABLED and str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
             meta["last_health_error"] = meta["reason"]
@@ -2330,7 +2338,7 @@ def _validate_auth_profile_file(source: Path, previous: Optional[Dict[str, Any]]
     output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
     meta["last_health_check_at"] = now_ts
     if proc.returncode == 0 and "Logged in" in output:
-        if str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
+        if AUTH_AUTO_DISABLE_ENABLED and str(meta.get("status") or "").strip().lower() == "temp_disabled" and disabled_until > now_ts:
             meta["valid"] = False
             meta["reason"] = meta["disabled_reason"] or f"临时禁用中，预计 {time.strftime('%m-%d %H:%M', time.localtime(disabled_until))} 解禁"
             meta["last_health_error"] = meta["reason"]
@@ -3891,6 +3899,16 @@ def _auth_control_registry_state() -> Dict[str, Any]:
                     notes=str(merged.get("notes") or ""),
                 )
             )
+            merged.update(
+                {
+                    "valid": bool(local_item.get("valid")),
+                    "status": str(local_item.get("status") or "").strip(),
+                    "reason": str(local_item.get("reason") or "").strip(),
+                    "check_required": bool(local_item.get("check_required")),
+                    "last_health_check_at": int(local_item.get("last_health_check_at") or 0),
+                    "last_health_error": str(local_item.get("last_health_error") or "").strip(),
+                }
+            )
         merged["profile"] = profile
         merged["label"] = str(merged.get("label") or profile).strip()[:120]
         merged["provider"] = _normalize_agent_provider(str(merged.get("provider") or "codex"))
@@ -4876,6 +4894,26 @@ def _apply_health_probe_result(profile: str, probe: Dict[str, Any]) -> Dict[str,
             }
         )
     else:
+        if not AUTH_AUTO_DISABLE_ENABLED:
+            reason = message[:1200] if message else f"真实对话检测失败：status={status or 'failed'}"
+            patch.update(
+                {
+                    "valid": True,
+                    "status": "active",
+                    "reason": f"健康检查告警：{reason}",
+                    "needs_reauth": False,
+                    "risk_deactivated": False,
+                    "disabled_until": 0,
+                    "disabled_reason": "",
+                    "check_required": False,
+                    "last_health_error": reason,
+                }
+            )
+            _patch_auth_registry_profile(clean, patch)
+            refreshed = _auth_registry_by_profile().get(clean)
+            payload = dict(refreshed or {"profile": clean})
+            payload["last_probe"] = probe
+            return payload
         classified = _classify_auth_error(message)
         if classified == "needs_reauth":
             patch.update(
@@ -5143,6 +5181,28 @@ def _apply_auth_error_policy(
 
     classification = _classify_auth_error(message)
     now_ts = int(time.time())
+    if classification and not AUTH_AUTO_DISABLE_ENABLED:
+        _patch_auth_registry_profile(
+            profile,
+            {
+                "valid": True,
+                "status": "active",
+                "reason": f"运行告警：{message[:1200]}",
+                "last_health_check_at": now_ts,
+                "last_health_error": message[:1200],
+                "check_required": False,
+                "disabled_until": 0,
+                "disabled_reason": "",
+                "needs_reauth": False,
+                "risk_deactivated": False,
+            },
+        )
+        return {
+            "classification": classification,
+            "switch": None,
+            "note": f"账号 `{profile}` 出现 {classification} 告警，已保留为可用账号。",
+            "deleted": False,
+        }
     note = ""
     deleted = False
     patch: Dict[str, Any] = {
