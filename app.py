@@ -45,6 +45,8 @@ API_TOKEN = os.environ.get("BRIDGE_API_TOKEN", "")
 API_PREFIX = os.environ.get("BRIDGE_API_PREFIX", "/appbridge/api")
 DEFAULT_CWD = os.environ.get("BRIDGE_DEFAULT_CWD", str(APP_DIR))
 DEFAULT_MODEL = os.environ.get("BRIDGE_DEFAULT_MODEL", "gpt-5.3-codex")
+DEFAULT_REASONING_EFFORT = os.environ.get("BRIDGE_DEFAULT_REASONING_EFFORT", "high").strip().lower() or "high"
+SUPPORTED_REASONING_EFFORTS = {"medium", "high", "xhigh"}
 DEFAULT_SANDBOX = os.environ.get("BRIDGE_DEFAULT_SANDBOX", "danger-full-access")
 DEFAULT_APPROVAL = os.environ.get("BRIDGE_DEFAULT_APPROVAL_POLICY", "never")
 DEFAULT_PERSONALITY = os.environ.get("BRIDGE_DEFAULT_PERSONALITY", "pragmatic")
@@ -207,6 +209,7 @@ class InterruptTurnRequest(BaseModel):
 class UpdateChatConfigRequest(BaseModel):
     cwd: str = Field(default="")
     model: str = Field(default="")
+    reasoning_effort: str = Field(default="")
     agent_provider: str = Field(default="")
     sandbox: str = Field(default="")
     approval_policy: str = Field(default="")
@@ -379,7 +382,13 @@ class AgentAdapter(Protocol):
     ) -> Dict[str, Any]:
         ...
 
-    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+    def turn_start(
+        self,
+        thread_id: str,
+        text: str,
+        image_paths: Optional[List[str]] = None,
+        effort: str = "",
+    ) -> Dict[str, Any]:
         ...
 
     def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> Any:
@@ -463,8 +472,14 @@ class CodexAgentAdapter:
             approval_policy=approval_policy,
         )
 
-    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
-        return self._client.turn_start(thread_id=thread_id, text=text, image_paths=image_paths)
+    def turn_start(
+        self,
+        thread_id: str,
+        text: str,
+        image_paths: Optional[List[str]] = None,
+        effort: str = "",
+    ) -> Dict[str, Any]:
+        return self._client.turn_start(thread_id=thread_id, text=text, image_paths=image_paths, effort=effort)
 
     def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> Any:
         return self._client.wait_for_turn_completion(thread_id=thread_id, turn_id=turn_id, timeout_sec=timeout_sec)
@@ -745,7 +760,13 @@ class ClaudeAgentAdapter:
             raise AppServerError("claude messages api invalid payload")
         return data
 
-    def turn_start(self, thread_id: str, text: str, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+    def turn_start(
+        self,
+        thread_id: str,
+        text: str,
+        image_paths: Optional[List[str]] = None,
+        effort: str = "",
+    ) -> Dict[str, Any]:
         if not self.is_running():
             self.start()
         clean_thread_id = str(thread_id or "").strip()
@@ -936,6 +957,7 @@ class ChatRuntime:
     active_turn_id: str = ""
     cwd: str = DEFAULT_CWD
     model: str = DEFAULT_MODEL
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
     sandbox: str = DEFAULT_SANDBOX
     approval_policy: str = DEFAULT_APPROVAL
     personality: str = DEFAULT_PERSONALITY
@@ -982,6 +1004,7 @@ class BridgeRuntimeManager:
                 active_turn_id=str(persisted.get("active_turn_id") or ""),
                 cwd=str(persisted.get("cwd") or DEFAULT_CWD),
                 model=str(persisted.get("model") or DEFAULT_MODEL),
+                reasoning_effort=str(persisted.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
                 sandbox=str(persisted.get("sandbox") or DEFAULT_SANDBOX),
                 approval_policy=str(persisted.get("approval_policy") or DEFAULT_APPROVAL),
                 personality=str(persisted.get("personality") or DEFAULT_PERSONALITY),
@@ -1410,6 +1433,13 @@ def _resolve_chat_config(runtime: ChatRuntime, body: Any) -> None:
     runtime.cwd = str(getattr(body, "cwd", "") or runtime.cwd or DEFAULT_CWD)
     requested_model = str(getattr(body, "model", "") or "").strip()
     runtime.model = str(requested_model or runtime.model or DEFAULT_MODEL)
+    requested_effort = str(getattr(body, "reasoning_effort", "") or "").strip().lower()
+    if requested_effort:
+        if requested_effort not in SUPPORTED_REASONING_EFFORTS:
+            raise HTTPException(status_code=422, detail=f"unsupported reasoning_effort: {requested_effort}")
+        runtime.reasoning_effort = requested_effort
+    elif str(runtime.reasoning_effort or "").strip().lower() not in SUPPORTED_REASONING_EFFORTS:
+        runtime.reasoning_effort = DEFAULT_REASONING_EFFORT
     requested_provider = str(getattr(body, "agent_provider", "") or "").strip()
     provider_changed = False
     if requested_provider:
@@ -1452,6 +1482,7 @@ def _persist_runtime(runtime: ChatRuntime, patch: Optional[Dict[str, Any]] = Non
         "active_turn_id": runtime.active_turn_id,
         "cwd": runtime.cwd,
         "model": runtime.model,
+        "reasoning_effort": runtime.reasoning_effort,
         "sandbox": runtime.sandbox,
         "approval_policy": runtime.approval_policy,
         "personality": runtime.personality,
@@ -5635,6 +5666,7 @@ def chat_status(chat_id: str) -> Dict[str, Any]:
             "turn_events": turn_events,
             "cwd": str(runtime.cwd or persisted.get("cwd") or DEFAULT_CWD),
             "model": str(runtime.model or persisted.get("model") or DEFAULT_MODEL),
+            "reasoning_effort": str(runtime.reasoning_effort or persisted.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
             "agent_provider": _normalize_agent_provider(str(runtime.agent_provider or persisted.get("agent_provider") or "codex")),
             "sandbox": str(runtime.sandbox or persisted.get("sandbox") or DEFAULT_SANDBOX),
             "approval_policy": str(runtime.approval_policy or persisted.get("approval_policy") or DEFAULT_APPROVAL),
@@ -5829,6 +5861,7 @@ def chat_config_update(chat_id: str, body: UpdateChatConfigRequest) -> Dict[str,
                 "chat_id": chat_id,
                 "cwd": runtime.cwd,
                 "model": runtime.model,
+                "reasoning_effort": runtime.reasoning_effort,
                 "sandbox": runtime.sandbox,
                 "approval_policy": runtime.approval_policy,
                 "personality": runtime.personality,
@@ -5998,6 +6031,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 thread_id=thread_id,
                 text=turn_input_text,
                 image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                effort=runtime.reasoning_effort,
             )
         except AppServerError as exc:
             raw_err = str(exc)
@@ -6013,6 +6047,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     thread_id=thread_id,
                     text=turn_input_text,
                     image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                    effort=runtime.reasoning_effort,
                 )
             elif _is_auth_limit_error(raw_err) and not auto_auth_switch:
                 auto_auth_switch = _maybe_auto_switch_auth_profile(runtime, reason=raw_err)
@@ -6022,6 +6057,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                         thread_id=thread_id,
                         text=turn_input_text,
                         image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                        effort=runtime.reasoning_effort,
                     )
                 else:
                     err_text = raw_err + (f"\n{note}" if note else "")

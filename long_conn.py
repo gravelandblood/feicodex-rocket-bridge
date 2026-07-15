@@ -1289,6 +1289,7 @@ class ControlAPI:
         chat_id: str,
         cwd: str = "",
         model: str = "",
+        reasoning_effort: str = "",
         sandbox: str = "",
         approval_policy: str = "",
         personality: str = "",
@@ -1296,6 +1297,7 @@ class ControlAPI:
         body = {
             "cwd": str(cwd or ""),
             "model": str(model or ""),
+            "reasoning_effort": str(reasoning_effort or ""),
             "sandbox": str(sandbox or ""),
             "approval_policy": str(approval_policy or ""),
             "personality": str(personality or ""),
@@ -2713,7 +2715,7 @@ class AppServerBotBridge:
         rows: List[Dict[str, Any]] = [
             {
                 "tag": "markdown",
-                "content": "请选择要切换的模型。\n\n选择后会直接更新当前会话配置。",
+                "content": "步骤 1/2：请选择要切换的模型。\n\n下一步选择推理强度后，才会更新当前会话配置。",
             }
         ]
         buttons = [
@@ -2747,7 +2749,7 @@ class AppServerBotBridge:
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": f"步骤 2/3：选择推理强度\n\n已选模型：`{model}`",
+                "content": f"步骤 2/2：选择推理强度\n\n已选模型：`{model}`",
                 },
                 {"tag": "action", "actions": actions},
                 {
@@ -2755,7 +2757,7 @@ class AppServerBotBridge:
                     "elements": [
                         {
                             "tag": "plain_text",
-                            "content": "下一步将执行：/model use <model> + /effort <level>",
+                            "content": "选择后会将模型和推理强度直接写入当前会话，并在下一次 turn/start 生效。",
                         }
                     ],
                 },
@@ -3226,14 +3228,7 @@ class AppServerBotBridge:
             if not model:
                 self.feishu.send_text(reply_chat_id, "未选择模型")
                 return
-            try:
-                runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
-                result = self.control.update_config(chat_id=runtime_key, model=model)
-                data = result.get("data") if isinstance(result.get("data"), dict) else {}
-                applied = str(data.get("model") or model).strip() or model
-                self.feishu.send_text(reply_chat_id, f"已切换模型: {applied}")
-            except Exception as exc:
-                self.feishu.send_text(reply_chat_id, f"切换模型失败: {exc}")
+            self.feishu.send_card(reply_chat_id, self._build_effort_select_card(model, project_name=target_project))
             return
 
         if op == "session_model_apply":
@@ -3245,7 +3240,7 @@ class AppServerBotBridge:
 
             try:
                 runtime_key = self._runtime_key(runtime_chat_id, target_project) if target_project else self._runtime_key(runtime_chat_id)
-                result = self.control.update_config(chat_id=runtime_key, model=model)
+                result = self.control.update_config(chat_id=runtime_key, model=model, reasoning_effort=effort)
                 data = result.get("data") if isinstance(result.get("data"), dict) else {}
                 applied = str(data.get("model") or model).strip() or model
                 self.feishu.smart_send(
@@ -3253,9 +3248,8 @@ class AppServerBotBridge:
                     text=_trim(
                         "模型切换完成。\n\n"
                         f"model = {applied}\n"
-                        f"selected_effort = {effort}\n\n"
-                        "说明：新版 Codex 已不再可靠支持桥接器通过会话文本命令下发 `/model`/`/effort`，"
-                        "当前桥接器改为直接更新会话模型配置。",
+                        f"reasoning_effort = {effort}\n\n"
+                        "该配置会在下一次请求的 Codex `turn/start` 中作为 `effort` 参数发送。",
                         3500,
                     ),
                     title="模型切换结果",
