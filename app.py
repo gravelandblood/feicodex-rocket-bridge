@@ -4090,9 +4090,11 @@ def _auth_control_upload(
     )
     meta = _merge_auth_control_auth_meta(item, provider=clean_provider, label=label, notes=notes)
     name = str(meta.get("profile") or "")
+    assignment: Dict[str, Any] = {}
     with _AUTH_CONTROL_LOCK:
         registry = _load_auth_control_registry()
         auths = registry.get("auths") if isinstance(registry.get("auths"), dict) else {}
+        assignments = registry.get("assignments") if isinstance(registry.get("assignments"), dict) else {}
         existing = auths.get(name) if isinstance(auths.get(name), dict) else {}
         created_at = int(existing.get("created_at") or time.time())
         merged = dict(existing)
@@ -4100,6 +4102,7 @@ def _auth_control_upload(
         merged["created_at"] = created_at
         auths[name] = merged
         registry["auths"] = auths
+        assignment = dict(assignments.get(name) or {}) if isinstance(assignments.get(name), dict) else {}
         _audit_auth_control(
             registry,
             action="upload",
@@ -4108,12 +4111,43 @@ def _auth_control_upload(
             message=f"profile uploaded/updated requested={requested_profile or '-'} resolved={name}",
         )
         _save_auth_control_registry(registry)
+
+    # Updating an assigned profile must also refresh its node copy. Otherwise the
+    # node's already-running runtime can keep using the previous credential.
+    target_node = str(assignment.get("node_id") or "").strip()
+    assignment_sync: Dict[str, Any] = {"state": "not_assigned"}
+    if target_node and target_node != "local":
+        try:
+            deployed = _auth_control_assign(
+                profile=name,
+                node_id=target_node,
+                lease_sec=int(assignment.get("lease_sec") or AUTH_CONTROL_DEFAULT_LEASE_SEC),
+                notes=str(merged.get("notes") or "").strip(),
+            )
+            assignment_sync = {"state": "deployed", **deployed}
+        except Exception as exc:
+            with _AUTH_CONTROL_LOCK:
+                registry = _load_auth_control_registry()
+                _audit_auth_control(
+                    registry,
+                    action="upload_sync",
+                    profile=name,
+                    node_id=target_node,
+                    ok=False,
+                    message=f"credential updated but assigned-node sync failed: {exc}",
+                )
+                _save_auth_control_registry(registry)
+            raise HTTPException(
+                status_code=502,
+                detail=f"profile updated locally but sync to assigned node {target_node} failed: {exc}",
+            ) from exc
     return {
         "profile": name,
         "requested_profile": requested_profile,
         "resolved_profile": name,
         "meta": meta,
         "health": item,
+        "assignment_sync": assignment_sync,
     }
 
 
