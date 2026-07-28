@@ -387,6 +387,7 @@ class AgentAdapter(Protocol):
         thread_id: str,
         text: str,
         image_paths: Optional[List[str]] = None,
+        model: str = "",
         effort: str = "",
     ) -> Dict[str, Any]:
         ...
@@ -477,9 +478,16 @@ class CodexAgentAdapter:
         thread_id: str,
         text: str,
         image_paths: Optional[List[str]] = None,
+        model: str = "",
         effort: str = "",
     ) -> Dict[str, Any]:
-        return self._client.turn_start(thread_id=thread_id, text=text, image_paths=image_paths, effort=effort)
+        return self._client.turn_start(
+            thread_id=thread_id,
+            text=text,
+            image_paths=image_paths,
+            model=model,
+            effort=effort,
+        )
 
     def wait_for_turn_completion(self, thread_id: str, turn_id: str, timeout_sec: int = 600) -> Any:
         return self._client.wait_for_turn_completion(thread_id=thread_id, turn_id=turn_id, timeout_sec=timeout_sec)
@@ -765,6 +773,7 @@ class ClaudeAgentAdapter:
         thread_id: str,
         text: str,
         image_paths: Optional[List[str]] = None,
+        model: str = "",
         effort: str = "",
     ) -> Dict[str, Any]:
         if not self.is_running():
@@ -779,6 +788,8 @@ class ClaudeAgentAdapter:
             if thread is None:
                 thread = {"messages": [], "model": self._default_model(), "cwd": DEFAULT_CWD, "session_id": ""}
                 self._threads[clean_thread_id] = thread
+            if model:
+                thread["model"] = str(model).strip()
             self._thread_status[clean_thread_id] = {"type": "running"}
             self._active_turn_by_thread[clean_thread_id] = turn_id
             self._turn_started_at_by_thread[clean_thread_id] = time.time()
@@ -5888,7 +5899,7 @@ def chat_config_update(chat_id: str, body: UpdateChatConfigRequest) -> Dict[str,
     runtime = RUNTIMES.get(chat_id)
     with runtime.lock:
         _resolve_chat_config(runtime, body)
-        state = _persist_runtime(runtime, {"last_error": ""})
+        state = _persist_runtime(runtime, {"last_error": "", "last_turn_error": {}, "last_turn_status": ""})
         return {
             "ok": True,
             "data": {
@@ -6065,6 +6076,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                 thread_id=thread_id,
                 text=turn_input_text,
                 image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                model=runtime.model,
                 effort=runtime.reasoning_effort,
             )
         except AppServerError as exc:
@@ -6081,6 +6093,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                     thread_id=thread_id,
                     text=turn_input_text,
                     image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                    model=runtime.model,
                     effort=runtime.reasoning_effort,
                 )
             elif _is_auth_limit_error(raw_err) and not auto_auth_switch:
@@ -6091,6 +6104,7 @@ def chat_turn(chat_id: str, body: TurnRequest) -> Dict[str, Any]:
                         thread_id=thread_id,
                         text=turn_input_text,
                         image_paths=[str(p) for p in list(body.image_paths or []) if str(p).strip()],
+                        model=runtime.model,
                         effort=runtime.reasoning_effort,
                     )
                 else:
