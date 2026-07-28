@@ -27,7 +27,7 @@ import lark_oapi as lark
 import requests
 from dotenv import load_dotenv
 from lark_oapi.api.application.v6 import P2ApplicationBotMenuV6
-from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+from lark_oapi.api.im.v1 import P2ImChatMemberBotAddedV1, P2ImMessageReceiveV1
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     CallBackToast,
     P2CardActionTrigger,
@@ -1393,6 +1393,9 @@ class AppServerBotBridge:
     def handle_menu_event_async(self, payload: Dict[str, Any]) -> None:
         threading.Thread(target=self._handle_menu_event_safe, args=(payload,), daemon=True).start()
 
+    def handle_bot_added_async(self, chat_id: str) -> None:
+        threading.Thread(target=self._handle_bot_added_safe, args=(chat_id,), daemon=True).start()
+
     def handle_card_action_async(self, payload: P2CardActionTrigger) -> None:
         threading.Thread(target=self._handle_card_action_safe, args=(payload,), daemon=True).start()
 
@@ -1407,6 +1410,12 @@ class AppServerBotBridge:
             self._handle_menu_event(payload)
         except Exception as exc:
             LOG.exception("Failed handling menu event: %s", exc)
+
+    def _handle_bot_added_safe(self, chat_id: str) -> None:
+        try:
+            self._handle_bot_added(chat_id)
+        except Exception as exc:
+            LOG.exception("Failed handling bot-added event: %s", exc)
 
     def _handle_card_action_safe(self, payload: P2CardActionTrigger) -> None:
         try:
@@ -2504,37 +2513,6 @@ class AppServerBotBridge:
             return ""
         return ""
 
-    def _management_text_action(self, text: str) -> str:
-        """Map explicit text commands to the interactive management cards.
-
-        Application menus are not consistently exposed in group chats, so these
-        commands provide a chat-local entry point without forwarding them to Codex.
-        """
-        raw = html.unescape(str(text or ""))
-        cleaned = (
-            raw.replace("\ufeff", " ")
-            .replace("\u200b", " ")
-            .replace("\u200c", " ")
-            .replace("\u200d", " ")
-            .replace("\u2060", " ")
-            .replace("／", "/")
-        )
-        cleaned = re.sub(r"<at\b[^>]*>.*?</at>", " ", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip().lower().strip("`")
-        cleaned = re.sub(r"^@\S+\s+", "", cleaned).strip()
-        commands = {
-            "/manage": "open_session_manage",
-            "/menu": "open_session_manage",
-            "/settings": "open_session_manage",
-            "/session": "open_session_manage",
-            "/project": "open_project_manage",
-            "/projects": "open_project_manage",
-            "/model": "session_model_start",
-            "/auth": "session_auth_start",
-            "/account": "session_auth_start",
-        }
-        return commands.get(cleaned, "")
-
     def _handle_text_session_command(
         self,
         chat_id: str,
@@ -2700,6 +2678,34 @@ class AppServerBotBridge:
             ],
         }
 
+    def _build_group_control_card(self) -> Dict[str, Any]:
+        """A persistent visual entry point posted when the bot joins a group."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": self._card_header("Codex 群聊控制台"),
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "使用下方按钮配置本群中的项目、模型、推理强度和账号。\n\n"
+                    "建议由群管理员将本卡片置顶，作为固定入口。",
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._action_button("项目管理", {"op": "open_project_manage"}, btn_type="primary"),
+                        self._action_button("会话设置", {"op": "open_session_manage"}),
+                    ],
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        self._action_button("切换模型", {"op": "session_model_start"}, btn_type="primary"),
+                        self._action_button("切换账号", {"op": "session_auth_start"}),
+                    ],
+                },
+            ],
+        }
+
     def _build_auth_select_card(self, current_profile: str, profiles: List[Dict[str, Any]], project_name: str = "") -> Dict[str, Any]:
         rows: List[Dict[str, Any]] = [
             {
@@ -2811,14 +2817,6 @@ class AppServerBotBridge:
 
         active_project = self._ensure_active_project(worker_chat_id)
         runtime_key = self._ensure_project_runtime(worker_chat_id, active_project) if active_project else worker_chat_id
-        management_action = self._management_text_action(raw)
-        if management_action:
-            self._run_card_action(
-                chat_id=worker_chat_id,
-                op=management_action,
-                value={"project": active_project} if active_project else {},
-            )
-            return
         if self._handle_text_session_command(
             chat_id=chat_id,
             runtime_chat_id=worker_chat_id,
@@ -2927,6 +2925,13 @@ class AppServerBotBridge:
                     streaming_card.close()
                 except Exception as exc:
                     LOG.warning("stream card cleanup failed message_id=%s err=%s", message_id or "<none>", exc)
+
+    def _handle_bot_added(self, chat_id: str) -> None:
+        target = str(chat_id or "").strip()
+        if not target:
+            return
+        LOG.info("bot joined group chat_id=%s; posting visual control panel", target)
+        self.feishu.send_card(target, self._build_group_control_card())
 
     def _handle_event(self, payload: Dict[str, Any]) -> None:
         header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
@@ -3439,6 +3444,10 @@ def main() -> None:
     def _on_bot_menu_v6(data: P2ApplicationBotMenuV6) -> None:
         bridge.handle_menu_event_async(_menu_event_to_payload(data))
 
+    def _on_bot_added_v1(data: P2ImChatMemberBotAddedV1) -> None:
+        chat_id = str(getattr(getattr(data, "event", None), "chat_id", "") or "").strip()
+        bridge.handle_bot_added_async(chat_id)
+
     def _on_card_action_trigger(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         bridge.handle_card_action_async(data)
         return _card_callback_ack("已收到操作，处理中...")
@@ -3446,6 +3455,7 @@ def main() -> None:
     event_handler = (
         lark.EventDispatcherHandler.builder("", "", level)
         .register_p2_im_message_receive_v1(_on_message_receive_v1)
+        .register_p2_im_chat_member_bot_added_v1(_on_bot_added_v1)
         .register_p2_application_bot_menu_v6(_on_bot_menu_v6)
         .register_p2_card_action_trigger(_on_card_action_trigger)
         .build()
