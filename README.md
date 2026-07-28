@@ -82,6 +82,15 @@ cp soul.md.example soul.md
 
 菜单键映射通过 `.env` 里的 `BRIDGE_MENU_ACTIONS_JSON` 配置。
 
+群聊中飞书客户端不一定显示机器人自定义菜单。请 `@机器人` 后发送以下文本命令打开同一套管理卡片：
+
+- `/manage`、`/menu`、`/settings` 或 `/session`：会话管理
+- `/project` 或 `/projects`：项目管理
+- `/model`：模型与推理强度选择
+- `/auth` 或 `/account`：账号选择
+
+`/model list` 仍保留为查询 Codex 返回模型列表的命令。
+
 建议开通的应用身份权限：
 
 - `im:message`

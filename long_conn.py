@@ -2504,6 +2504,37 @@ class AppServerBotBridge:
             return ""
         return ""
 
+    def _management_text_action(self, text: str) -> str:
+        """Map explicit text commands to the interactive management cards.
+
+        Application menus are not consistently exposed in group chats, so these
+        commands provide a chat-local entry point without forwarding them to Codex.
+        """
+        raw = html.unescape(str(text or ""))
+        cleaned = (
+            raw.replace("\ufeff", " ")
+            .replace("\u200b", " ")
+            .replace("\u200c", " ")
+            .replace("\u200d", " ")
+            .replace("\u2060", " ")
+            .replace("／", "/")
+        )
+        cleaned = re.sub(r"<at\b[^>]*>.*?</at>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip().lower().strip("`")
+        cleaned = re.sub(r"^@\S+\s+", "", cleaned).strip()
+        commands = {
+            "/manage": "open_session_manage",
+            "/menu": "open_session_manage",
+            "/settings": "open_session_manage",
+            "/session": "open_session_manage",
+            "/project": "open_project_manage",
+            "/projects": "open_project_manage",
+            "/model": "session_model_start",
+            "/auth": "session_auth_start",
+            "/account": "session_auth_start",
+        }
+        return commands.get(cleaned, "")
+
     def _handle_text_session_command(
         self,
         chat_id: str,
@@ -2780,6 +2811,14 @@ class AppServerBotBridge:
 
         active_project = self._ensure_active_project(worker_chat_id)
         runtime_key = self._ensure_project_runtime(worker_chat_id, active_project) if active_project else worker_chat_id
+        management_action = self._management_text_action(raw)
+        if management_action:
+            self._run_card_action(
+                chat_id=worker_chat_id,
+                op=management_action,
+                value={"project": active_project} if active_project else {},
+            )
+            return
         if self._handle_text_session_command(
             chat_id=chat_id,
             runtime_chat_id=worker_chat_id,
