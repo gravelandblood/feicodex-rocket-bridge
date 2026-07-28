@@ -92,6 +92,7 @@ cp soul.md.example soul.md
 - `im:message:readonly`
 - `im:message.p2p_msg:readonly`
 - `im:message.group_at_msg:readonly`
+- `im:chat:readonly`
 - `im:message:update`
 - `im:chat.members:bot_access`
 - `im:chat.access_event.bot_p2p_chat:read`
