@@ -1013,12 +1013,12 @@ class FeishuClient:
         if data.get("code") != 0:
             raise RuntimeError(f"delete_message feishu err: {data}")
 
-    def send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
+    def send_card_by_receive_id(self, receive_id: str, card: Dict[str, Any], receive_id_type: str = "chat_id") -> None:
         token = self._tenant_access_token()
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"{FEISHU_API}/im/v1/messages?receive_id_type=chat_id"
+        url = f"{FEISHU_API}/im/v1/messages?receive_id_type={receive_id_type}"
         payload = {
-            "receive_id": chat_id,
+            "receive_id": str(receive_id or ""),
             "msg_type": "interactive",
             "content": json.dumps(card, ensure_ascii=False),
         }
@@ -1028,6 +1028,9 @@ class FeishuClient:
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"send_card feishu err: {data}")
+
+    def send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
+        self.send_card_by_receive_id(chat_id, card, receive_id_type="chat_id")
 
     def update_message_card(self, message_id: str, card: Dict[str, Any]) -> None:
         mid = str(message_id or "").strip()
@@ -1637,6 +1640,16 @@ class AppServerBotBridge:
             return f"union:{union_id}"
         return ""
 
+    def _menu_private_chat_keys(self, open_id: str = "", user_id: str = "", union_id: str = "") -> List[str]:
+        keys: List[str] = []
+        if open_id:
+            keys.append(f"menu_p2p:open:{open_id}")
+        if user_id:
+            keys.append(f"menu_p2p:user:{user_id}")
+        if union_id:
+            keys.append(f"menu_p2p:union:{union_id}")
+        return keys
+
     def _scoped_chat_id(self, chat_id: str, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
         base = self._base_chat_id(chat_id)
         if not USER_SESSION_ISOLATION:
@@ -1679,7 +1692,13 @@ class AppServerBotBridge:
             return False
         return owner == runtime
 
-    def _bind_user_chat(self, sender_id: Dict[str, Any], chat_id: str, runtime_chat_id: str = "") -> None:
+    def _bind_user_chat(
+        self,
+        sender_id: Dict[str, Any],
+        chat_id: str,
+        runtime_chat_id: str = "",
+        chat_type: str = "",
+    ) -> None:
         open_id = str(sender_id.get("open_id") or "").strip()
         user_id = str(sender_id.get("user_id") or "").strip()
         union_id = str(sender_id.get("union_id") or "").strip()
@@ -1703,6 +1722,11 @@ class AppServerBotBridge:
                 if self._user_chat_map.get(f"union:{union_id}") != mapped_chat:
                     changed = True
                 self._user_chat_map[f"union:{union_id}"] = mapped_chat
+            if str(chat_type or "").strip().lower() == "p2p":
+                for key in self._menu_private_chat_keys(open_id=open_id, user_id=user_id, union_id=union_id):
+                    if self._user_chat_map.get(key) != mapped_chat:
+                        self._user_chat_map[key] = mapped_chat
+                        changed = True
             if base_chat and identity:
                 owner_key = f"legacy_owner_identity:{base_chat}"
                 if not str(self._user_chat_map.get(owner_key) or "").strip():
@@ -1734,6 +1758,20 @@ class AppServerBotBridge:
                     txt = str(v or "")
                     if txt:
                         return txt
+        return ""
+
+    def _resolve_menu_private_chat_by_user(self, open_id: str = "", user_id: str = "", union_id: str = "") -> str:
+        """Resolve app-menu actions only to a known private bot conversation.
+
+        Bot menu events lack a chat ID. Falling back to a user's latest group
+        activity leaks private-menu cards into that group, so group mappings are
+        intentionally never considered here.
+        """
+        with self._user_chat_lock:
+            for key in self._menu_private_chat_keys(open_id=open_id, user_id=user_id, union_id=union_id):
+                value = str(self._user_chat_map.get(key) or "").strip()
+                if value:
+                    return value
         return ""
 
     def _append_pending_file(self, chat_id: str, file_path: str) -> int:
@@ -2678,16 +2716,14 @@ class AppServerBotBridge:
             ],
         }
 
-    def _build_group_control_card(self) -> Dict[str, Any]:
-        """A persistent visual entry point posted when the bot joins a group."""
+    def _build_visual_control_card(self, title: str, description: str) -> Dict[str, Any]:
         return {
             "config": {"wide_screen_mode": True},
-            "header": self._card_header("Codex 群聊控制台"),
+            "header": self._card_header(title),
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": "使用下方按钮配置本群中的项目、模型、推理强度和账号。\n\n"
-                    "建议由群管理员将本卡片置顶，作为固定入口。",
+                    "content": description,
                 },
                 {
                     "tag": "action",
@@ -2705,6 +2741,19 @@ class AppServerBotBridge:
                 },
             ],
         }
+
+    def _build_group_control_card(self) -> Dict[str, Any]:
+        """A persistent visual entry point posted when the bot joins a group."""
+        return self._build_visual_control_card(
+            "Codex 群聊控制台",
+            "使用下方按钮配置本群中的项目、模型、推理强度和账号。\n\n建议由群管理员将本卡片置顶，作为固定入口。",
+        )
+
+    def _build_private_control_card(self) -> Dict[str, Any]:
+        return self._build_visual_control_card(
+            "Codex 控制台",
+            "使用下方按钮配置你的项目、模型、推理强度和账号。",
+        )
 
     def _build_auth_select_card(self, current_profile: str, profiles: List[Dict[str, Any]], project_name: str = "") -> Dict[str, Any]:
         rows: List[Dict[str, Any]] = [
@@ -2956,15 +3005,20 @@ class AppServerBotBridge:
         sender_open_id = str(sender_id.get("open_id") or "").strip()
         sender_user_id = str(sender_id.get("user_id") or "").strip()
         sender_union_id = str(sender_id.get("union_id") or "").strip()
+        chat_type = str(message.get("chat_type") or "").strip().lower()
         runtime_chat_id = self._scoped_chat_id(
             chat_id=chat_id,
             open_id=sender_open_id,
             user_id=sender_user_id,
             union_id=sender_union_id,
         )
-        self._bind_user_chat(sender_id=sender_id, chat_id=chat_id, runtime_chat_id=runtime_chat_id)
+        self._bind_user_chat(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            runtime_chat_id=runtime_chat_id,
+            chat_type=chat_type,
+        )
 
-        chat_type = str(message.get("chat_type") or "").strip().lower()
         if SINGLE_CHAT_ONLY and chat_type and chat_type != "p2p":
             self.feishu.send_text(chat_id, "This bot is configured for 1:1 chat only.")
             return
@@ -3044,12 +3098,12 @@ class AppServerBotBridge:
                 self.feishu.send_text_by_receive_id(open_id, f"未配置菜单动作: {event_key}", receive_id_type="open_id")
             return
 
-        chat_id = self._resolve_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
+        chat_id = self._resolve_menu_private_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
         if not chat_id:
             if open_id:
-                self.feishu.send_text_by_receive_id(
+                self.feishu.send_card_by_receive_id(
                     open_id,
-                    "菜单已点击，但尚未绑定会话。请先给机器人发送一条消息。",
+                    self._build_private_control_card(),
                     receive_id_type="open_id",
                 )
             return
@@ -3087,9 +3141,9 @@ class AppServerBotBridge:
         chat_id = str(getattr(ctx, "open_chat_id", "") or "")
         source_message_id = str(getattr(ctx, "open_message_id", "") or "")
         if not chat_id:
-            chat_id = self._resolve_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
+            chat_id = self._resolve_menu_private_chat_by_user(open_id=open_id, user_id=user_id, union_id=union_id)
         if not chat_id:
-            LOG.warning("card action dropped: no chat mapping op=%s", op)
+            LOG.warning("card action dropped: no private chat mapping op=%s", op)
             return
 
         runtime_chat_id = self._scoped_chat_id(chat_id=chat_id, open_id=open_id, user_id=user_id, union_id=union_id)
