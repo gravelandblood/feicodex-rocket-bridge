@@ -64,6 +64,16 @@ USER_SESSION_ISOLATION = str(os.getenv("BRIDGE_USER_SESSION_ISOLATION", "false")
 CONTROL_BASE = str(os.getenv("BRIDGE_CONTROL_BASE", "http://127.0.0.1:18788")).strip().rstrip("/")
 API_PREFIX = str(os.getenv("BRIDGE_API_PREFIX", "/appbridge/api")).strip()
 API_TOKEN = str(os.getenv("BRIDGE_API_TOKEN", "")).strip()
+MODEL_EXTRA_ALLOWLIST = {
+    item.strip().lower()
+    for item in str(
+        os.getenv(
+            "BRIDGE_MODEL_EXTRA_ALLOWLIST",
+            "muse-spark-1.3-contributor,grok-4.7,deepseek-v4.1-flash",
+        )
+    ).split(",")
+    if item.strip()
+}
 TURN_TIMEOUT_SEC = max(5, int(os.getenv("BRIDGE_TURN_TIMEOUT_SEC", "21600")))
 TURN_RECOVERY_MAX_RETRIES = max(0, int(os.getenv("BRIDGE_TURN_RECOVERY_MAX_RETRIES", "2")))
 TURN_RECOVERY_RETRY_BACKOFF_SEC = max(0, int(os.getenv("BRIDGE_TURN_RECOVERY_RETRY_BACKOFF_SEC", "2")))
@@ -733,15 +743,13 @@ def _profile_live_api_models(profile: str, current_model: str = "") -> List[str]
     return out
 
 
-def _is_bridge_visible_gpt_model(model: str) -> bool:
+def _is_bridge_visible_model(model: str) -> bool:
     clean = str(model or "").strip().lower()
     if not clean:
         return False
-    if not clean.startswith("gpt-"):
-        return False
     if clean.startswith("gpt-image-"):
         return False
-    return True
+    return clean.startswith("gpt-") or clean in MODEL_EXTRA_ALLOWLIST
 
 
 def _merge_model_candidates(*groups: List[str]) -> List[str]:
@@ -758,7 +766,7 @@ def _merge_model_candidates(*groups: List[str]) -> List[str]:
 
 def _visible_bridge_model_candidates(models: List[str], current_model: str = "") -> List[str]:
     merged = _merge_model_candidates(models, [current_model] if current_model else [])
-    visible = [item for item in merged if _is_bridge_visible_gpt_model(item)]
+    visible = [item for item in merged if _is_bridge_visible_model(item)]
     if visible:
         return visible
     return merged
